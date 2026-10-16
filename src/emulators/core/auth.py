@@ -187,7 +187,7 @@ class TokenService:
             user_id=user_id,
             scopes=list(scopes or []),
             issued_at=now,
-            expires_at=(now + ttl) if ttl else None,
+            expires_at=(now + ttl) if ttl is not None else None,
             app_only=app_only,
             **extra_fields,
         )
