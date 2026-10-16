@@ -39,10 +39,14 @@ def postings(ctx: ProviderContext, tenant: str) -> list[Posting]:
                 continue
             day = instant(record["Date"]).date()
             kind = record["Type"]
+            if kind in {"SPEND-TRANSFER", "RECEIVE-TRANSFER"}:
+                continue  # The paired entries are posted once through BankTransfers below.
             credit = resource == "CreditNotes"
             purchase = kind in {"ACCPAY", "ACCPAYCREDIT", "SPEND"}
             sign = Decimal(1 if purchase != credit else -1)
             for line in record["LineItems"]:
+                if "AccountCode" not in line:
+                    continue
                 track = line.get("Tracking", [])
                 net = Decimal(str(line["LineAmount"]))
                 if record["LineAmountTypes"] == "Inclusive":
@@ -76,6 +80,8 @@ def postings(ctx: ProviderContext, tenant: str) -> list[Posting]:
         add(day, payment["Account"]["Code"], Decimal(str(payment["Amount"])) * sign)
         add(day, "1100" if invoice["Type"] == "ACCREC" else "2000", -Decimal(str(payment["Amount"])) * sign)
     for transfer in rows(ctx, "BankTransfers", tenant):
+        if transfer.get("Status") == "DELETED":
+            continue
         day = instant(transfer["Date"]).date()
         add(day, transfer["FromBankAccount"]["Code"], -Decimal(str(transfer["Amount"])))
         add(day, transfer["ToBankAccount"]["Code"], transfer["Amount"])

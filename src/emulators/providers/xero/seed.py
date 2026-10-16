@@ -223,7 +223,7 @@ def seed(ctx: ProviderContext) -> None:
                         "FirstName": person.first_name,
                         "LastName": person.last_name,
                         "IsSubscriber": person.id == "p001",
-                        "OrganisationRole": role,
+                        "OrganisationRole": "FINANCIALADVISER" if role == "ADMIN" else role,
                         "UpdatedDateUTC": updated,
                     },
                 )
@@ -568,6 +568,12 @@ def seed(ctx: ProviderContext) -> None:
                 "UpdatedDateUTC": updated,
             },
         )
+
+    account_ids = {a["Code"]: a["AccountID"] for a in rows(ctx, "Accounts", tenant)}
+    for resource in ["Invoices", "Quotes", "BankTransactions"]:
+        for record in rows(ctx, resource, tenant):
+            for line in record["LineItems"]:
+                line["AccountID"] = account_ids[line["AccountCode"]]
 
 
 def seed_payment(

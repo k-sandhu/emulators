@@ -103,3 +103,68 @@ def test_xero_documented_oauth_discovery_invoices_payment_and_reports(emulator_i
             client.get(base + "/Invoices", headers={"xero-tenant-id": demo["tenantId"]}).json()["Invoices"]
             == []
         )
+
+
+def test_xero_custom_connection_granular_scopes_and_invoice_number_payment(emulator_intercept: Any) -> None:
+    with httpx.Client() as client:
+        api = "https://api.xero.com"
+        base = api + "/api.xro/2.0"
+        credentials = client.get(api + "/_emulator/info").json()["credentials"]
+        tokens = client.post(
+            "https://identity.xero.com/connect/token",
+            auth=(credentials["client_id"], credentials["client_secret"]),
+            data={
+                "grant_type": "client_credentials",
+                "scope": "accounting.invoices accounting.payments accounting.contacts.read accounting.settings.read",
+            },
+        )
+        tokens.raise_for_status()
+        client.headers.update(
+            {"Authorization": "Bearer " + tokens.json()["access_token"], "Accept": "application/json"}
+        )
+        # A Custom Connection carries the tenant in its token; there is no tenant header.
+        contacts = client.get(base + "/Contacts", params={"searchTerm": "christopher.ingram@northwind"})
+        contacts.raise_for_status()
+        contact = contacts.json()["Contacts"][0]
+        invoice_response = client.post(
+            base + "/Invoices",
+            params={"unitdp": 4},
+            json={
+                "Invoices": [
+                    {
+                        "Type": "ACCREC",
+                        "Contact": {"ContactID": contact["ContactID"]},
+                        "Date": "2026-10-16",
+                        "DueDate": "2026-11-15",
+                        "Status": "AUTHORISED",
+                        "LineItems": [
+                            {
+                                "Description": "Precision contract",
+                                "Quantity": 100,
+                                "UnitAmount": 0.015,
+                                "AccountCode": "4200",
+                            }
+                        ],
+                    }
+                ],
+            },
+        )
+        invoice_response.raise_for_status()
+        invoice = invoice_response.json()["Invoices"][0]
+        assert invoice["Total"] == 1.5
+        payment = client.put(
+            base + "/Payments",
+            json={
+                "Invoice": {"InvoiceNumber": invoice["InvoiceNumber"]},
+                "Account": {"Code": "1000"},
+                "Date": "2026-10-16",
+                "Amount": 1.5,
+            },
+        )
+        payment.raise_for_status()
+        settled = client.get(base + "/Invoices/" + invoice["InvoiceID"], params={"unitdp": 4})
+        settled.raise_for_status()
+        assert settled.json()["Invoices"][0]["Status"] == "PAID"
+        assert settled.json()["Invoices"][0]["LineItems"][0]["UnitAmount"] == 0.015
+        assert client.get(base + "/CreditNotes").status_code == 200
+        assert client.get(base + "/BankTransactions").status_code == 401

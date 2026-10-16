@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from typing import Any
+from uuid import uuid4
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
@@ -14,7 +15,7 @@ from emulators.core.middleware import FaultRule
 from emulators.core.provider import Provider, ProviderContext
 
 from . import hooks, identity, routes
-from .common import BASE, ID_FIELDS, NOT_FOUND, problem
+from .common import BASE, ID_FIELDS, NOT_FOUND, problem, tenant_id
 from .journal import XeroJournal
 from .reports import NAMES
 from .seed import seed
@@ -52,19 +53,29 @@ class XeroProvider(Provider):
             "Elements": [{"ValidationErrors": [{"Message": message}]}],
         }
 
-    def fault_response(self, rule: FaultRule) -> tuple[int, dict[str, str], bytes]:
+    def error_headers_for(self, scope: dict[str, Any] | None, status: int) -> dict[str, str]:
+        return {"xero-correlation-id": str(uuid4())}
+
+    def fault_response(
+        self, rule: FaultRule, scope: dict[str, Any] | None = None
+    ) -> tuple[int, dict[str, str], bytes]:
         if rule.status == 404 and rule.body is None:
-            return 404, {"content-type": "text/plain", **rule.headers}, NOT_FOUND.encode()
-        status, headers, body = super().fault_response(rule)
+            return (
+                404,
+                {"content-type": "text/plain", **self.error_headers_for(scope, 404), **rule.headers},
+                NOT_FOUND.encode(),
+            )
+        status, headers, body = super().fault_response(rule, scope)
         if status == 429:
             headers = {
-                "Retry-After": "60",
                 "X-MinLimit-Remaining": "0",
                 "X-DayLimit-Remaining": "4999",
                 "X-AppMinLimit-Remaining": "9999",
                 **headers,
                 **rule.headers,
             }
+            if not any(k.lower() == "retry-after" for k in rule.headers):
+                headers["Retry-After"] = "60"
         return status, headers, body
 
     def build(self, app: FastAPI, ctx: ProviderContext) -> None:
@@ -104,8 +115,9 @@ class XeroProvider(Provider):
                 path = BASE + "/" + "/".join(parts)
                 request.scope["path"] = request.scope.get("root_path", "") + path
             headers: dict[str, str] = {}
-            tenant = request.headers.get("xero-tenant-id", "").lower()
             grant = ctx.tokens.resolve(bearer_token(request))
+            tenant = tenant_id(ctx, request, grant) if grant else ""
+            correlation = {"xero-correlation-id": str(uuid4())}
             if path.startswith(BASE + "/") and grant and ctx.store.collection("_tenants").get(tenant):
                 now = ctx.clock.timestamp()
                 counters = ctx.store.collection("_limits")
@@ -128,14 +140,14 @@ class XeroProvider(Provider):
                     }
                     headers["Retry-After"] = str(max(1, max(c["reset"] - now for c in exhausted)))
                     headers["X-Rate-Limit-Problem"] = "minute" if values[0][0] in exhausted else "day"
-                    return JSONResponse(problem(429), status_code=429, headers=headers)
+                    return JSONResponse(problem(429), status_code=429, headers={**headers, **correlation})
                 for counter, _ in values:
                     counter["used"] += 1
                 headers = {
                     name: str(maximum - c["used"]) for name, (c, maximum) in zip(names, values, strict=True)
                 }
             response = await call_next(request)
-            response.headers.update(headers)
+            response.headers.update({**headers, **correlation})
             return response
 
         identity.build(app, ctx)

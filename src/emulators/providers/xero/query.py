@@ -12,7 +12,7 @@ from typing import Any
 
 from fastapi import Request
 
-from .common import ID_FIELDS, instant, public, validation
+from .common import ID_FIELDS, instant, round_units, unit_precision, validation
 
 TOKEN = re.compile(r'\s*("(?:[^"\\]|\\.)*"|==|!=|>=|<=|&&|\|\||[><(),!]|-?\d+(?:\.\d+)?|[A-Za-z_][\w.]*)')
 
@@ -98,7 +98,7 @@ class Parser:
                 self.expect(")")
                 try:
                     return ("literal", datetime(*parts, tzinfo=UTC))
-                except (TypeError, ValueError):
+                except (TypeError, ValueError, OverflowError):
                     validation("Invalid DateTime in where expression.")
             field, _, method = token.rpartition(".")
             if method.lower() not in {"contains", "startswith", "endswith", "equals"} or not field:
@@ -180,34 +180,74 @@ def select(
             records = [r for r in records if str(path(r, field)).lower() in wanted]
     if query.get("where"):
         node = Parser(query["where"]).parse()
-        records = [r for r in records if evaluate(node, r)]
+        try:
+            records = [r for r in records if evaluate(node, r)]
+        except RecursionError:
+            validation("The where expression is too complex.")
     if value := request.headers.get("if-modified-since"):
         try:
             since = parsedate_to_datetime(value) if "," in value else instant(value)
             if since.tzinfo is None:
                 since = since.replace(tzinfo=UTC)
-        except ValueError:
+        except (ValueError, TypeError, OverflowError):
             validation("If-Modified-Since must be a valid UTC date.")
         records = [r for r in records if r.get("UpdatedDateUTC") and instant(r["UpdatedDateUTC"]) > since]
     if term := query.get("searchterm"):
+        search_fields = (
+            ["Name", "FirstName", "LastName", "ContactNumber", "CompanyNumber", "EmailAddress"]
+            if resource == "Contacts"
+            else ["InvoiceNumber", "Reference"]
+        )
         records = [
             r
             for r in records
-            if term.casefold().strip('"')
-            in str(
-                r.get("InvoiceNumber", "") + " " + r.get("Reference", "") + " " + r.get("Name", "")
-            ).casefold()
+            if term.casefold().strip('"') in " ".join(str(r.get(k, "")) for k in search_fields).casefold()
         ]
+    if resource == "Quotes":
+        for parameter, field in [
+            ("contactid", "Contact.ContactID"),
+            ("status", "Status"),
+            ("quotenumber", "QuoteNumber"),
+        ]:
+            if parameter in query:
+                records = [
+                    r for r in records if str(path(r, field)).casefold() == query[parameter].casefold()
+                ]
+        for parameter, field, compare in [
+            ("datefrom", "Date", operator.ge),
+            ("dateto", "Date", operator.le),
+            ("expirydatefrom", "ExpiryDate", operator.ge),
+            ("expirydateto", "ExpiryDate", operator.le),
+        ]:
+            if parameter in query:
+                try:
+                    boundary = instant(query[parameter])
+                except ValueError:
+                    validation(f"{parameter} must be a valid date.")
+                records = [r for r in records if r.get(field) and compare(instant(r[field]), boundary)]
     order = query.get("order", "UpdatedDateUTC ASC," + ID_FIELDS[resource] + " ASC")
+    if not any(
+        c.strip().split()[0].lower() == ID_FIELDS[resource].lower() for c in order.split(",") if c.strip()
+    ):
+        order += "," + ID_FIELDS[resource] + " ASC"
     for clause in reversed(order.split(",")):
         match = re.fullmatch(r"\s*([\w.]+)(?:\s+(ASC|DESC))?\s*", clause, re.I)
         if not match:
             validation("Invalid order expression.")
-        records = sorted(
-            records,
-            key=lambda r: (path(r, match[1]) is None, path(r, match[1]) or ""),
-            reverse=(match[2] or "").upper() == "DESC",
-        )
+
+        def sort_key(record: dict[str, Any], field: str = match[1]) -> Any:
+            value = path(record, field)
+            if value is None:
+                return (True, 0, "")
+            if isinstance(value, (dict, list)):
+                validation("Cannot order by a complex property.")
+            if isinstance(value, str):
+                if value.startswith("/Date("):
+                    return (False, 1, instant(value))
+                return (False, 2, value.casefold())
+            return (False, 0, value)
+
+        records = sorted(records, key=sort_key, reverse=(match[2] or "").upper() == "DESC")
     paged = (
         "page" in query
         or "pagesize" in query
@@ -230,7 +270,7 @@ def select(
             "pageCount": math.ceil(count / size),
             "itemCount": count,
         }
-    result = public(records)
+    result = round_units(records, unit_precision(request))
     if resource == "Invoices" and not paged:
         result = [{k: v for k, v in r.items() if k != "LineItems"} for r in result]
     if query.get("summaryonly", "").lower() == "true":

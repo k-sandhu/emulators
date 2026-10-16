@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import json
+import math
 from typing import Any
 
 from fastapi import FastAPI, Request
@@ -26,8 +28,10 @@ from .common import (
     money,
     msdate,
     public,
+    round_units,
     rows,
     stamp,
+    unit_precision,
     validation,
 )
 from .hooks import notify
@@ -35,6 +39,7 @@ from .ledger import contact_balances
 from .query import select
 from .reports import report
 from .transactions import mutate, settle
+from .validation import fields
 
 
 def known(resource: str) -> None:
@@ -44,8 +49,18 @@ def known(resource: str) -> None:
 
 async def payload(request: Request) -> dict[str, Any]:
     try:
-        data = await request.json()
-    except (ValueError, UnicodeDecodeError):
+
+        def invalid_constant(value: str) -> Any:
+            raise ValueError(value)
+
+        def finite_float(value: str) -> float:
+            number = float(value)
+            if not math.isfinite(number):
+                raise ValueError(value)
+            return number
+
+        data = json.loads(await request.body(), parse_constant=invalid_constant, parse_float=finite_float)
+    except (ValueError, UnicodeDecodeError, RecursionError):
         validation("A JSON request body is required.")
     if not isinstance(data, dict):
         validation("The request body must be an object.")
@@ -56,8 +71,14 @@ async def write(
     ctx: ProviderContext, request: Request, resource: str, identifier: str | None = None
 ) -> dict[str, Any]:
     known(resource)
-    _, tenant = access(ctx, request, resource, write=True)
+    grant, tenant = access(ctx, request, resource, write=True)
     if resource in READ_ONLY:
+        raise EmulatorError(405, {"Message": "Method not allowed"})
+    if (
+        request.method == "POST"
+        and identifier is None
+        and resource in {"Accounts", "ContactGroups", "TrackingCategories"}
+    ):
         raise EmulatorError(405, {"Message": "Method not allowed"})
     data = await payload(request)
     records = data.get(resource, [data])
@@ -66,8 +87,8 @@ async def write(
     if identifier and len(records) != 1:
         validation("Only one element can be updated through an individual resource URL.")
     key = request.headers.get("idempotency-key")
-    cache_id = f"{tenant}/{request.method}/{request.url.path}/{key}"
-    digest = hashlib.sha256(await request.body()).hexdigest()
+    cache_id = f"{grant.client_id}/{tenant}/{request.method}/{request.url.path}/{key}"
+    digest = hashlib.sha256(await request.body() + b"?" + request.url.query.encode()).hexdigest()
     if key:
         if len(key) > 128:
             validation("Idempotency-Key must not exceed 128 characters.")
@@ -76,24 +97,37 @@ async def write(
             if cached["digest"] != digest:
                 validation("Idempotency-Key has already been used with a different request.")
             return cached["response"]
-    summarize = request.query_params.get("summarizeErrors", "true").lower() != "false"
+    query = {k.lower(): v for k, v in request.query_params.items()}
+    summarize = query.get("summarizeerrors", "true").lower() != "false"
+    unitdp = unit_precision(request)
     snapshot = ctx.store.snapshot()
     results, events = [], []
     for value in records:
         before = ctx.store.snapshot() if not summarize else snapshot
         try:
+            if resource == "BankTransfers" and request.method == "POST" and identifier is None:
+                transfer_id = value.get("BankTransferID") if isinstance(value, dict) else None
+                if not isinstance(transfer_id, str) or not any(
+                    r["BankTransferID"].lower() == transfer_id.lower() for r in rows(ctx, resource, tenant)
+                ):
+                    validation("POST requires an existing BankTransferID; use PUT to create a transfer.")
             if (
                 request.method == "PUT"
                 and isinstance(value, dict)
                 and any(
-                    r[ID_FIELDS[resource]] == value.get(ID_FIELDS[resource])
+                    isinstance(value.get(ID_FIELDS[resource]), str)
+                    and r[ID_FIELDS[resource]].lower() == value[ID_FIELDS[resource]].lower()
                     for r in rows(ctx, resource, tenant)
                 )
             ):
                 validation("PUT creates new resources; use POST to update.", value)
-            result, created = mutate(ctx, tenant, resource, value, identifier)
+            result, created = mutate(ctx, tenant, resource, value, identifier, unitdp=unitdp)
             result.pop("_pdf", None)
-            results.append(copy.deepcopy(result))
+            response_record = copy.deepcopy(result)
+            if not summarize:
+                response_record["StatusAttributeString"] = "OK"
+                response_record["HasErrors" if resource == "Invoices" else "HasValidationErrors"] = False
+            results.append(response_record)
             events.append((copy.deepcopy(result), created))
         except EmulatorError as exc:
             ctx.store.restore(before)
@@ -101,10 +135,16 @@ async def write(
                 ctx.store.restore(snapshot)
                 raise
             element = exc.body["Elements"][0]
+            try:
+                failed_value = public(fields(value)) if isinstance(value, dict) else {}
+                json.dumps(failed_value, ensure_ascii=False).encode("utf-8")
+            except (EmulatorError, UnicodeEncodeError, RecursionError):
+                failed_value = {}
             results.append(
                 {
-                    **(public(value) if isinstance(value, dict) else {}),
-                    "HasValidationErrors": True,
+                    **failed_value,
+                    "HasErrors" if resource == "Invoices" else "HasValidationErrors": True,
+                    "StatusAttributeString": "ERROR",
                     "ValidationErrors": element["ValidationErrors"],
                 }
             )
@@ -120,7 +160,10 @@ def build(app: FastAPI, ctx: ProviderContext) -> None:
     @app.get(BASE + "/Reports/{name}")
     async def get_report(request: Request, name: str) -> dict[str, Any]:
         _, tenant = access(ctx, request, "Reports/" + name)
-        return report(ctx, request, tenant, name)
+        try:
+            return report(ctx, request, tenant, name)
+        except (ValueError, OverflowError):
+            validation("The report date range is outside the supported range.")
 
     @app.get(BASE + "/Invoices/{identifier}/OnlineInvoice")
     async def online(request: Request, identifier: str) -> dict[str, Any]:
@@ -243,7 +286,7 @@ def build(app: FastAPI, ctx: ProviderContext) -> None:
         record = find(ctx, resource, tenant, identifier)
         identifier = record[ID_FIELDS[resource]]
         if request.method == "PUT":
-            data = await payload(request)
+            data = fields(await payload(request))
             notes = data.get("HistoryRecords", [])
             if (
                 not isinstance(notes, list)
@@ -262,7 +305,7 @@ def build(app: FastAPI, ctx: ProviderContext) -> None:
     async def group_contacts(request: Request, identifier: str) -> dict[str, Any]:
         _, tenant = access(ctx, request, "ContactGroups", write=True)
         group = find(ctx, "ContactGroups", tenant, identifier)
-        data = await payload(request)
+        data = fields(await payload(request))
         members = data.get("Contacts", [])
         if not isinstance(members, list) or not members:
             validation("Contacts is required.")
@@ -290,7 +333,7 @@ def build(app: FastAPI, ctx: ProviderContext) -> None:
     async def add_option(request: Request, identifier: str) -> dict[str, Any]:
         _, tenant = access(ctx, request, "TrackingCategories", write=True)
         category = find(ctx, "TrackingCategories", tenant, identifier)
-        data = await payload(request)
+        data = fields(await payload(request))
         if not isinstance(data.get("Name"), str) or not data["Name"].strip():
             validation("Name is required.")
         if any(o["Name"].casefold() == data["Name"].casefold() for o in category["Options"]):
@@ -303,7 +346,7 @@ def build(app: FastAPI, ctx: ProviderContext) -> None:
     async def allocate(request: Request, identifier: str) -> dict[str, Any]:
         _, tenant = access(ctx, request, "CreditNotes", write=True)
         credit = find(ctx, "CreditNotes", tenant, identifier)
-        data = await payload(request)
+        data = fields(await payload(request))
         allocations = data.get("Allocations", [])
         if credit["Status"] != "AUTHORISED" or not isinstance(allocations, list) or not allocations:
             validation("Allocations require an authorised credit note.")
@@ -381,13 +424,17 @@ def build(app: FastAPI, ctx: ProviderContext) -> None:
         if resource == "Invoices" and "application/pdf" in request.headers.get("accept", ""):
             if not record.get("_pdf"):
                 paragraphs = [
-                    "Halcyon Advisory Group",
+                    ctx.store.collection("_tenants").get(tenant)["name"],
                     record["Contact"]["Name"],
                     "Date: " + record["DateString"][:10],
                     "Due: " + record["DueDateString"][:10],
                     *[
                         line["Description"]
-                        + f": {line['Quantity']:g} x {line['UnitAmount']:.2f} = {line['LineAmount']:.2f}"
+                        + (
+                            f": {line['Quantity']:g} x {line['UnitAmount']:.2f} = {line['LineAmount']:.2f}"
+                            if "LineAmount" in line
+                            else ""
+                        )
                         for line in record["LineItems"]
                     ],
                     f"Subtotal: {record['SubTotal']:.2f}",
@@ -401,7 +448,7 @@ def build(app: FastAPI, ctx: ProviderContext) -> None:
             return Response(ctx.store.blobs.get(record["_pdf"]), media_type="application/pdf")
         if resource == "Contacts":
             record = {**record, "Balances": contact_balances(ctx, tenant, record)}
-        return JSONResponse(envelope(ctx, resource, [record]))
+        return JSONResponse(envelope(ctx, resource, round_units([record], unit_precision(request))))
 
     @app.api_route(BASE + "/{resource}", methods=["PUT", "POST"])
     async def create(request: Request, resource: str) -> dict[str, Any]:
@@ -413,7 +460,7 @@ def build(app: FastAPI, ctx: ProviderContext) -> None:
 
     @app.delete(BASE + "/{resource}/{identifier}")
     async def delete(request: Request, resource: str, identifier: str) -> Response:
-        if resource not in {"Accounts", "Items", "ContactGroups", "TrackingCategories"}:
+        if resource not in {"Accounts", "Items", "TrackingCategories"}:
             raise EmulatorError(405, {"Message": "Method not allowed"})
         _, tenant = access(ctx, request, resource, write=True)
         record = find(ctx, resource, tenant, identifier)

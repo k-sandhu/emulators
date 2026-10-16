@@ -19,7 +19,23 @@ from emulators.core.clock import isoformat_z
 from emulators.core.errors import EmulatorError
 from emulators.core.provider import ProviderContext, url_for_host
 
-from .common import FULL_SCOPES, actor, guid, main_tenant, missing, problem, public
+from .common import FULL_SCOPES, actor, guid, main_tenant, missing, problem, public, validation
+
+
+async def parameters(request: Request) -> dict[str, str]:
+    """OAuth token requests use form fields, never JSON or uploaded files."""
+    if (
+        request.headers.get("content-type", "").split(";", 1)[0].lower()
+        != "application/x-www-form-urlencoded"
+    ):
+        raise OAuthError("invalid_request", "A form-encoded request body is required.")
+    try:
+        form = await request.form()
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise OAuthError("invalid_request", "Invalid form-encoded body.") from exc
+    if any(not isinstance(v, str) for v in form.values()):
+        raise OAuthError("invalid_request", "Form values must be strings.")
+    return {key: str(value) for key, value in form.items()}
 
 
 def connect(ctx: ProviderContext, grant: Grant) -> None:
@@ -121,6 +137,23 @@ def issue(
 def mint_token(ctx: ProviderContext, payload: dict[str, Any]) -> dict[str, Any]:
     """Mint an RS256 access token, optionally restricted to explicit scopes."""
     value = payload.get("user")
+    scopes = payload.get("scopes", FULL_SCOPES)
+    client_id = payload.get("client_id", "emulator-client")
+    if value is not None and not isinstance(value, str):
+        validation("user must be an employee ID or email string.")
+    if not isinstance(scopes, list) or any(not isinstance(scope, str) for scope in scopes):
+        validation("scopes must be an array of strings.")
+    if not isinstance(client_id, str) or not client_id:
+        validation("client_id must be a non-empty string.")
+    if "app_only" in payload and not isinstance(payload["app_only"], bool):
+        validation("app_only must be a boolean.")
+    try:
+        if isinstance(payload.get("expires_in"), bool):
+            raise ValueError
+        ttl = int(payload.get("expires_in", 1800))
+        ctx.clock.now() + timedelta(seconds=ttl)
+    except (ValueError, TypeError, OverflowError):
+        validation("expires_in must be an integer within the supported date range.")
     user = None
     if value:
         person = next((p for p in ctx.world.people if value in {p.id, p.email, guid("user", p.id)}), None)
@@ -134,11 +167,11 @@ def mint_token(ctx: ProviderContext, payload: dict[str, Any]) -> dict[str, Any]:
         raise EmulatorError(403, problem(403))
     return issue(
         ctx,
-        client=payload.get("client_id", "emulator-client"),
+        client=client_id,
         user=user,
-        scopes=payload.get("scopes", FULL_SCOPES),
+        scopes=scopes,
         app_only=app_only,
-        ttl=int(payload.get("expires_in", 1800)),
+        ttl=ttl,
         new_connection=True,
         refresh=False,
     )
@@ -199,15 +232,22 @@ def build(app: FastAPI, ctx: ProviderContext) -> None:
 
     @app.post("/connect/token")
     async def token(request: Request) -> Response:
-        form = await request.form()
-        client_id, secret = basic_credentials(request) or (form.get("client_id"), form.get("client_secret"))
         try:
+            form = await parameters(request)
+            client_id, secret = basic_credentials(request) or (
+                form.get("client_id"),
+                form.get("client_secret"),
+            )
             kind = form.get("grant_type")
             code = ctx.tokens.resolve(str(form.get("code", "")), "code")
+            refresh_source = ctx.tokens.resolve(str(form.get("refresh_token", "")), "refresh")
+            public_client = (
+                kind == "authorization_code" and code is not None and code.code_challenge is not None
+            ) or (kind == "refresh_token" and refresh_source is not None and refresh_source.extra.get("pkce"))
             ctx.tokens.authenticate_client(
                 client_id,
                 secret,
-                require_secret=kind != "authorization_code" or code is None or code.code_challenge is None,
+                require_secret=not public_client,
             )
             if kind == "authorization_code":
                 if code and form.get("redirect_uri") != code.redirect_uri:
@@ -224,16 +264,16 @@ def build(app: FastAPI, ctx: ProviderContext) -> None:
                     user=source.user_id,
                     scopes=source.scopes,
                     app_only=False,
-                    extra={"nonce": source.nonce},
+                    extra={"nonce": source.nonce, "pkce": source.code_challenge is not None},
                     new_connection=True,
                 )
             elif kind == "refresh_token":
-                source = ctx.tokens.resolve(str(form.get("refresh_token", "")), "refresh")
+                source = refresh_source
                 if source is None or source.client_id != client_id:
                     raise OAuthError("invalid_grant", "Invalid refresh token.")
                 record = ctx.store.collection("_grants").get(source.token)
                 grace = source.extra.get("rotated_at")
-                if grace is not None and ctx.clock.timestamp() - grace > 1800:
+                if grace is not None and ctx.clock.timestamp() - grace >= 1800:
                     raise OAuthError("invalid_grant", "The refresh token grace period has expired.")
                 if grace is None:
                     record["extra"]["rotated_at"] = ctx.clock.timestamp()
@@ -267,9 +307,12 @@ def build(app: FastAPI, ctx: ProviderContext) -> None:
 
     @app.post("/connect/revocation")
     async def revoke(request: Request) -> Response:
-        form = await request.form()
-        client_id, secret = basic_credentials(request) or (form.get("client_id"), form.get("client_secret"))
         try:
+            form = await parameters(request)
+            client_id, secret = basic_credentials(request) or (
+                form.get("client_id"),
+                form.get("client_secret"),
+            )
             ctx.tokens.authenticate_client(client_id, secret)
         except OAuthError as exc:
             return JSONResponse({"error": exc.error}, status_code=exc.status)
@@ -278,6 +321,10 @@ def build(app: FastAPI, ctx: ProviderContext) -> None:
             for record in ctx.store.collection("_grants"):
                 if record.get("extra", {}).get("family") == grant.extra.get("family"):
                     record["revoked"] = True
+            connections = ctx.store.collection("_connections")
+            for record in connections.values():
+                if record["_client"] == client_id and record["_user"] == grant.user_id:
+                    connections.delete(record["id"])
         return Response(status_code=200)
 
     @app.get("/.well-known/openid-configuration")

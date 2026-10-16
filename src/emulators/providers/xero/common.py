@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import copy
 import re
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Any, NoReturn
 
@@ -64,7 +64,8 @@ def msdate(value: date | datetime, *, offset: bool = True) -> str:
     instant = value if isinstance(value, datetime) else datetime.combine(value, datetime.min.time(), UTC)
     if instant.tzinfo is None:
         instant = instant.replace(tzinfo=UTC)
-    return f"/Date({int(instant.timestamp() * 1000)}{'+0000' if offset else ''})/"
+    milliseconds = int((instant - datetime(1970, 1, 1, tzinfo=UTC)).total_seconds() * 1000)
+    return f"/Date({milliseconds}{'+0000' if offset else ''})/"
 
 
 def instant(value: Any) -> datetime:
@@ -74,14 +75,17 @@ def instant(value: Any) -> datetime:
         return datetime.combine(value, datetime.min.time(), UTC)
     match = re.fullmatch(r"/Date\((-?\d+)(?:[+-]\d{4})?\)/", str(value))
     if match:
-        return datetime.fromtimestamp(int(match[1]) / 1000, UTC)
+        try:
+            return datetime(1970, 1, 1, tzinfo=UTC) + timedelta(milliseconds=int(match[1]))
+        except (OverflowError, ValueError) as exc:
+            raise ValueError("Date is outside the supported range.") from exc
     return parse_instant(str(value))
 
 
 def money(value: Any) -> float:
     try:
         number = Decimal(str(value))
-        if not number.is_finite():
+        if not number.is_finite() or abs(number) > Decimal("99999999999999.99"):
             raise ValueError
         return float(number.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
     except (ValueError, TypeError, InvalidOperation):
@@ -94,6 +98,31 @@ def public(value: Any) -> Any:
     if isinstance(value, list):
         return [public(v) for v in value]
     return value
+
+
+def unit_precision(request: Request) -> int:
+    value = next((v for k, v in request.query_params.items() if k.lower() == "unitdp"), "2")
+    if value not in {"2", "4"}:
+        validation("unitdp must be 2 or 4.")
+    return int(value)
+
+
+def round_units(records: list[dict[str, Any]], places: int) -> list[dict[str, Any]]:
+    """Unit-price display precision must never change persisted totals or postings."""
+    result = public(records)
+    quantum = Decimal(1).scaleb(-places)
+    for record in result:
+        for line in record.get("LineItems", []):
+            if "UnitAmount" in line:
+                line["UnitAmount"] = float(
+                    Decimal(str(line["UnitAmount"])).quantize(quantum, rounding=ROUND_HALF_UP)
+                )
+        for field in ["SalesDetails", "PurchaseDetails"]:
+            if "UnitPrice" in record.get(field, {}):
+                record[field]["UnitPrice"] = float(
+                    Decimal(str(record[field]["UnitPrice"])).quantize(quantum, rounding=ROUND_HALF_UP)
+                )
+    return result
 
 
 def problem(status: int, detail: str = "AuthenticationUnsuccessful") -> dict[str, Any]:
@@ -127,6 +156,8 @@ def rows(ctx: ProviderContext, resource: str, tenant: str) -> list[dict[str, Any
 
 
 def find(ctx: ProviderContext, resource: str, tenant: str, identifier: str) -> dict[str, Any]:
+    if not isinstance(identifier, str):
+        validation("The resource identifier must be a string.")
     field = ID_FIELDS[resource]
     for record in rows(ctx, resource, tenant):
         if str(record.get(field, "")).lower() == identifier.lower():
@@ -164,6 +195,8 @@ def envelope(
 
 def actor(ctx: ProviderContext, request: Request) -> Grant:
     grant = ctx.tokens.resolve(bearer_token(request))
+    if request.headers.get("authorization", "").partition(" ")[0].lower() != "bearer":
+        grant = None
     if grant is None:
         raise EmulatorError(401, problem(401), headers={"WWW-Authenticate": 'Bearer error="invalid_token"'})
     if not grant.app_only:
@@ -177,7 +210,7 @@ def access(
     ctx: ProviderContext, request: Request, resource: str, *, write: bool = False
 ) -> tuple[Grant, str]:
     grant = actor(ctx, request)
-    tenant = request.headers.get("xero-tenant-id", "").lower()
+    tenant = tenant_id(ctx, request, grant)
     connections = ctx.store.collection("_connections").filter(
         lambda c: c["_client"] == grant.client_id and c["_user"] == grant.user_id and c["tenantId"] == tenant
     )
@@ -188,14 +221,17 @@ def access(
         if user is None or user["role"] == "READONLY":
             raise EmulatorError(403, problem(403, "You do not have permission to access this resource"))
     if resource.startswith("Reports"):
+        report_name = resource.split("/")[-1].lower()
+        if report_name.startswith("aged"):
+            report_name = "aged"
         scopes = {
             "accounting.reports.read",
-            "accounting.reports." + resource.split("/")[-1].lower() + ".read",
+            "accounting.reports." + report_name + ".read",
         }
     elif resource in {"Contacts", "ContactGroups"}:
         scopes = {"accounting.contacts"}
     elif resource in {"Attachments"}:
-        scopes = {"accounting.attachments", "files"}
+        scopes = {"accounting.attachments"}
     elif resource in {
         "Organisation",
         "Accounts",
@@ -207,8 +243,15 @@ def access(
         "Items",
     }:
         scopes = {"accounting.settings"}
+        if resource == "Items":
+            scopes.add("accounting.invoices")
     else:
-        scopes = {"accounting.transactions", "accounting." + resource.lower()}
+        granular = {
+            "CreditNotes": "invoices",
+            "Quotes": "invoices",
+            "BankTransfers": "banktransactions",
+        }.get(resource, resource.lower())
+        scopes = {"accounting.transactions", "accounting." + granular}
     if not write:
         scopes |= {s + ".read" for s in list(scopes) if not s.endswith(".read")}
     if not scopes.intersection(grant.scopes):
@@ -218,6 +261,12 @@ def access(
 
 def stamp(ctx: ProviderContext, record: dict[str, Any]) -> None:
     record["UpdatedDateUTC"] = msdate(ctx.clock.now())
+
+
+def tenant_id(ctx: ProviderContext, request: Request, grant: Grant) -> str:
+    """A Custom Connection is already bound to its sole organisation."""
+    value = request.headers.get("xero-tenant-id", "").lower()
+    return value or (main_tenant(ctx) if grant.app_only else "")
 
 
 def history(

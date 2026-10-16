@@ -14,6 +14,7 @@ from emulators.core.provider import ProviderContext, url_for_host
 from emulators.core.webhooks import hmac_sha256_b64
 
 from .common import BASE, ID_FIELDS, validation
+from .validation import text
 
 
 async def configure(ctx: ProviderContext, payload: dict[str, Any]) -> dict[str, Any]:
@@ -26,6 +27,8 @@ async def configure(ctx: ProviderContext, payload: dict[str, Any]) -> dict[str, 
         or not key
     ):
         validation("url and signing_key are required.")
+    text(url)
+    text(key)
     ctx.store.collection("_config").delete("webhook")
     body = json.dumps(
         {"events": [], "firstEventSequence": 0, "lastEventSequence": 0, "entropy": ctx.ids.token(n=32)},

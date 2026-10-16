@@ -8,6 +8,8 @@ import httpx
 import pytest
 from pypdf import PdfReader
 
+from emulators.providers.xero.common import instant
+
 from .conftest import BASE, create_invoice
 
 
@@ -47,7 +49,7 @@ async def test_resource_collections(client: httpx.AsyncClient, resource: str, ke
         assert body[key][0]["BaseCurrency"] == "USD"
         assert body[key][0]["ShortCode"] == "!xK2Lm"
     if resource == "Users":
-        assert {u["OrganisationRole"] for u in body[key]} == {"ADMIN", "STANDARD", "READONLY"}
+        assert {u["OrganisationRole"] for u in body[key]} == {"FINANCIALADVISER", "STANDARD", "READONLY"}
         assert sum(u["IsSubscriber"] for u in body[key]) == 1
 
 
@@ -107,10 +109,17 @@ async def test_query_language_paging_ids_order_dates_summary_and_archived(client
 
 async def test_world_transactions_and_contact_balances(client: httpx.AsyncClient) -> None:
     invoices = (await client.get(BASE + "/Invoices", params={"page": 1, "pageSize": 1000})).json()["Invoices"]
+    accounts = (await client.get(BASE + "/Accounts")).json()["Accounts"]
+    account_ids = {account["Code"]: account["AccountID"] for account in accounts}
     world = client.hub.world
     assert len(invoices) == len(world.invoices) + len(world.bills)
     assert sum(i["Type"] == "ACCREC" for i in invoices) == len(world.invoices)
     for invoice in invoices:
+        assert invoice["DateString"][:10] <= world.anchor.date().isoformat()
+        assert all(line["AccountID"] == account_ids[line["AccountCode"]] for line in invoice["LineItems"])
+        assert all(
+            instant(invoice["Date"]) <= instant(p["Date"]) <= world.anchor for p in invoice["Payments"]
+        )
         assert sum(line["LineAmount"] for line in invoice["LineItems"]) == pytest.approx(invoice["SubTotal"])
         assert sum(line["TaxAmount"] for line in invoice["LineItems"]) == pytest.approx(invoice["TotalTax"])
         assert invoice["SubTotal"] + invoice["TotalTax"] == pytest.approx(invoice["Total"])
@@ -294,7 +303,7 @@ async def test_settings_contacts_groups_items_and_deletes(client: httpx.AsyncCli
     detail = (await client.get(BASE + "/Contacts/" + cid)).json()["Contacts"][0]
     assert any(g["ContactGroupID"] == gid for g in detail["ContactGroups"])
     assert (await client.delete(BASE + "/ContactGroups/" + gid + "/Contacts/" + cid)).status_code == 204
-    assert (await client.delete(BASE + "/ContactGroups/" + gid)).status_code == 200
+    assert (await client.post(BASE + "/ContactGroups/" + gid, json={"Status": "DELETED"})).status_code == 200
     accounts = (
         await client.put(
             BASE + "/Accounts", json={"Code": "6999", "Name": "Synthetic expense", "Type": "EXPENSE"}
