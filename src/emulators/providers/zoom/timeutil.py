@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from datetime import UTC, date, datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -27,7 +28,9 @@ def parse_instant(value: str, tz_name: str | None = None) -> datetime:
 
 
 def parse_day(value: str) -> date:
-    return date.fromisoformat(str(value).strip()[:10])
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        raise ValueError("Expected yyyy-MM-dd")
+    return date.fromisoformat(value)
 
 
 def valid_timezone(name: str) -> bool:

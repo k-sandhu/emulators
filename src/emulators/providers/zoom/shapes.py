@@ -39,12 +39,12 @@ DIAL_IN = (
     {
         "country_name": "US",
         "city": "Washington DC",
-        "number": "+1 301 715 8592",
+        "number": "+1 202 555 0100",
         "type": "toll",
         "country": "US",
     },
-    {"country_name": "US", "city": "New York", "number": "+1 646 931 3860", "type": "toll", "country": "US"},
-    {"country_name": "US", "city": "Chicago", "number": "+1 312 626 6799", "type": "toll", "country": "US"},
+    {"country_name": "US", "city": "New York", "number": "+1 212 555 0101", "type": "toll", "country": "US"},
+    {"country_name": "US", "city": "Chicago", "number": "+1 312 555 0102", "type": "toll", "country": "US"},
 )
 ZOOM_TZ_LABELS = {
     "America/New_York": "Eastern Time (US and Canada)",
@@ -485,7 +485,7 @@ def meeting_detail(
     if rec.get("duration") is not None:
         item["duration"] = occ["duration"] if occ else rec["duration"]
     item["timezone"] = rec["timezone"]
-    item["agenda"] = rec.get("agenda", "")
+    item["agenda"] = occ.get("_agenda", rec.get("agenda", "")) if occ else rec.get("agenda", "")
     item["created_at"] = rec["created_at"]
     item["start_url"] = rec["start_url"]
     item["join_url"] = rec["join_url"]
@@ -493,7 +493,7 @@ def meeting_detail(
     item["h323_password"] = rec["h323_password"]
     item["pstn_password"] = rec["pstn_password"]
     item["encrypted_password"] = rec["encrypted_password"]
-    item["settings"] = rec["settings"]
+    item["settings"] = occ.get("_settings", rec["settings"]) if occ else rec["settings"]
     item["pre_schedule"] = rec.get("pre_schedule", False)
     if rec.get("recurrence"):
         item["recurrence"] = rec["recurrence"]
@@ -525,7 +525,7 @@ def meeting_payload(rec: dict[str, Any], *, string_id: bool = False) -> dict[str
 
 # -- recurrence ---------------------------------------------------------------------------
 
-MAX_OCCURRENCES = 50
+MAX_OCCURRENCES = 60
 
 
 def zoom_weekday(d: date) -> int:
@@ -548,7 +548,7 @@ def _nth_weekday(year: int, month: int, week: int, zdow: int) -> date | None:
 def expand_occurrences(
     start_utc: datetime, tz_name: str, recurrence: dict[str, Any], duration: int
 ) -> list[dict[str, Any]]:
-    """Generate the occurrences of a type-8 meeting (at most 50, DST-aware)."""
+    """Generate the occurrences of a type-8 meeting (at most 60, DST-aware)."""
     zone = _zone(tz_name)
     local = start_utc.astimezone(zone)
     kind = int(recurrence.get("type", 1))

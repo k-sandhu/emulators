@@ -4,6 +4,7 @@ meeting summaries, downloads and webhooks."""
 from __future__ import annotations
 
 import importlib
+from functools import wraps
 from typing import Any
 
 from fastapi import FastAPI
@@ -37,6 +38,17 @@ def _modules() -> list[Any]:
     return loaded
 
 
+def _validated_action(name: str, handler: Any) -> Any:
+    @wraps(handler)
+    def validated(ctx: ProviderContext, payload: dict[str, Any]) -> Any:
+        from emulators.providers.zoom.action_validation import action_body
+
+        action_body(name, payload)
+        return handler(ctx, payload)
+
+    return validated
+
+
 class ZoomProvider(Provider):
     name = "zoom"
     title = "Zoom"
@@ -57,6 +69,8 @@ class ZoomProvider(Provider):
         for module in _modules():
             if hasattr(module, "actions"):
                 module.actions(self)
+        for name, handler in self.actions.items():
+            self.actions[name] = _validated_action(name, handler)
 
     def seed(self, ctx: ProviderContext) -> None:
         for module in _modules():

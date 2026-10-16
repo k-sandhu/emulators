@@ -31,6 +31,7 @@ from emulators.providers.zoom.common import (
     respond,
     zoom_error,
 )
+from emulators.providers.zoom.shapes import share_token
 from emulators.providers.zoom.timeutil import day_range, in_days
 
 LIST_USER_RECORDINGS = Need("recording:read", "cloud_recording:read:list_user_recordings")
@@ -40,9 +41,10 @@ LIST_ACCOUNT_RECORDINGS = Need(
 READ_RECORDING = Need("recording:read", "cloud_recording:read:list_recording_files")
 DELETE_RECORDING = Need("recording:write", "cloud_recording:delete:meeting_recording")
 DELETE_FILE = Need("recording:write", "cloud_recording:delete:recording_file")
-RECOVER = Need("recording:write", "cloud_recording:update:recover_meeting_recording")
-READ_SETTINGS = Need("recording:read", "cloud_recording:read:meeting_recording_settings")
-WRITE_SETTINGS = Need("recording:write", "cloud_recording:update:meeting_recording_settings")
+RECOVER = Need("recording:write", "cloud_recording:update:recover_meeting_recordings")
+READ_SETTINGS = Need("recording:read", "cloud_recording:read:recording_settings")
+WRITE_SETTINGS = Need("recording:write", "cloud_recording:update:recording_settings")
+RECOVER_FILE = Need("recording:write", "cloud_recording:update:recover_single_recording")
 MAX_TTL_S = 604800
 SHARE_VALUES = ("publicly", "internally", "none")
 
@@ -53,16 +55,19 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
     def listing(request: Request, rows: list[dict[str, Any]], *, account: bool = False) -> dict[str, Any]:
         q = request.query_params
         today = ctx.clock.now().date()
-        lo, hi = day_range(
-            q.get("from"), q.get("to"), default_from=today - timedelta(days=1), default_to=today
-        )
         trash = query_bool(request, "trash")
+        lo, hi = day_range(
+            None if trash else q.get("from"),
+            None if trash else q.get("to"),
+            default_from=today,
+            default_to=today + timedelta(days=1),
+        )
         file_level = trash and q.get("trash_type") == "recording_file"
         if q.get("trash_type") not in (None, "", "meeting_recordings", "recording_file"):
             raise invalid_field("trash_type")
         keep = []
         for rec in rows:
-            if not in_days(rec["start_time"], lo, hi):
+            if not trash and not in_days(rec["start_time"], lo, hi):
                 continue
             if q.get("meeting_id") and str(rec["meeting_id"]) != q["meeting_id"].replace(" ", ""):
                 continue
@@ -105,7 +110,8 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
     # -- one meeting's recordings ---------------------------------------------------------
 
     def settings_of(rec: dict[str, Any]) -> dict[str, Any]:
-        return rec.setdefault("settings", dict(files.RECORDING_SETTINGS))
+        settings = rec.setdefault("settings", dict(files.RECORDING_SETTINGS))
+        return {**settings, "topic": rec["topic"]}
 
     @app.get("/v2/meetings/{meeting:path}/recordings/settings")
     async def get_recording_settings(request: Request, meeting: str) -> Response:
@@ -126,10 +132,17 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
             raise invalid_field("share_recording")
         if data.get("approval_type") not in (None, 0, 1, 2):
             raise invalid_field("approval_type")
-        current = settings_of(rec)
+        current = rec.setdefault("settings", dict(files.RECORDING_SETTINGS))
         for key in files.RECORDING_SETTINGS:
             if key in data:
                 current[key] = data[key]
+        if "password" in data:
+            rec["password"] = data["password"]
+            rec["recording_play_passcode"] = share_token(
+                ctx.world, "passcode", rec["id"], data["password"], length=40
+            )
+        if "topic" in data:
+            rec["topic"] = data["topic"]
         return Response(status_code=204)
 
     @app.put("/v2/meetings/{meeting:path}/recordings/status")
@@ -154,7 +167,7 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
     @app.put("/v2/meetings/{meeting:path}/recordings/{recording_id}/status")
     async def recover_file(request: Request, meeting: str, recording_id: str) -> Response:
         principal = authenticate(ctx, request)
-        admin = principal.authorize(RECOVER)
+        admin = principal.authorize(RECOVER_FILE)
         rec = lookup.find_recording(ctx, meeting, include_trashed=True)
         lookup.ensure_recording_access(ctx, principal, admin, rec)
         if (await json_body(request)).get("action") != "recover":
@@ -175,12 +188,13 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
     async def delete_file(request: Request, meeting: str, recording_id: str) -> Response:
         principal = authenticate(ctx, request)
         admin = principal.authorize(DELETE_FILE)
-        rec = lookup.find_recording(ctx, meeting)
+        rec = lookup.find_recording(ctx, meeting, include_trashed=True)
         lookup.ensure_recording_access(ctx, principal, admin, rec)
         action = request.query_params.get("action", "trash")
         if action not in ("trash", "delete"):
             raise invalid_field("action")
-        entry = next((f for f in files.live_files(rec) if f["id"] == recording_id), None)
+        candidates = rec["recording_files"] if action == "delete" else files.live_files(rec)
+        entry = next((f for f in candidates if f["id"] == recording_id), None)
         if entry is None:
             raise recording_missing()
         snapshot = simulate.recording_object({**rec, "recording_files": [entry]})
@@ -206,7 +220,7 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         body = files.recording_wire(rec)
         wanted = {f.strip() for f in (request.query_params.get("include_fields") or "").split(",")}
         if "download_access_token" in wanted:
-            ttl = query_int(request, "ttl", 86400, minimum=1)
+            ttl = query_int(request, "ttl", 86400, minimum=0)
             if ttl > MAX_TTL_S:
                 raise zoom_error(400, E_VALIDATION, "Invalid parameter: ttl. The maximum is 604800 seconds.")
             body["download_access_token"] = hooks.issue_download_token(ctx, rec["id"], ttl)
@@ -216,7 +230,7 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
     async def delete_recordings(request: Request, meeting: str) -> Response:
         principal = authenticate(ctx, request)
         admin = principal.authorize(DELETE_RECORDING)
-        rec = lookup.find_recording(ctx, meeting)
+        rec = lookup.find_recording(ctx, meeting, include_trashed=True)
         lookup.ensure_recording_access(ctx, principal, admin, rec)
         action = request.query_params.get("action", "trash")
         if action not in ("trash", "delete"):

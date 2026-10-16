@@ -145,7 +145,7 @@ async def test_range_rules_defaults_and_paging(zoom: httpx.AsyncClient, host: di
     assert changed.status_code == 400  # a token only works for the query that produced it
 
 
-async def test_default_window_is_yesterday_to_today() -> None:
+async def test_default_window_is_today_to_tomorrow() -> None:
     hub = EmulatorHub(
         providers=["zoom"],
         anchor="2026-10-16",
@@ -155,8 +155,8 @@ async def test_default_window_is_yesterday_to_today() -> None:
     async with httpx.AsyncClient(transport=hub.async_transport()) as client:
         maya = await token_for(client, MAYA)
         body = (await client.get(f"{V2}/users/me/recordings", headers=maya)).json()
-    assert (body["from"], body["to"]) == ("2026-10-15", "2026-10-16")
-    assert [m["topic"] for m in body["meetings"]] == ["Advisory Deal Review"]  # held 15 Oct
+    assert (body["from"], body["to"]) == ("2026-10-16", "2026-10-17")
+    assert body["meetings"] == []  # the most recent recording was held 15 Oct
 
 
 async def test_visibility_of_user_recordings(
@@ -203,7 +203,7 @@ async def test_get_meeting_recordings_by_uuid_in_every_encoding(
             assert r.json()["uuid"] == uuid and list(r.json()) == MEETING_KEYS
     by_id = (await zoom.get(f"{V2}/meetings/{BLUEFIN_ID}/recordings", headers=host)).json()
     assert by_id["uuid"] == recorded_of(ctx, BLUEFIN_ID)[-1]["id"]  # latest recorded instance
-    assert by_id["id"] == BLUEFIN_ID and by_id["type"] == 8
+    assert by_id["id"] == BLUEFIN_ID and by_id["type"] == "8"
     assert (
         await zoom.get(f"{V2}/meetings/{double_encode(leading)}/recordings", headers=maya)
     ).status_code == 403

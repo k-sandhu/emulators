@@ -262,13 +262,15 @@ async def test_dashboard_metrics(
     item = past["meetings"][0]
     assert {"uuid", "id", "topic", "host", "email", "user_type", "start_time", "end_time", "duration", "participants",
             "has_voip", "has_video", "has_recording", "in_room_participants", "dept"} <= set(item)  # fmt: skip
-    assert len(item["duration"]) == 5 and item["duration"][2] == ":"
+    assert len(item["duration"]) == 8 and item["duration"][2] == item["duration"][5] == ":"
     assert (await zoom.get(f"{V2}/metrics/meetings", headers=s2s)).json()["total_records"] == 0  # live
     uuid = instances_of(ctx, BLUEFIN_ID)[0]["id"]
-    assert (await zoom.get(f"{V2}/metrics/meetings/{double_encode(uuid)}", headers=s2s)).json()[
+    assert (await zoom.get(f"{V2}/metrics/meetings/{double_encode(uuid)}?type=past", headers=s2s)).json()[
         "uuid"
     ] == uuid
-    parts = (await zoom.get(f"{V2}/metrics/meetings/{double_encode(uuid)}/participants", headers=s2s)).json()
+    parts = (
+        await zoom.get(f"{V2}/metrics/meetings/{double_encode(uuid)}/participants?type=past", headers=s2s)
+    ).json()
     assert (
         parts["total_records"] == 6
         and "device" in parts["participants"][0]

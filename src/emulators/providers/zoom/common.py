@@ -240,9 +240,10 @@ class Need:
     classic: str
     granular: str
     admin_only: bool = False
+    classic_aliases: tuple[str, ...] = ()
 
     def names(self) -> list[str]:
-        base = [self.classic, self.granular]
+        base = [self.classic, self.granular, *self.classic_aliases]
         admin = [f"{n}:admin" for n in base]
         return admin if self.admin_only else [*base, *admin]
 
@@ -278,7 +279,7 @@ class Principal:
 
         Tokens minted without scopes (``/_emulator/tokens``) are unrestricted: reach then depends
         only on the caller's identity."""
-        if not self.scopes:
+        if not self.scopes and not self.grant.extra.get("enforce_scopes"):
             return self.is_account_admin
         acceptable = need.names()
         if not any(name in self.scopes for name in acceptable):
@@ -288,7 +289,9 @@ class Principal:
                 E_MISSING_SCOPE,
                 f"Invalid access token, does not contain scopes:[{', '.join(need.hint(granular=granular))}].",
             )
-        has_admin = any(f"{n}:admin" in self.scopes for n in (need.classic, need.granular))
+        has_admin = any(
+            f"{n}:admin" in self.scopes for n in (need.classic, need.granular, *need.classic_aliases)
+        )
         return has_admin and self.is_account_admin
 
 
@@ -334,15 +337,23 @@ def zoom_user_id(world: World, person_id: str) -> str:
 
 
 async def json_body(request: Request) -> dict[str, Any]:
+    from emulators.providers.zoom.validation import request_body
+
     raw = await request.body()
     if not raw.strip():
-        return {}
+        raw = b"{}"
+
+    def non_finite(_: str) -> None:
+        raise ValueError("Non-finite JSON number")
+
     try:
-        data = json.loads(raw)
-    except ValueError:
+        data = json.loads(raw, parse_constant=non_finite)
+        json.dumps(data, ensure_ascii=False, allow_nan=False).encode("utf-8")
+    except (ValueError, RecursionError):
         data = None
     if not isinstance(data, dict):
         raise zoom_error(400, E_VALIDATION, "Request Body should be a valid JSON object.")
+    request_body(request, data)
     return data
 
 
@@ -365,7 +376,9 @@ def query_bool(request: Request, name: str, default: bool = False) -> bool:
     raw = request.query_params.get(name)
     if raw in (None, ""):
         return default
-    return raw.lower() in ("true", "1", "yes")
+    if raw.lower() not in ("true", "false", "1", "0"):
+        raise invalid_param(name)
+    return raw.lower() in ("true", "1")
 
 
 # -- paging -------------------------------------------------------------------------------
@@ -380,36 +393,49 @@ def _fingerprint(request: Request) -> str:
     return stable_hash(request.url.path, pairs, length=8)
 
 
-def page_token(request: Request, offset: int) -> str:
-    return b64url(f"{offset}:{_fingerprint(request)}:{stable_hash(offset, length=10)}".encode())
-
-
 def paginate(request: Request, items: list[Any]) -> tuple[list[Any], dict[str, Any]]:
     """Slice ``items`` by ``page_size``/``next_page_token`` and return the paging envelope.
 
     Unknown or stale tokens fail the way Zoom's do (code 300)."""
     size = query_int(request, "page_size", DEFAULT_PAGE_SIZE, maximum=MAX_PAGE_SIZE)
     token = request.query_params.get("next_page_token")
+    ctx: ProviderContext = request.app.state.ctx
+    cursors = ctx.store.collection("_zoom_cursors")
+    grant = ctx.tokens.resolve(bearer_token(request))
+    identity = (grant.client_id, grant.user_id, grant.app_only, sorted(grant.scopes)) if grant else None
     offset = 0
     if token:
-        try:
-            raw = base64.urlsafe_b64decode(token + "=" * (-len(token) % 4)).decode()
-            off, fp, _ = raw.split(":")
-            offset = int(off)
-        except (ValueError, UnicodeDecodeError):
-            raise zoom_error(400, E_VALIDATION, "The next page token is invalid or has expired.") from None
-        if fp != _fingerprint(request):
+        cursor = cursors.get(token)
+        if (
+            cursor is None
+            or cursor["fingerprint"] != _fingerprint(request)
+            or cursor["identity"] != identity
+            or cursor["expires"] <= ctx.clock.timestamp()
+        ):
             raise zoom_error(400, E_VALIDATION, "The next page token is invalid or has expired.")
+        offset = cursor["offset"]
     elif request.query_params.get("page_number"):
         offset = (query_int(request, "page_number", 1) - 1) * size
     page = items[offset : offset + size]
     more = offset + size < len(items)
+    next_token = ""
+    if more:
+        next_token = secrets.token_urlsafe(32)
+        cursors.put(
+            {
+                "id": next_token,
+                "offset": offset + size,
+                "fingerprint": _fingerprint(request),
+                "identity": identity,
+                "expires": ctx.clock.timestamp() + 900,
+            }
+        )
     meta = {
         "page_count": math.ceil(len(items) / size),
         "page_number": offset // size + 1,
         "page_size": size,
         "total_records": len(items),
-        "next_page_token": page_token(request, offset + size) if more else "",
+        "next_page_token": next_token,
     }
     return page, meta
 

@@ -29,6 +29,7 @@ RECORDING_SETTINGS = {
     "approval_type": 2,
     "send_email_to_host": True,
     "show_social_share_buttons": True,
+    "auto_delete": False,
 }
 
 #: file_type -> (extension, content type, recording_type)
@@ -197,7 +198,7 @@ def build_recording(
         "recording_play_passcode": share_token(world, "passcode", instance["id"], length=40),
         "recording_files": files,
         "trashed": False,
-        "settings": dict(RECORDING_SETTINGS),
+        "settings": {**RECORDING_SETTINGS, "password": _recording_password(world, instance["id"])},
     }
     refresh_totals(record)
     return record
@@ -234,7 +235,7 @@ def recording_wire(record: dict[str, Any], *, trash_view: bool = False) -> dict[
         "account_id": record["account_id"],
         "host_id": record["host_id"],
         "topic": record["topic"],
-        "type": record["type"],
+        "type": str(record["type"]),
         "start_time": record["start_time"],
         "timezone": record["timezone"],
         "host_email": record["host_email"],

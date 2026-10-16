@@ -23,6 +23,7 @@ from emulators.core.errors import EmulatorError
 from emulators.core.provider import Provider, ProviderContext
 from emulators.core.webhooks import hmac_sha256_hex
 from emulators.providers.zoom.common import now_ms, tracking_id, zoom_token, zoom_user_id
+from emulators.providers.zoom.dispatcher import ZoomWebhookDispatcher
 from emulators.world.model import Person
 
 EVENT_NAMES = (
@@ -49,13 +50,26 @@ DOWNLOAD_TOKEN_TTL_S = 86400
 _ZOOM_URL = re.compile(r"https://((?:[a-z0-9-]+\.)*zoom\.us)")
 
 
+def seed(ctx: ProviderContext) -> None:
+    ctx.webhooks = ZoomWebhookDispatcher(
+        ctx.name,
+        ctx.store,
+        ctx.clock,
+        ctx.ids.fork("webhooks"),
+        mode=ctx.hub.webhook_mode,
+        transport_factory=lambda: ctx.hub.webhook_transport,
+        max_attempts=4,
+        timeout_s=3.0,
+    )
+
+
 def issue_download_token(ctx: ProviderContext, uuid: str, ttl_s: int = DOWNLOAD_TOKEN_TTL_S) -> str:
     """A ``download_access_token`` / webhook ``download_token``: usable as Bearer or ``?access_token=``
     on that meeting's recording download URLs only."""
     token = zoom_token(
         ctx, kind="download", uid=ctx.world.org.zoom_account_id, client_id="zoom-download", ttl_s=ttl_s
     )
-    ctx.tokens.issue(
+    grant = ctx.tokens.issue(
         "download",
         client_id="zoom-download",
         user_id=None,
@@ -63,6 +77,10 @@ def issue_download_token(ctx: ProviderContext, uuid: str, ttl_s: int = DOWNLOAD_
         ttl=timedelta(seconds=ttl_s),
         extra={"uuid": uuid},
     )
+    if ttl_s == 0:
+        stored = ctx.store.collection("_grants").get(grant.token)
+        if stored is not None:
+            stored["expires_at"] = ctx.clock.now()
     return token
 
 

@@ -21,6 +21,7 @@ from emulators.providers.zoom.common import (
     no_permission,
     owner_person,
     paginate,
+    query_bool,
     query_int,
     respond,
     runtime_b64_22,
@@ -28,19 +29,27 @@ from emulators.providers.zoom.common import (
     zoom_token,
 )
 
-LIST_USERS = Need("user:read", "user:read:list_users", admin_only=True)
-READ_USER = Need("user:read", "user:read:user")
+LIST_USERS = Need("user:read", "user:read:list_users", admin_only=True, classic_aliases=("user:write",))
+READ_USER = Need(
+    "user:read", "user:read:user", classic_aliases=("user:write", "user_profile", "user_info:read")
+)
 WRITE_USER = Need("user:write", "user:update:user")
 CREATE_USER = Need("user:write", "user:write:user", admin_only=True)
 DELETE_USER = Need("user:write", "user:delete:user", admin_only=True)
-READ_SETTINGS = Need("user:read", "user:read:settings")
+READ_SETTINGS = Need("user:read", "user:read:settings", classic_aliases=("user:write",))
 WRITE_SETTINGS = Need("user:write", "user:update:settings")
-LIST_GROUPS = Need("group:read", "group:read:list_groups", admin_only=True)
-READ_GROUP = Need("group:read", "group:read:group", admin_only=True)
+LIST_GROUPS = Need("group:read", "group:read:list_groups", admin_only=True, classic_aliases=("group:write",))
+READ_GROUP = Need("group:read", "group:read:group", admin_only=True, classic_aliases=("group:write",))
 WRITE_GROUP = Need("group:write", "group:write:group", admin_only=True)
-GROUP_MEMBERS = Need("group:read", "group:read:list_group_members", admin_only=True)
+UPDATE_GROUP = Need("group:write", "group:update:group", admin_only=True)
+DELETE_GROUP = Need("group:write", "group:delete:group", admin_only=True)
+ADD_MEMBER = Need("group:write", "group:write:member", admin_only=True)
+REMOVE_MEMBER = Need("group:write", "group:delete:member", admin_only=True)
+GROUP_MEMBERS = Need(
+    "group:read", "group:read:list_members", admin_only=True, classic_aliases=("group:write",)
+)
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
-USER_TYPES = (1, 2, 3, 99)
+USER_TYPES = (1, 2, 4, 99)
 PATCHABLE = [
     "first_name",
     "last_name",
@@ -59,7 +68,6 @@ PATCHABLE = [
     "manager",
     "vanity_name",
     "use_pmi",
-    "verified",
 ]
 
 
@@ -176,7 +184,7 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
     @app.get("/v2/users/email")
     async def user_email_exists(request: Request) -> Response:
         principal = authenticate(ctx, request)
-        principal.authorize(READ_USER)
+        principal.authorize(Need("user:read", "user:read:email", classic_aliases=("user:write",)))
         email = request.query_params.get("email", "")
         if not EMAIL_RE.match(email):
             raise invalid_field("email")
@@ -196,6 +204,8 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         admin = principal.authorize(WRITE_USER)
         rec = lookup.acting_user(ctx, principal, user_id, admin_level=admin)
         data = await json_body(request)
+        if data.get("group_id") and not admin:
+            raise no_permission()
         if "type" in data:
             if not admin:
                 raise no_permission()
@@ -242,6 +252,41 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         action = request.query_params.get("action", "disassociate")
         if action not in ("disassociate", "delete"):
             raise invalid_field("action")
+        transfer_meeting = query_bool(request, "transfer_meeting")
+        transfer_recording = query_bool(request, "transfer_recording")
+        target = None
+        if transfer_meeting or transfer_recording:
+            email = request.query_params.get("transfer_email", "")
+            target = lookup.find_user(ctx, email)
+            if target is None or target["id"] == rec["id"] or target["status"] != "active":
+                raise invalid_field("transfer_email")
+        removed_meetings = set()
+        for collection, transfer in (
+            ("meetings", transfer_meeting),
+            ("deleted_meetings", transfer_meeting),
+            ("recordings", transfer_recording),
+            ("instances", transfer_meeting or transfer_recording),
+        ):
+            records = ctx.store.collection(collection)
+            for item in records:
+                if item["host_id"] != rec["id"]:
+                    continue
+                if transfer and target is not None:
+                    item["host_id"], item["host_email"] = target["id"], target["email"]
+                    if collection in ("meetings", "deleted_meetings"):
+                        item["start_url"] = shapes.start_url(ctx.world, item["id"], target["id"])
+                    if collection == "instances":
+                        item.update(
+                            user_name=target["display_name"], user_email=target["email"], dept=target["dept"]
+                        )
+                else:
+                    records.delete(str(item["id"]))
+                    if collection in ("meetings", "deleted_meetings"):
+                        removed_meetings.add(item["id"])
+        registrants = ctx.store.collection("registrants")
+        for registrant in registrants:
+            if registrant["_meeting_id"] in removed_meetings:
+                registrants.delete(registrant["id"])
         users.delete(rec["id"])
         for group in groups:
             if rec["id"] in group["_member_ids"]:
@@ -254,7 +299,7 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
     @app.put("/v2/users/{user_id}/email")
     async def change_email(request: Request, user_id: str) -> Response:
         principal = authenticate(ctx, request)
-        admin = principal.authorize(WRITE_USER)
+        admin = principal.authorize(Need("user:write", "user:update:email"))
         rec = lookup.acting_user(ctx, principal, user_id, admin_level=admin)
         email = str((await json_body(request)).get("email", "")).strip()
         if not EMAIL_RE.match(email):
@@ -264,6 +309,10 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
             raise zoom_error(409, 1005, f"User already in the account: {email}")
         old = rec["email"]
         rec["email"] = email
+        for collection in ("meetings", "instances", "recordings"):
+            for item in ctx.store.collection(collection):
+                if item["host_id"] == rec["id"]:
+                    item["host_email"] = email
         await hooks.emit(
             ctx,
             "user.updated",
@@ -279,7 +328,7 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
     @app.put("/v2/users/{user_id}/status")
     async def user_status(request: Request, user_id: str) -> Response:
         principal = authenticate(ctx, request)
-        if not principal.authorize(Need("user:write", "user:update:user_status", admin_only=True)):
+        if not principal.authorize(Need("user:write", "user:update:status", admin_only=True)):
             raise no_permission()
         rec = lookup.acting_user(ctx, principal, user_id, admin_level=True)
         action = (await json_body(request)).get("action")
@@ -343,7 +392,7 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
     @app.get("/v2/users/{user_id}/permissions")
     async def user_permissions(request: Request, user_id: str) -> Response:
         principal = authenticate(ctx, request)
-        admin = principal.authorize(Need("user:read", "user:read:permissions"))
+        admin = principal.authorize(Need("user:read", "user:read:list_permissions"))
         rec = lookup.acting_user(ctx, principal, user_id, admin_level=admin)
         perms = ["Meeting:Read", "Meeting:Edit", "Recording:Read", "Recording:Edit", "User:Read"]
         if rec["role_id"] in ("0", "1"):
@@ -408,11 +457,11 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
     @app.patch("/v2/groups/{group_id}")
     async def patch_group(request: Request, group_id: str) -> Response:
         principal = authenticate(ctx, request)
-        if not principal.authorize(WRITE_GROUP):
+        if not principal.authorize(UPDATE_GROUP):
             raise no_permission()
         group = find_group(group_id)
         name = str((await json_body(request)).get("name", "")).strip()
-        if not name:
+        if not name or len(name) > 128:
             raise invalid_field("name")
         group["name"] = name
         return Response(status_code=204)
@@ -420,7 +469,7 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
     @app.delete("/v2/groups/{group_id}")
     async def delete_group(request: Request, group_id: str) -> Response:
         principal = authenticate(ctx, request)
-        if not principal.authorize(WRITE_GROUP):
+        if not principal.authorize(DELETE_GROUP):
             raise no_permission()
         group = find_group(group_id)
         for zid in group["_member_ids"]:
@@ -443,15 +492,18 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
     @app.post("/v2/groups/{group_id}/members")
     async def add_group_members(request: Request, group_id: str) -> Response:
         principal = authenticate(ctx, request)
-        if not principal.authorize(WRITE_GROUP):
+        if not principal.authorize(ADD_MEMBER):
             raise no_permission()
         group = find_group(group_id)
         data = await json_body(request)
-        added = []
+        resolved = []
         for entry in data.get("members") or []:
             user = lookup.find_user(ctx, entry.get("id") or entry.get("email") or "")
             if user is None:
                 raise zoom_error(404, 1001, f"User does not exist: {entry.get('id') or entry.get('email')}.")
+            resolved.append(user)
+        added = []
+        for user in resolved:
             if user["id"] not in group["_member_ids"]:
                 group["_member_ids"].append(user["id"])
                 user["group_ids"].append(group_id)
@@ -463,7 +515,7 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
     @app.delete("/v2/groups/{group_id}/members/{member_id}")
     async def remove_group_member(request: Request, group_id: str, member_id: str) -> Response:
         principal = authenticate(ctx, request)
-        if not principal.authorize(WRITE_GROUP):
+        if not principal.authorize(REMOVE_MEMBER):
             raise no_permission()
         group = find_group(group_id)
         user = lookup.find_user(ctx, member_id)

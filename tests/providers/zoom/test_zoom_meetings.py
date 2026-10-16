@@ -319,7 +319,7 @@ async def test_recurring_daily_monthly_and_end_date(zoom: httpx.AsyncClient, sta
     capped = await create(
         zoom, staff, type=8, start_time="2026-11-02T10:00:00Z", recurrence={"type": 1, "end_times": 0}
     )
-    assert len(capped["occurrences"]) == 50
+    assert len(capped["occurrences"]) == 60
 
 
 async def test_update_meeting_fields_password_and_single_occurrence(

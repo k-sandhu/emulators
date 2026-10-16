@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import copy
 import re
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any
 
 from fastapi import FastAPI, Request, Response
@@ -34,6 +34,7 @@ from emulators.providers.zoom.timeutil import parse_instant, valid_timezone
 from emulators.world.model import Person
 
 LIST_MEETINGS = Need("meeting:read", "meeting:read:list_meetings")
+LIST_UPCOMING = Need("meeting:read", "meeting:read:list_upcoming_meetings")
 READ_MEETING = Need("meeting:read", "meeting:read:meeting")
 CREATE_MEETING = Need("meeting:write", "meeting:write:meeting")
 UPDATE_MEETING = Need("meeting:write", "meeting:update:meeting")
@@ -43,6 +44,7 @@ INVITATION = Need("meeting:read", "meeting:read:invitation")
 LIST_REGISTRANTS = Need("meeting:read", "meeting:read:list_registrants")
 ADD_REGISTRANT = Need("meeting:write", "meeting:write:registrant")
 UPDATE_REGISTRANT = Need("meeting:write", "meeting:update:registrant_status")
+DELETE_REGISTRANT = Need("meeting:write", "meeting:delete:registrant")
 MEETING_TYPES = (1, 2, 3, 8)
 LIST_TYPES = ("scheduled", "live", "upcoming", "upcoming_meetings", "previous_meetings")
 AUDIO_OPTIONS = ("both", "telephony", "voip", "thirdParty")
@@ -100,7 +102,15 @@ def check_common(data: dict[str, Any], *, creating: bool) -> None:
         raise invalid_field("duration")
     if "timezone" in data and not valid_timezone(str(data["timezone"])):
         raise invalid_field("timezone")
-    if data.get("password") is not None and not PASSWORD_RE.match(str(data["password"])):
+    if (
+        "password" in data
+        and data["password"]
+        and not (
+            re.fullmatch(r"[\x21-\x7e]{1,10}", data["password"])
+            if creating
+            else PASSWORD_RE.fullmatch(data["password"])
+        )
+    ):
         raise invalid_field("password", "Passcode may only contain letters, digits and @ - _ *.")
     if "recurrence" in data and not isinstance(data["recurrence"], dict):
         raise invalid_field("recurrence")
@@ -109,7 +119,7 @@ def check_common(data: dict[str, Any], *, creating: bool) -> None:
 def parse_start(data: dict[str, Any], tz_name: str) -> Any:
     try:
         return parse_instant(data["start_time"], tz_name)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, OverflowError):
         raise invalid_field("start_time") from None
 
 
@@ -127,30 +137,49 @@ def regenerate_occurrences(meeting: dict[str, Any], uuid_factory: Any) -> None:
     meeting["occurrences"] = happened
 
 
-def upcoming_occurrences(meeting: dict[str, Any]) -> list[dict[str, Any]]:
-    return [o for o in meeting.get("occurrences", []) if not o.get("_happened") and o["status"] != "deleted"]
+def upcoming_occurrences(meeting: dict[str, Any], now: datetime | None = None) -> list[dict[str, Any]]:
+    return [
+        o
+        for o in meeting.get("occurrences", [])
+        if not o.get("_happened")
+        and o["status"] != "deleted"
+        and (now is None or parse_instant(o["start_time"]) >= now)
+    ]
 
 
-def listing_start(meeting: dict[str, Any], list_type: str) -> str | None:
+def listing_start(meeting: dict[str, Any], list_type: str, now: datetime) -> str | None:
     occs = meeting.get("occurrences", [])
     if list_type in ("upcoming", "upcoming_meetings"):
-        up = upcoming_occurrences(meeting)
+        up = upcoming_occurrences(meeting, now)
         return up[0]["start_time"] if up else meeting.get("start_time")
     if list_type == "previous_meetings":
-        past = [o for o in occs if o.get("_happened")]
+        past = [
+            o
+            for o in occs
+            if o["status"] != "deleted"
+            and parse_instant(o["start_time"]) + timedelta(minutes=o["duration"]) < now
+        ]
         return past[-1]["start_time"] if past else meeting.get("start_time")
     return meeting.get("start_time")
 
 
-def matches_type(meeting: dict[str, Any], list_type: str) -> bool:
+def matches_type(meeting: dict[str, Any], list_type: str, now: datetime) -> bool:
+    if meeting["type"] == 1:
+        return False
     if list_type == "live":
         return meeting.get("status") == "started"
     if list_type in ("upcoming", "upcoming_meetings"):
         return (
-            meeting.get("status") == "started" or bool(upcoming_occurrences(meeting)) or meeting["type"] == 3
+            meeting.get("status") == "started"
+            or bool(upcoming_occurrences(meeting, now))
+            or meeting["type"] == 3
         )
     if list_type == "previous_meetings":
-        return any(o.get("_happened") for o in meeting.get("occurrences", []))
+        return any(
+            o["status"] != "deleted"
+            and parse_instant(o["start_time"]) + timedelta(minutes=o["duration"]) < now
+            for o in meeting.get("occurrences", [])
+        )
     return True
 
 
@@ -179,20 +208,26 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         if list_type not in LIST_TYPES:
             raise invalid_field("type")
         lo = hi = None
+        tz_name = q.get("timezone", "UTC")
+        if not valid_timezone(tz_name):
+            raise invalid_field("timezone")
         try:
             if q.get("from"):
-                lo = parse_instant(q["from"], "UTC")
+                lo = parse_instant(q["from"], tz_name)
             if q.get("to"):
-                hi = parse_instant(q["to"], "UTC") + (
+                hi = parse_instant(q["to"], tz_name) + (
                     timedelta(days=1) if len(q["to"]) == 10 else timedelta()
                 )
-        except ValueError:
+        except (ValueError, OverflowError):
             raise invalid_field("from") from None
+        if lo and hi and lo >= hi:
+            raise invalid_field("to")
+        now = ctx.clock.now()
         rows = []
         for m in meetings:
-            if m["host_id"] != host["id"] or not matches_type(m, list_type):
+            if m["host_id"] != host["id"] or not matches_type(m, list_type, now):
                 continue
-            start = listing_start(m, list_type)
+            start = listing_start(m, list_type, now)
             if (lo or hi) and start:
                 moment = parse_instant(start)
                 if (lo and moment < lo) or (hi and moment >= hi):
@@ -211,13 +246,15 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
     @app.get("/v2/users/{user_id}/upcoming_meetings")
     async def upcoming_meetings(request: Request, user_id: str) -> Response:
         principal = authenticate(ctx, request)
-        admin = principal.authorize(LIST_MEETINGS)
+        admin = principal.authorize(LIST_UPCOMING)
         host = lookup.acting_user(ctx, principal, user_id, admin_level=admin)
         rows = []
         for m in meetings:
             if m["host_id"] != host["id"]:
                 continue
-            for occ in upcoming_occurrences(m):
+            if m["type"] == 1:
+                continue
+            for occ in upcoming_occurrences(m, ctx.clock.now()):
                 rows.append(
                     {
                         "id": m["id"],
@@ -270,7 +307,9 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
                 "recurrence", "Recurrence is required for a recurring meeting with fixed time."
             )
         mid = new_meeting_id()
-        password = str(data.get("password") or shapes.numeric_password(world, mid, ctx.ids.hex(8)))
+        password = data.get("password") or (
+            shapes.numeric_password(world, mid, ctx.ids.hex(8)) if data.get("default_password", True) else ""
+        )
         enc = shapes.encrypted_password(world, mid, password)
         uuid = runtime_uuid(ctx)
         record: dict[str, Any] = {
@@ -300,7 +339,10 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
             record["tracking_fields"] = data["tracking_fields"]
         if kind == 8:
             record["recurrence"] = recurrence
-            record["occurrences"] = shapes.expand_occurrences(start, tz_name, recurrence, duration)
+            try:
+                record["occurrences"] = shapes.expand_occurrences(start, tz_name, recurrence, duration)
+            except (ValueError, OverflowError):
+                raise invalid_field("recurrence") from None
             if record["occurrences"]:  # the series starts at its first real occurrence
                 record["start_time"] = record["occurrences"][0]["start_time"]
             for occ in record["occurrences"]:
@@ -371,7 +413,7 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
     async def update_meeting(request: Request, meeting_id: str) -> Response:
         principal = authenticate(ctx, request)
         admin = principal.authorize(UPDATE_MEETING)
-        meeting = lookup.find_meeting(ctx, meeting_id)
+        meeting = copy.deepcopy(lookup.find_meeting(ctx, meeting_id))
         lookup.ensure_meeting_access(ctx, principal, admin, meeting, write=True)
         data = await json_body(request)
         check_common(data, creating=False)
@@ -396,14 +438,30 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
             if "duration" in data:
                 old["duration"] = occ["duration"]
                 occ["duration"] = new["duration"] = data["duration"]
+            if "agenda" in data:
+                old["agenda"] = occ.get("_agenda", meeting.get("agenda", ""))
+                occ["_agenda"] = new["agenda"] = data["agenda"]
+            if incoming:
+                old["settings"] = copy.deepcopy(occ.get("_settings", meeting["settings"]))
+                occ["_settings"] = merge_settings(old["settings"], incoming)
+                new["settings"] = incoming
         else:
-            if (
-                meeting["type"] == 8
-                and "type" in data
-                and data["type"] != 8
-                and data.get("recurrence") is None
-            ):
-                raise invalid_field("type")
+            if "type" in data:
+                old["type"], new["type"] = meeting["type"], data["type"]
+                meeting["type"] = data["type"]
+                if meeting["type"] == 8 and not (data.get("recurrence") or meeting.get("recurrence")):
+                    raise invalid_field("recurrence")
+                if meeting["type"] != 8:
+                    meeting.pop("recurrence", None)
+                    if meeting["type"] != old["type"]:
+                        meeting["occurrences"] = []
+                if meeting["type"] == 3:
+                    meeting.pop("start_time", None)
+                    meeting.pop("duration", None)
+                    meeting["occurrences"] = []
+                else:
+                    meeting.setdefault("start_time", isoformat_z(ctx.clock.now()))
+                    meeting.setdefault("duration", 60)
             for key in ("topic", "agenda", "duration", "timezone"):
                 if key in data:
                     old[key], meeting[key] = meeting.get(key), data[key]
@@ -413,11 +471,13 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
                 meeting["start_time"] = isoformat_z(parse_start(data, meeting["timezone"]))
                 new["start_time"] = meeting["start_time"]
             if "recurrence" in data:
+                if meeting["type"] != 8:
+                    raise invalid_field("recurrence")
                 old["recurrence"], meeting["recurrence"] = meeting.get("recurrence"), data["recurrence"]
                 new["recurrence"] = data["recurrence"]
-                if meeting["type"] != 8:
-                    meeting["type"] = 8
             if "password" in data:
+                old["password"] = meeting["password"]
+                new["password"] = data["password"]
                 meeting["password"] = meeting["h323_password"] = meeting["pstn_password"] = str(
                     data["password"]
                 )
@@ -431,11 +491,25 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
                 new["settings"] = incoming
             if "tracking_fields" in data:
                 meeting["tracking_fields"] = data["tracking_fields"]
-            retimed = {"start_time", "duration", "timezone", "recurrence"} & set(new)
+            retimed = {"start_time", "duration", "timezone", "recurrence", "type"} & set(new)
             if retimed:
                 if meeting["type"] == 8 and meeting.get("recurrence"):
-                    regenerate_occurrences(meeting, lambda: runtime_uuid(ctx))
+                    try:
+                        regenerate_occurrences(meeting, lambda: runtime_uuid(ctx))
+                    except (ValueError, OverflowError):
+                        raise invalid_field("recurrence") from None
                 else:
+                    if meeting["type"] != 3 and not meeting.get("occurrences"):
+                        start = parse_instant(meeting["start_time"])
+                        meeting["occurrences"] = [
+                            {
+                                "occurrence_id": str(int(start.timestamp() * 1000)),
+                                "start_time": meeting["start_time"],
+                                "duration": meeting["duration"],
+                                "status": "available",
+                                "_uuid": meeting["uuid"],
+                            }
+                        ]
                     for occ in meeting.get("occurrences", []):
                         if not occ.get("_happened"):
                             occ["start_time"] = meeting.get("start_time", occ["start_time"])
@@ -443,6 +517,7 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
                             occ["occurrence_id"] = str(
                                 int(parse_instant(occ["start_time"]).timestamp() * 1000)
                             )
+        meetings.put(meeting)
         if new:
             await hooks.emit(
                 ctx,
@@ -632,6 +707,7 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
             raise invalid_field("action")
         mapping = {"approve": "approved", "cancel": "cancelled", "deny": "denied"}
         known = {r["id"]: r for r in registrants_of(meeting)}
+        selected = []
         for entry in data.get("registrants") or []:
             reg = known.get(entry.get("id")) or next(
                 (r for r in known.values() if r["email"].lower() == str(entry.get("email", "")).lower()), None
@@ -640,15 +716,19 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
                 raise zoom_error(
                     404, 3043, f"Registrant does not exist: {entry.get('id') or entry.get('email')}."
                 )
+            selected.append(reg)
+        for reg in selected:
             reg["status"] = mapping[action]
         return Response(status_code=204)
 
     @app.delete("/v2/meetings/{meeting_id}/registrants/{registrant_id}")
     async def delete_registrant(request: Request, meeting_id: str, registrant_id: str) -> Response:
         principal = authenticate(ctx, request)
-        admin = principal.authorize(UPDATE_REGISTRANT)
+        admin = principal.authorize(DELETE_REGISTRANT)
         meeting = lookup.find_meeting(ctx, meeting_id)
         lookup.ensure_meeting_access(ctx, principal, admin, meeting, write=True)
-        if ctx.store.collection("registrants").delete(registrant_id) is None:
+        registrant = ctx.store.collection("registrants").get(registrant_id)
+        if registrant is None or registrant["_meeting_id"] != meeting["id"]:
             raise zoom_error(404, 3043, f"Registrant does not exist: {registrant_id}.")
+        ctx.store.collection("registrants").delete(registrant_id)
         return Response(status_code=204)

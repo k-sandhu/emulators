@@ -189,11 +189,11 @@ async def test_failing_consumer_is_retried_and_journaled(
     deliveries = (
         await zoom.get(f"{API}/_emulator/webhooks", params={"event_type": "meeting.created"})
     ).json()["deliveries"]
-    assert len(deliveries) == 1 and deliveries[0]["status"] == "failed" and deliveries[0]["attempts"] == 3
+    assert len(deliveries) == 1 and deliveries[0]["status"] == "failed" and deliveries[0]["attempts"] == 4
     assert deliveries[0]["response_status"] == 500
     assert {"x-zm-signature", "x-zm-request-timestamp"} <= {h.lower() for h in deliveries[0]["headers"]}
     # every attempt carried a fresh, valid signature
-    assert len(receiver.events) == 3 and all(receiver.signatures_ok)
+    assert len(receiver.events) == 4 and all(receiver.signatures_ok)
 
 
 async def test_live_meeting_lifecycle_creates_recordings_and_events(

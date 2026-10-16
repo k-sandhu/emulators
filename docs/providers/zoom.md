@@ -10,6 +10,13 @@ Wire compatibility is the goal: a client that works against Zoom (for example on
 the VTT/M4A/MP4 `download_url` with a Bearer header) works unchanged. `tests/sdk/test_zoom_http.py` runs that
 exact flow with plain `httpx` and `requests` over real sockets.
 
+The fidelity audit uses Zoom's published [Meetings OpenAPI](https://developers.zoom.us/api-hub/meetings/methods/endpoints.json),
+[Users OpenAPI](https://developers.zoom.us/api-hub/users/methods/endpoints.json),
+[Accounts/Dashboard OpenAPI](https://developers.zoom.us/api-hub/accounts/methods/endpoints.json),
+[OAuth reference](https://developers.zoom.us/docs/integrations/oauth/), and
+[webhook delivery rules](https://developers.zoom.us/docs/api/webhooks/). Request constraints are stored locally in
+`request_meetings.py`, `request_users.py`, and `request_settings.py`; serving requests never fetches a schema.
+
 ## Hosts
 
 | Host | Used for |
@@ -31,8 +38,8 @@ and injected faults included) and JSON as `application/json;charset=UTF-8`.
 
 ## Auth flows and test credentials
 
-Clients are lenient by default: any `client_id`/`client_secret` is accepted. The account id is
-`ctx.world.org.zoom_account_id` = **`hAlCy0nbd53d988b8b5815`** (also in `GET /_emulator/info`).
+Clients are lenient by default: any `client_id`/`client_secret` is accepted. Find the synthetic account id and
+test credential guidance at `GET /_emulator/info`. Use these local values instead of real credentials.
 
 | Flow | Request | Notes |
 | --- | --- | --- |
@@ -41,10 +48,10 @@ Clients are lenient by default: any `client_id`/`client_secret` is accepted. The
 | Refresh | `grant_type=refresh_token&refresh_token=` | Refresh tokens **rotate**: the old one is dead after use (`{"reason":"Invalid Token!","error":"invalid_request"}`). |
 | Server-to-Server | `POST https://zoom.us/oauth/token?grant_type=account_credentials&account_id=<id>` | Parameters may ride in the query string or a form body. No refresh token. Wrong `account_id` -> `Invalid Token!`. |
 | Chatbot | `grant_type=client_credentials` | Scope `imchat:bot` only: every `/v2` call answers `4700` (no API scopes). |
-| Revoke | `POST https://zoom.us/oauth/revoke` (Basic auth, `token=`) | `{"status":"success"}`; revoking a refresh token also revokes the access tokens minted from it. |
+| Revoke | `POST https://zoom.us/oauth/revoke` (Basic auth, `token=`) | `{"status":"success"}`; the token must belong to the authenticated client. A refresh token and its paired access token are revoked together. |
 | Shortcut | `POST /_emulator/tokens {"user": "<id\|email>", "scopes": [...], "app_only": bool, "expires_in": s}` | Returns a Zoom-format token. No `user` (or `app_only`) = account-level app. Omit `scopes` for an unrestricted token. |
 
-Token response: `{"access_token": "eyJzdiI6IjAwMDAwMSIs...", "token_type": "bearer", "refresh_token": ..., "expires_in": 3599,
+Token response: `{"access_token": "<issued token>", "token_type": "bearer", "refresh_token": ..., "expires_in": 3599,
 "scope": "...", "api_url": "https://api.zoom.us"}`. Tokens are JWT-shaped (`{"sv":"000001","alg":"HS512",...}`; payload has
 `uid`, `aid`, `cid`, `iat`, `exp`) but are validated by lookup, not signature. Token errors use
 `{"reason": "...", "error": "..."}` (`invalid_client` is `401`, the rest `400`).
@@ -53,6 +60,9 @@ Token response: `{"access_token": "eyJzdiI6IjAwMDAwMSIs...", "token_type": "bear
 redirect URIs (Zoom has no `scope` parameter on `/authorize`: scopes belong to the app). Unregistered clients get
 `meeting:read:admin meeting:write:admin recording:read:admin recording:write:admin user:read:admin user:write:admin
 report:read:admin group:read:admin group:write:admin dashboard_meetings:read:admin meeting_summary:read:admin`.
+The authorize URL cannot expand those configured scopes. An explicitly empty registered scope list grants no API
+access. Code exchange requires the original `redirect_uri`. Deleted or deactivated directory users cannot authorize,
+redeem codes, or refresh, even if their underlying world person is still active.
 
 ### Identity, scopes and visibility
 
@@ -70,6 +80,12 @@ report:read:admin group:read:admin group:write:admin dashboard_meetings:read:adm
   `401 {"code":4700,"message":"Invalid access token, does not contain scopes:[recording:read]."}` (classic apps see the classic
   name, `[x:admin]` for account-level endpoints; granular apps see `[meeting:read:meeting, meeting:read:meeting:admin]`).
   Tokens minted with `/_emulator/tokens` without scopes are unrestricted (identity rules still apply).
+* Granular scopes are endpoint specific: for example `group:update:group:admin`, `group:write:member:admin`,
+  `group:delete:member:admin`, `group:read:list_members:admin`, `user:update:email`, `user:update:status:admin`,
+  `user:read:list_permissions`, `cloud_recording:read:recording_settings:admin`,
+  `cloud_recording:update:recover_single_recording:admin`, and `report:read:user:admin`.
+  Dashboard granular scopes use `dashboard:read:list_meetings:admin`, `dashboard:read:meeting:admin`, and
+  `dashboard:read:list_meeting_participants:admin`.
 * Deactivated or deleted users lose their tokens. Departed employees (`paul.henderson`, `yuki.tanaka`) are
   `status: "inactive"` and cannot sign in.
 * API errors: `{"code": 124, "message": "Invalid access token."}` / `"Access token is expired."` (401),
@@ -77,6 +93,12 @@ report:read:admin group:read:admin group:write:admin dashboard_meetings:read:adm
   `{"code": 3301, "message": "This recording does not exist."}` (404), `{"code": 3003, "message": "You are not the meeting host."}` (403),
   `{"code": 300, "message": "Validation Failed.", "errors": [{"field": ..., "message": "Invalid field."}]}` / `Invalid parameter: x.` /
   `Request Body should be a valid JSON object.` (400), `429` with `Retry-After` and `X-RateLimit-*` via fault injection.
+
+Pagination tokens are opaque, reusable for the same query and principal, expire after 15 minutes, and are invalidated
+by reset. Changing filters, using another identity, or tampering with a token returns `400` / code `300`. The final
+page returns `next_page_token: ""`. Nested write fields are validated before mutation, including strict JSON scalar
+types, strings, arrays of members/registrants, settings, and recurrence. Invalid batches and meeting updates leave
+the original resource unchanged. Simulation actions also validate inputs before changing state.
 
 ## Endpoints
 
@@ -88,17 +110,17 @@ IDs: `{userId}` is a 22-char user id, an email, or `me`. `{meetingId}` is 10-11 
 | GET | `/v2/users` | `status` active\|inactive\|pending, `role_id`, `license`, `page_size` (30, max 300, silently capped), `next_page_token`, `page_number`, `include_fields=host_key`. Admin only. |
 | POST | `/v2/users` | `action` create\|autoCreate\|custCreate\|ssoCreate, `user_info`. Admin; `201 {id, first_name, last_name, email, type}`; duplicate = `409 1005`. |
 | GET | `/v2/users/email?email=` | `{existed_email}` |
-| GET / PATCH / DELETE | `/v2/users/{userId}` | Full record (`role_name`, `personal_meeting_url`, `cms_user_id`, `jid`, `account_id`, `account_number`, `host_key`, `cluster` `us06`, `job_title`, `company`, `location`, `manager`). PATCH is `204`; `type` only by admins. DELETE `action=disassociate\|delete`, `204`, not the owner. |
+| GET / PATCH / DELETE | `/v2/users/{userId}` | Full record (`role_name`, `personal_meeting_url`, `cms_user_id`, `jid`, `account_id`, `account_number`, `host_key`, `cluster` `us06`, `job_title`, `company`, `location`, `manager`). PATCH is `204`; `type` and group assignment require admins. DELETE `action=disassociate\|delete`, `204`, not the owner. Owned meetings/recordings leave the account; `transfer_email` with `transfer_meeting`/`transfer_recording` moves those assets to an active user. |
 | PUT | `/v2/users/{userId}/status`, `/email` | activate / deactivate (revokes tokens); change email. |
 | GET / PATCH | `/v2/users/{userId}/settings` | Subset (`schedule_meeting`, `in_meeting`, `email_notification`, `recording`, `telephony`, `feature`, `tsp`); PATCH overlays. |
 | GET | `/v2/users/{userId}/token`, `/permissions` | zak token; role permissions. |
 | GET / POST / PATCH / DELETE | `/v2/groups`, `/v2/groups/{id}` | Department, role and "All Staff" world groups. |
 | GET / POST / DELETE | `/v2/groups/{id}/members`, `/members/{memberId}` | `group_ids` on users stay in sync. |
-| GET | `/v2/users/{userId}/meetings` | `type` scheduled\|live\|upcoming\|upcoming_meetings\|previous_meetings, `from`/`to`, paging. Series appear once (type 8). |
+| GET | `/v2/users/{userId}/meetings` | `type` scheduled\|live\|upcoming\|upcoming_meetings\|previous_meetings, `from`/`to`, `timezone`, paging. Series appear once (type 8). Instant meetings are excluded; upcoming/previous are based on scheduled times, including meetings that were never started. |
 | GET | `/v2/users/{userId}/upcoming_meetings` | One row per upcoming occurrence. |
-| POST | `/v2/users/{userId}/meetings` | `topic`, `type` 1\|2\|3\|8, `start_time` (`...Z` = GMT, bare = local in `timezone`), `duration`, `password`, `agenda`, `recurrence`, `settings`, `schedule_for`. `201` with `start_url` (zak), `join_url ...?pwd=`, `password`, `h323_password`, `pstn_password`, `encrypted_password`, full `settings`, `occurrences`. Emits `meeting.created`. |
+| POST | `/v2/users/{userId}/meetings` | `topic`, `type` 1\|2\|3\|8, `start_time` (`...Z` = GMT, bare = local in `timezone`), `duration` (1..1440), `password`, `default_password`, `agenda`, `recurrence`, `settings`, `schedule_for`. `201` with `start_url` (zak), `join_url ...?pwd=`, password fields, settings, occurrences. Recurrence supports up to 60 occurrences. Emits `meeting.created`. |
 | GET | `/v2/meetings/{meetingId}` | `occurrence_id`, `show_previous_occurrences`. Occurrences default to the ones still to come. |
-| PATCH / DELETE | `/v2/meetings/{meetingId}` | `204`; `occurrence_id` edits/deletes one occurrence; emit `meeting.updated` (with `old_object`) / `meeting.deleted`. |
+| PATCH / DELETE | `/v2/meetings/{meetingId}` | `204`; type updates persist; `occurrence_id` edits/deletes one occurrence (including agenda/settings overrides); emit `meeting.updated` (with `old_object`) / `meeting.deleted`. |
 | PUT | `/v2/meetings/{meetingId}/status` | `end` (live meetings; records when `auto_recording` is `cloud`) or `recover` (deleted meeting). |
 | GET | `/v2/meetings/{meetingId}/invitation` | `{invitation, sip_links}` in Zoom's invitation text format. |
 | GET / POST / PUT / DELETE | `/v2/meetings/{meetingId}/registrants`, `/registrants/status`, `/registrants/{id}` | Needs `settings.approval_type` 0 or 1 (else `400 3000`). |
@@ -107,13 +129,13 @@ IDs: `{userId}` is a 22-char user id, an email, or `me`. `{meetingId}` is 10-11 
 | GET | `/v2/past_meetings/{id or UUID}/participants` | `{page_count, page_size, total_records, next_page_token, participants}`; guests have empty `user_id`/`user_email`. |
 | GET | `/v2/report/meetings/{id or UUID}`, `/participants` | Adds `has_*` flags, `customer_key`, `attentiveness_score`; `include_fields=registrant_id`. Admin. |
 | GET | `/v2/report/users/{userId}/meetings`, `/v2/report/daily`, `/v2/report/users` | `from`/`to` required (max 30 days) except `daily`. |
-| GET | `/v2/metrics/meetings`, `/{id or UUID}`, `/{id or UUID}/participants` | Dashboard; `type` past\|pastOne\|live. Admin. |
-| GET | `/v2/users/{userId}/recordings` | `from`/`to` `YYYY-MM-DD` (default yesterday..today, max 30 days else `400 300`; empty values mean "not given"), `page_size`, `next_page_token`, `trash`, `trash_type`, `meeting_id`, `mc`. Newest first. |
+| GET | `/v2/metrics/meetings`, `/{id or UUID}`, `/{id or UUID}/participants` | Dashboard; `type` past\|pastOne\|live (default live, also enforced on detail/participants); `pastOne` selects one-user meetings. Lists accept dates or timestamps and `query_date_type`. Durations are `HH:MM:SS`. Admin. |
+| GET | `/v2/users/{userId}/recordings` | `from`/`to` `YYYY-MM-DD` (default today..tomorrow per the current reference, max 30 days else `400 300`; empty values mean "not given"), `page_size`, `next_page_token`, `trash`, `trash_type`, `meeting_id`, `mc`. Trash ignores date filters. Newest first. |
 | GET | `/v2/accounts/{accountId}/recordings` | Account-wide (`me` or the account id). Admin. |
 | GET | `/v2/meetings/{id or UUID}/recordings` | `include_fields=download_access_token`, `ttl` (max 604800). A meeting id returns its latest recorded instance. |
-| DELETE | `/v2/meetings/{id or UUID}/recordings`, `/recordings/{recordingId}` | `action=trash` (default) \| `delete`; `204`. |
+| DELETE | `/v2/meetings/{id or UUID}/recordings`, `/recordings/{recordingId}` | `action=trash` (default) \| `delete`; `204`. Permanently deleting a trashed recording or file is supported. |
 | PUT | `/v2/meetings/{id or UUID}/recordings/status`, `/recordings/{recordingId}/status` | `{"action":"recover"}`. |
-| GET / PATCH | `/v2/meetings/{id or UUID}/recordings/settings` | `share_recording`, `viewer_download`, `password`, `on_demand`, ... |
+| GET / PATCH | `/v2/meetings/{id or UUID}/recordings/settings` | `share_recording`, `viewer_download`, `password`, `topic`, `on_demand`, `auto_delete`, ...; password/topic edits stay consistent with the recordings object. |
 | GET | `/v2/meetings/{id or UUID}/meeting_summary` | AI Companion summary built from the transcript (404 when untranscribed). |
 | GET | `/v2/meetings/meeting_summaries` | Account list; `from`/`to`, `host_id`. Admin. |
 | GET | `https://us06web.zoom.us/rec/download/<token>` | `Authorization: Bearer` or `?access_token=` (OAuth or download token); `302` to ssrweb. |
@@ -165,10 +187,12 @@ single-encoded and unencoded forms also work wherever a UUID is accepted.
   transcribed meetings, `CHAT` TXT (`chat_file`) when the meeting had chat. The MP4/M4A are valid ISO-BMFF with AAC audio
   (silent; no video track), the VTT is Zoom style (`1`, `00:00:41.410 --> ...`, `Benjamin Adler: text`), chat lines are
   `HH:MM:SS<TAB> From  Name to  Everyone:<TAB>text`. Times in transcripts/chat count from `recording_start`.
+  Recording REST responses use a string `type` (e.g. `"8"`); recording webhook objects use a numeric `type` (`8`).
+  Invitation dial-in numbers use fictional NANP 555-01xx numbers.
 
 ## Webhooks
 
-Zoom configures subscriptions in the Marketplace app, so here:
+Configure local subscriptions through this action:
 
 ```
 POST /_emulator/actions/configure_webhook
@@ -185,7 +209,8 @@ header; deliveries also carry `x-zm-trackingid` and `User-Agent: Zoom Marketplac
 
 Deliveries are `POST` JSON `{"event", "event_ts" (ms), "payload": {"account_id", "operator"?, "operator_id"?, "object": {...}}}`
 with headers `x-zm-request-timestamp` (unix seconds) and `x-zm-signature: v0=<hex hmac_sha256(secret_token, "v0:{ts}:{body}")>`
-(recomputed on every retry; 3 attempts). The body is compact UTF-8 JSON without ASCII escaping, so a consumer that
+(recomputed on every retry). Server/transport failures receive up to three retries after the initial attempt;
+redirects and 4xx responses are terminal. The response timeout is three seconds. The body is compact UTF-8 JSON without ASCII escaping, so a consumer that
 re-serialises the parsed JSON (`JSON.stringify`) verifies the same signature. Payloads follow Zoom's shapes: ids are
 integers in `meeting.created/updated/deleted` and strings in `meeting.started/ended/participant_*`; `meeting.updated` carries
 `old_object` and `time_stamp`; `recording.completed` carries the meeting-recordings object (`recording_files` with
@@ -218,7 +243,8 @@ Also: `PUT /meetings/{id}/status {"action":"end"}` ends a live meeting through t
 
 * Not implemented: webinars, Zoom Phone/Rooms/Team Chat, tracking-field definitions, meeting polls/templates/livestream,
   recording registrants and analytics, `GET /past_meetings/{id}/polls`, Dashboard QoS endpoints, SCIM, the legacy JWT
-  app flow, `user.settings_updated` and `app_deauthorized` events, `device_code` grant.
+  app flow, `user.settings_updated` and `app_deauthorized` events, `device_code` grant, and the Marketplace event
+  subscription REST API (use `configure_webhook`).
 * Participants are not tracked through breakouts/waiting rooms; `status` is always `in_meeting`.
 * Recordings contain audio only (no H.264 track) and silent AAC; the MP4 is a valid container that ffprobe/mutagen read.
 * `from`/`to` defaults on recording, summary and dashboard lists use the hub clock (`/_emulator/clock` freezes it).
@@ -228,3 +254,12 @@ Also: `PUT /meetings/{id}/status {"action":"end"}` ends a live meeting through t
   world has no matching person.
 * `GET /meetings/{id}` accepts meeting ids only (UUID lookups belong to past meetings and recordings).
 * Rate limiting is only simulated through fault injection (`POST /_emulator/faults {"status":429}`), not enforced.
+* Webhook retry delays are shortened for tests; production uses 5, 20 and 60 minutes. Sync/manual mode retries
+  immediately. URL validation is run when configuring a subscription, without periodic revalidation.
+* Revocation pairs access/refresh tokens conservatively; full app deauthorization and cross-refresh-family revocation
+  are not modeled. JWT-shaped tokens are opaque emulator grants, not cryptographically verifiable Zoom tokens.
+* Master-account scopes, account-locked passcode policies, meeting expiry/retention windows, six-month listing caps,
+  scheduling privileges, and full settings/license policy enforcement are not modeled. User settings remain a subset;
+  unsupported request fields may be ignored. The 30-day recording range remains the original brief's approximation
+  of Zoom's documented one-month range. Default recording dates follow the current reference (today..tomorrow),
+  superseding the original brief's yesterday..today default.

@@ -25,6 +25,7 @@ from emulators.core.auth import (
     render_account_picker,
 )
 from emulators.core.provider import Provider, ProviderContext
+from emulators.providers.zoom import lookup
 from emulators.providers.zoom.common import (
     DEFAULT_SCOPES,
     JSON_TYPE,
@@ -45,6 +46,9 @@ def resolve_person(ctx: ProviderContext, value: str | None) -> Person | None:
     if not value:
         return None
     needle = value.strip().lower()
+    record = lookup.find_user(ctx, value)
+    if record and record.get("_person_id"):
+        return ctx.world.person(record["_person_id"])
     for person in ctx.world.employees:
         if needle in (person.id.lower(), person.email.lower(), zoom_user_id(ctx.world, person.id).lower()):
             return person
@@ -58,7 +62,12 @@ def split_scopes(value: Any) -> list[str]:
 
 
 def app_scopes(ctx: ProviderContext, client: dict[str, Any], fallback: str) -> list[str]:
-    return split_scopes(client.get("scopes")) or split_scopes(fallback)
+    return split_scopes(client["scopes"]) if "scopes" in client else split_scopes(fallback)
+
+
+def active_person(ctx: ProviderContext, person: Person | None) -> bool:
+    record = ctx.store.collection("users").get(zoom_user_id(ctx.world, person.id)) if person else None
+    return record is not None and record.get("status") == "active"
 
 
 def issue_pair(
@@ -73,7 +82,7 @@ def issue_pair(
     """Issue an access token (and a refresh token for user-level grants) in Zoom's response shape."""
     uid = zoom_user_id(ctx.world, user.id) if user else ctx.world.org.zoom_account_id
     refresh = None
-    extra: dict[str, Any] = dict(chain or {})
+    extra: dict[str, Any] = {**(chain or {}), "enforce_scopes": True}
     if with_refresh:
         refresh = ctx.tokens.issue_refresh(
             client_id=client_id,
@@ -120,7 +129,11 @@ async def collect_params(request: Request) -> dict[str, str]:
                 data = {}
             params.update({k: str(v) for k, v in data.items()} if isinstance(data, dict) else {})
         else:
-            params.update({k: v[-1] for k, v in parse_qs(raw.decode(), keep_blank_values=True).items()})
+            try:
+                text = raw.decode("utf-8")
+            except UnicodeDecodeError:
+                text = ""
+            params.update({k: v[-1] for k, v in parse_qs(text, keep_blank_values=True).items()})
     return params
 
 
@@ -153,7 +166,10 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
             return oauth_failure("invalid_request", "Missing required parameter: client_id or redirect_uri")
         if q.get("response_type", "code") != "code":
             return oauth_failure("unsupported_response_type", "Invalid response_type")
-        client = ctx.tokens.authenticate_client(client_id, None, require_secret=False)
+        try:
+            client = ctx.tokens.authenticate_client(client_id, None, require_secret=False)
+        except OAuthError as exc:
+            return _failure(exc)
         if client.get("redirect_uris") and redirect_uri not in client["redirect_uris"]:
             return oauth_failure("invalid_request", "Redirect URI mismatch.")
         state = q.get("state")
@@ -164,7 +180,7 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
             )
         hint = q.get("login_hint")
         person = resolve_person(ctx, hint)
-        if hint and (person is None or not person.active):
+        if hint and not active_person(ctx, person):
             return RedirectResponse(
                 redirect_with_params(
                     redirect_uri,
@@ -176,7 +192,9 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
                 ),
                 status_code=302,
             )
-        scopes = split_scopes(q.get("scope")) or app_scopes(ctx, client, DEFAULT_SCOPES)
+        scopes = app_scopes(ctx, client, DEFAULT_SCOPES)
+        if q.get("code_challenge_method") not in (None, "plain", "S256"):
+            return oauth_failure("invalid_request", "Invalid code_challenge_method.")
         if person is None:
             return HTMLResponse(
                 render_account_picker(
@@ -186,6 +204,7 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
                     accounts=[
                         {"display_name": p.display_name, "email": p.email, "login_hint": p.email}
                         for p in ctx.world.active_employees
+                        if active_person(ctx, p)
                     ],
                     action_base=str(request.url),
                 )
@@ -216,6 +235,11 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
             if grant_type == "authorization_code":
                 if not params.get("code"):
                     return oauth_failure("invalid_request", "Missing authorization code")
+                if not params.get("redirect_uri"):
+                    return oauth_failure("invalid_request", "Missing redirect_uri")
+                pending = ctx.tokens.resolve(params["code"], "code")
+                if pending and not active_person(ctx, resolve_person(ctx, pending.user_id)):
+                    return oauth_failure("invalid_grant", "Invalid authorization code")
                 grant = ctx.tokens.redeem_code(
                     params["code"],
                     client_id=client_id,
@@ -227,6 +251,8 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
             elif grant_type == "refresh_token":
                 old = ctx.tokens.resolve(params.get("refresh_token"), "refresh")
                 if old is None or old.client_id != client_id:
+                    return oauth_failure("invalid_request", "Invalid Token!")
+                if old.user_id and not active_person(ctx, resolve_person(ctx, old.user_id)):
                     return oauth_failure("invalid_request", "Invalid Token!")
                 ctx.tokens.revoke(old.token)  # refresh tokens rotate: the previous one dies here
                 body = issue_pair(
@@ -275,8 +301,12 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
             return _failure(exc)
         token_value = params.get("token")
         grant = ctx.tokens.get(token_value)
+        if grant is None or grant.client_id != client_id:
+            return oauth_failure("invalid_request", "Invalid Token!")
         if grant is not None:
             ctx.tokens.revoke(grant.token)
+            if grant.kind == "access" and grant.extra.get("refresh"):
+                ctx.tokens.revoke(grant.extra["refresh"])
             if grant.kind == "refresh":
                 for record in ctx.store.collection("_grants"):
                     if record.get("extra", {}).get("refresh") == grant.token:
@@ -313,6 +343,10 @@ def actions(provider: Provider) -> None:
             ttl=timedelta(seconds=ttl),
             token=zoom_token(ctx, kind="access", uid=uid, client_id=client_id, ttl_s=ttl),
         )
+        if ttl == 0:
+            record = ctx.store.collection("_grants").get(grant.token)
+            if record is not None:
+                record["expires_at"] = ctx.clock.now()
         return {
             "access_token": grant.token,
             "token_type": "bearer",

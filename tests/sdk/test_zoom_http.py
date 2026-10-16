@@ -113,6 +113,7 @@ def test_parlance_flow_with_httpx(zoom_only: Any) -> None:
 
         listed = list_recordings(http, headers)
         assert len(listed) == 8
+        assert all(type(m["type"]) is str for m in listed)
         assert any(m["uuid"].startswith("/") for m in listed)  # the awkward UUID shapes are in the data
         downloaded = 0
         for item in listed:
@@ -121,6 +122,7 @@ def test_parlance_flow_with_httpx(zoom_only: Any) -> None:
             )
             assert detail.status_code == 200, (item["uuid"], detail.text)
             assert detail.json()["uuid"] == item["uuid"]
+            assert detail.json()["type"] == item["type"]
             chosen = pick_file(detail.json()["recording_files"])
             assert chosen is not None and chosen["file_extension"] == "VTT"
             # Bearer header + following the 302 to ssrweb (httpx drops the header across hosts)
@@ -209,3 +211,23 @@ def test_uuid_encodings_over_a_real_socket(zoom_only: Any) -> None:
                 assert past.status_code == 200 and past.json()["uuid"] == uuid
         raw = http.get(f"https://api.zoom.us/v2/past_meetings/{plain}/participants", headers=headers)
         assert raw.status_code == 200  # a UUID with a literal "+" and "=" in the path
+
+
+def test_adversarial_payloads_and_client_bound_revoke_over_real_socket(zoom_only: Any) -> None:
+    with httpx.Client(timeout=30) as http:
+        tokens = authorize(http)
+        headers = {"Authorization": f"Bearer {tokens['access_token']}"}
+        malformed = http.post(
+            "https://api.zoom.us/v2/users/me/meetings",
+            headers=headers,
+            json={"type": 8, "recurrence": {"type": [1]}},
+        )
+        assert malformed.status_code == 400 and malformed.json()["code"] == 300
+        assert malformed.headers["x-zm-trackingid"]
+        rejected = http.post(
+            "https://zoom.us/oauth/revoke",
+            auth=("other-client", "test-only"),
+            data={"token": tokens["access_token"]},
+        )
+        assert rejected.status_code == 400
+        assert http.get("https://api.zoom.us/v2/users/me/meetings", headers=headers).status_code == 200

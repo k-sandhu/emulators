@@ -26,6 +26,7 @@ from emulators.providers.zoom.common import (
     runtime_uuid,
 )
 from emulators.providers.zoom.timeutil import parse_instant
+from emulators.world.media import Cue
 from emulators.world.model import Person
 
 Record = dict[str, Any]
@@ -70,6 +71,8 @@ def pick_occurrence(meeting: Record, occurrence_id: str | None) -> Record | None
         found = next((o for o in occs if o["occurrence_id"] == str(occurrence_id)), None)
         if found is None:
             raise fail(404, f"occurrence {occurrence_id} does not exist")
+        if found["status"] == "deleted":
+            raise fail(404, f"occurrence {occurrence_id} does not exist")
         return found
     return next((o for o in occs if not o.get("_happened") and o["status"] != "deleted"), None)
 
@@ -81,6 +84,7 @@ def participant_row(ctx: ProviderContext, instance: Record, spec: Any, join: dat
     person = find_person(ctx, key) or find_person(ctx, spec.get("name"))
     internal = person is not None and not person.is_external
     name = spec.get("name") or (person.display_name if person else str(key or "Guest"))
+    name = " ".join(name.split()) or "Guest"
     email = person.email if person else str(spec.get("email") or "")
     guest_emails = (ctx.setting("guest_emails", "") or "").lower() in ("1", "true", "yes")
     return {
@@ -274,6 +278,8 @@ async def end_meeting(
         else float(scheduled or meeting.get("duration") or 30)
     )
     end = start + timedelta(minutes=max(minutes, 1 / 60))
+    if any(parse_instant(row["join_time"]) > end for row in instance["participants"]):
+        raise fail(400, "duration_minutes ends the meeting before a participant joins")
     sent: list[Record] = []
     for row in open_rows(instance):
         stay = row.get("_stay_s")
@@ -281,6 +287,7 @@ async def end_meeting(
         left = min(end, join_dt + timedelta(seconds=stay)) if stay is not None else end
         sent += await leave(ctx, instance, meeting, row, left)
     seconds = (end - start).total_seconds()
+    instance["recording_offset_s"] = min(instance["recording_offset_s"], max(0, seconds - 1))
     rows = instance["participants"]
     instance.update(
         {
@@ -328,7 +335,13 @@ async def process_recording(ctx: ProviderContext, instance: Record, meeting: Rec
         ).total_seconds() - instance["recording_offset_s"]
         turns = dialogue.timed(lines, seconds, instance["id"])
         emails = {r["name"]: r.get("user_email", "") for r in instance["participants"]}
-        instance["transcript"] = files.cues_to_records(files.make_cues(turns), emails)
+        cues = [
+            Cue(c.start_s, min(c.end_s, seconds), c.speaker, c.text)
+            for c in files.make_cues(turns)
+            if c.start_s < seconds
+        ]
+        instance["transcript"] = files.cues_to_records(cues, emails)
+        instance["transcribed"] = bool(cues)
     recording = files.build_recording(ctx, instance)
     ctx.store.collection("recordings").put(recording)
     sent = await hooks.emit(
@@ -349,6 +362,7 @@ async def process_recording(ctx: ProviderContext, instance: Record, meeting: Rec
 
 def recording_object(recording: Record, *, only: tuple[str, ...] | None = None) -> Record:
     wire = files.recording_wire(recording)
+    wire["type"] = recording["type"]
     if only is not None:
         kept = [f for f in wire["recording_files"] if f["file_type"] in only]
         wire["recording_files"] = kept

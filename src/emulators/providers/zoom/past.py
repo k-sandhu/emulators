@@ -26,20 +26,30 @@ from emulators.providers.zoom.common import (
     paginate,
     respond,
 )
-from emulators.providers.zoom.timeutil import day_range, in_days
+from emulators.providers.zoom.timeutil import day_range, in_days, parse_instant
 
 PAST_MEETING = Need("meeting:read", "meeting:read:past_meeting")
 PAST_INSTANCES = Need("meeting:read", "meeting:read:list_past_instances")
 PAST_PARTICIPANTS = Need("meeting:read", "meeting:read:list_past_participants")
 REPORT_MEETING = Need("report:read", "report:read:meeting", admin_only=True)
 REPORT_PARTICIPANTS = Need("report:read", "report:read:list_meeting_participants", admin_only=True)
-REPORT_USER_MEETINGS = Need("report:read", "report:read:list_meeting_activities", admin_only=True)
+REPORT_USER_MEETINGS = Need("report:read", "report:read:user", admin_only=True)
 REPORT_DAILY = Need("report:read", "report:read:list_daily_usage", admin_only=True)
-REPORT_USERS = Need("report:read", "report:read:list_active_inactive_host", admin_only=True)
-DASHBOARD = Need("dashboard_meetings:read", "dashboard_meetings:read:list_meetings", admin_only=True)
-DASHBOARD_DETAIL = Need("dashboard_meetings:read", "dashboard_meetings:read:meeting", admin_only=True)
+REPORT_USERS = Need("report:read", "report:read:list_users", admin_only=True)
+DASHBOARD = Need(
+    "dashboard_meetings:read",
+    "dashboard:read:list_meetings",
+    admin_only=True,
+    classic_aliases=("dashboard:read",),
+)
+DASHBOARD_DETAIL = Need(
+    "dashboard_meetings:read", "dashboard:read:meeting", admin_only=True, classic_aliases=("dashboard:read",)
+)
 DASHBOARD_PARTICIPANTS = Need(
-    "dashboard_meetings:read", "dashboard_meetings:read:list_meeting_participants", admin_only=True
+    "dashboard_meetings:read",
+    "dashboard:read:list_meeting_participants",
+    admin_only=True,
+    classic_aliases=("dashboard:read",),
 )
 
 PAST_FIELDS = [
@@ -224,7 +234,10 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
             first = date(year, month, 1)
         except ValueError:
             raise invalid_field("month") from None
-        following = date(year + month // 12, month % 12 + 1, 1)
+        try:
+            following = date(year + month // 12, month % 12 + 1, 1)
+        except ValueError:
+            raise invalid_field("year") from None
         dates = []
         for offset in range((following - first).days):
             day = first + timedelta(days=offset)
@@ -288,6 +301,13 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
 
     def metrics_item(inst: dict[str, Any]) -> dict[str, Any]:
         host = ctx.store.collection("users").get(inst["host_id"]) or {}
+        seconds = int(
+            (
+                (parse_instant(inst["end_time"]) if inst["end_time"] else ctx.clock.now())
+                - parse_instant(inst["start_time"])
+            ).total_seconds()
+        )
+        seconds = max(0, seconds)
         return {
             "uuid": inst["id"],
             "id": inst["meeting_id"],
@@ -296,8 +316,8 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
             "email": inst["user_email"],
             "user_type": "Licensed" if host.get("type") == 2 else "Basic",
             "start_time": inst["start_time"],
-            "end_time": inst["end_time"],
-            "duration": f"{inst['duration'] // 60:02d}:{inst['duration'] % 60:02d}",
+            "end_time": inst["end_time"] or None,
+            "duration": f"{seconds // 3600:02d}:{seconds % 3600 // 60:02d}:{seconds % 60:02d}",
             "participants": inst["participants_count"],
             **media_flags(inst),
             "in_room_participants": 0,
@@ -306,27 +326,56 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
             "tracking_fields": [],
         }
 
+    def metrics_type(request: Request) -> str:
+        kind = request.query_params.get("type", "live")
+        if kind not in ("past", "pastOne", "live"):
+            raise invalid_field("type")
+        return kind
+
+    def metrics_instance(request: Request, key: str) -> dict[str, Any]:
+        kind = metrics_type(request)
+        inst = lookup.find_instance(ctx, key, ended_only=kind != "live")
+        if ((kind == "live") != (inst.get("state") == "live")) or (
+            kind == "pastOne" and inst["participants_count"] != 1
+        ):
+            raise meeting_missing(decode_path_key(key))
+        return inst
+
     @app.get("/v2/metrics/meetings")
     async def metrics_meetings(request: Request) -> Response:
         principal = authenticate(ctx, request)
         if not principal.authorize(DASHBOARD):
             raise no_permission()
         q = request.query_params
-        kind = q.get("type", "live")
-        if kind not in ("past", "pastOne", "live"):
-            raise invalid_field("type")
-        lo, hi = day_range(
-            q.get("from"), q.get("to"), default_from=today() - timedelta(days=1), default_to=today()
-        )
+        kind = metrics_type(request)
+        from_raw = q.get("from") or (today() - timedelta(days=1)).isoformat()
+        to_raw = q.get("to") or today().isoformat()
+        try:
+            lo, hi = parse_instant(from_raw), parse_instant(to_raw)
+            if len(to_raw) == 10:
+                hi += timedelta(days=1)
+        except (ValueError, OverflowError):
+            raise invalid_field("from") from None
+        if hi < lo or (hi - lo).days > 31:
+            raise invalid_field("to")
+        date_type = q.get("query_date_type", "start_time")
+        if date_type not in ("start_time", "end_time"):
+            raise invalid_field("query_date_type")
         if kind == "live":
             rows = [i for i in instances if i.get("state") == "live"]
         else:
-            rows = [i for i in instances if i.get("state") == "ended" and in_days(i["start_time"], lo, hi)]
+            rows = [
+                i
+                for i in instances
+                if i.get("state") == "ended"
+                and lo <= parse_instant(i[date_type]) <= hi
+                and (kind != "pastOne" or i["participants_count"] == 1)
+            ]
         rows.sort(key=lambda i: i["start_time"])
         page, meta = paginate(request, rows)
         body = {
-            "from": lo.isoformat(),
-            "to": hi.isoformat(),
+            "from": from_raw,
+            "to": to_raw,
             **{k: meta[k] for k in PAGE_KEYS},
             "meetings": [metrics_item(i) for i in page],
         }
@@ -338,7 +387,7 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         if rest.endswith("/participants"):
             if not principal.authorize(DASHBOARD_PARTICIPANTS):
                 raise no_permission()
-            inst = lookup.find_instance(ctx, rest[: -len("/participants")])
+            inst = metrics_instance(request, rest[: -len("/participants")])
             rows = [
                 {
                     "id": r["id"],
@@ -368,4 +417,4 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
             return respond(request, ctx, {**{k: meta[k] for k in PAGE_KEYS}, "participants": page})
         if not principal.authorize(DASHBOARD_DETAIL):
             raise no_permission()
-        return respond(request, ctx, metrics_item(lookup.find_instance(ctx, rest)))
+        return respond(request, ctx, metrics_item(metrics_instance(request, rest)))
