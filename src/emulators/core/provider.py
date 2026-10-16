@@ -120,16 +120,32 @@ class Provider:
         """The vendor's error envelope; used for 404s, validation errors and faults."""
         return {"error": {"code": code, "message": message}}
 
-    def fault_response(self, rule: FaultRule) -> tuple[int, dict[str, str], bytes]:
+    def error_body_for(self, scope: dict[str, Any] | None, status: int, code: str, message: str) -> Any:
+        """Route-aware error envelope. Override when one provider serves APIs with different
+        error styles (Google Meet vs Drive, Microsoft login vs Graph). ``scope`` is the ASGI
+        scope (``scope["path"]``, headers...) or ``None``."""
+        return self.error_body(status, code, message)
+
+    def error_headers_for(self, scope: dict[str, Any] | None, status: int) -> dict[str, str]:
+        """Extra headers on emulator-generated errors (request ids, API version echoes)."""
+        return {}
+
+    def fault_response(
+        self, rule: FaultRule, scope: dict[str, Any] | None = None
+    ) -> tuple[int, dict[str, str], bytes]:
         status = rule.status or 500
-        headers = {"content-type": "application/json", **rule.headers}
+        headers = {
+            "content-type": "application/json",
+            **self.error_headers_for(scope, status),
+            **rule.headers,
+        }
         if status == 429 and not any(k.lower() == "retry-after" for k in headers):
             headers["Retry-After"] = "2"
         if rule.body is not None:
             body = rule.body if isinstance(rule.body, (bytes, str)) else json.dumps(rule.body)
         else:
             code, message = FAULT_DEFAULTS.get(status, ("InternalServerError", "Injected fault."))
-            body = json.dumps(self.error_body(status, code, message))
+            body = json.dumps(self.error_body_for(scope, status, code, message))
         return status, headers, body.encode() if isinstance(body, str) else body
 
     # -- helpers -------------------------------------------------------------------

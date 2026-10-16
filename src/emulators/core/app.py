@@ -60,24 +60,35 @@ def build_provider_app(ctx: ProviderContext) -> Any:
         return _render_error(exc)
 
     @app.exception_handler(RequestValidationError)
-    async def _validation_error(_: Request, exc: RequestValidationError) -> Response:
+    async def _validation_error(request: Request, exc: RequestValidationError) -> Response:
         errors = exc.errors()
         first = errors[0] if errors else {}
         where = ".".join(str(p) for p in first.get("loc", ()) if p not in ("body", "query"))
         message = f"Invalid request: {where} {first.get('msg', '')}".strip()
-        return JSONResponse(provider.error_body(400, "BadRequest", message), status_code=400)
+        return JSONResponse(
+            provider.error_body_for(request.scope, 400, "BadRequest", message),
+            status_code=400,
+            headers=provider.error_headers_for(request.scope, 400),
+        )
 
     @app.exception_handler(StarletteHTTPException)
-    async def _http_error(_: Request, exc: StarletteHTTPException) -> Response:
+    async def _http_error(request: Request, exc: StarletteHTTPException) -> Response:
+        scope = request.scope
         if exc.status_code == 404:
-            body = provider.error_body(404, "NotFound", "Resource not found for the segment requested.")
+            body = provider.error_body_for(
+                scope, 404, "NotFound", "Resource not found for the segment requested."
+            )
         elif exc.status_code == 405:
-            body = provider.error_body(
-                405, "MethodNotAllowed", "The HTTP method is not allowed on this resource."
+            body = provider.error_body_for(
+                scope, 405, "MethodNotAllowed", "The HTTP method is not allowed on this resource."
             )
         else:
-            body = provider.error_body(exc.status_code, "Error", str(exc.detail))
-        return JSONResponse(body, status_code=exc.status_code, headers=getattr(exc, "headers", None))
+            body = provider.error_body_for(scope, exc.status_code, "Error", str(exc.detail))
+        headers = {
+            **provider.error_headers_for(scope, exc.status_code),
+            **(getattr(exc, "headers", None) or {}),
+        }
+        return JSONResponse(body, status_code=exc.status_code, headers=headers)
 
     app.include_router(admin_router(ctx))
     provider.build(app, ctx)

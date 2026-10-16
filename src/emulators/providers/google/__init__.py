@@ -68,6 +68,12 @@ class GoogleProvider(Provider):
     def error_body(self, status: int, code: str, message: str) -> Any:
         return common.error_body(status, message)
 
+    def error_body_for(self, scope: dict[str, Any] | None, status: int, code: str, message: str) -> Any:
+        # Meet REST v2 is a gRPC-transcoded API: errors carry no legacy ``errors[]`` list.
+        path = (scope or {}).get("path", "")
+        legacy = not path.startswith(("/v2/spaces", "/v2/conferenceRecords", "/meet/v2/"))
+        return common.error_body(status, message, legacy=legacy)
+
     def seed(self, ctx: ProviderContext) -> None:
         for module in _modules():
             if hasattr(module, "seed"):

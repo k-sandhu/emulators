@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import inspect
 import json
 import random
 import re
@@ -187,7 +188,7 @@ class EmulatorMiddleware:
         journal: RequestJournal,
         faults: FaultInjector,
         clock: Clock,
-        fault_response: Callable[[FaultRule], tuple[int, dict[str, str], bytes]],
+        fault_response: Callable[..., tuple[int, dict[str, str], bytes]],
     ) -> None:
         self.app = app
         self.provider = provider
@@ -195,6 +196,11 @@ class EmulatorMiddleware:
         self.faults = faults
         self.clock = clock
         self.fault_response = fault_response
+        try:
+            # Providers written before the scope-aware hook take only ``rule``.
+            self._fault_takes_scope = len(inspect.signature(fault_response).parameters) >= 2
+        except (TypeError, ValueError):
+            self._fault_takes_scope = False
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
@@ -239,7 +245,10 @@ class EmulatorMiddleware:
                 while more:
                     message = await capture_receive()
                     more = message.get("more_body", False) and message["type"] == "http.request"
-                status, headers, body = self.fault_response(rule)
+                if self._fault_takes_scope:
+                    status, headers, body = self.fault_response(rule, scope)  # type: ignore[call-arg]
+                else:
+                    status, headers, body = self.fault_response(rule)
                 raw_headers = [(k.lower().encode(), v.encode()) for k, v in headers.items()]
                 raw_headers.append((b"content-length", str(len(body)).encode()))
                 await capture_send({"type": "http.response.start", "status": status, "headers": raw_headers})
