@@ -15,7 +15,7 @@ import hmac
 import json
 import re
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from typing import Any, NoReturn
 from urllib.parse import urlencode
 
@@ -163,6 +163,16 @@ def wa_fail(ctx: ProviderContext, code: int, title: str, details: str, *, status
 
 
 def not_found(ctx: ProviderContext, object_id: str) -> NoReturn:
+    if object_id.isascii() and object_id.isdigit():
+        fail(
+            ctx,
+            400,
+            100,
+            f"Unsupported get request. Object with ID '{object_id}' does not exist, "
+            "cannot be loaded due to missing permissions, or does not support this operation.",
+            subcode=33,
+            err_type="GraphMethodException",
+        )
     fail(
         ctx,
         400,
@@ -193,10 +203,11 @@ class Auth:
     page_id: str | None = None
     person_id: str | None = None
     scopes: list[str] = field(default_factory=list)
+    app_id: str = APP_ID
 
     @property
     def client_id(self) -> str:
-        return self.grant.client_id if self.grant else APP_ID
+        return self.grant.client_id if self.grant else self.app_id
 
 
 def extract_token(request: Request, params: dict[str, Any]) -> str | None:
@@ -220,11 +231,10 @@ def resolve_auth(ctx: ProviderContext, request: Request, params: dict[str, Any])
         client_id, _, secret = token.partition("|")
         record = ctx.tokens.client(client_id)
         expected = (record or {}).get("client_secret") or (APP_SECRET if client_id == APP_ID else None)
-        if expected is not None and hmac.compare_digest(str(expected), secret):
-            return Auth(token=token, meta_type="APP", grant=None, scopes=[])
-        if ctx.tokens.lenient_clients and record is None and secret:
-            ctx.tokens.register_client(client_id, secret)
-            return Auth(token=token, meta_type="APP", grant=None, scopes=[])
+        if expected is not None and hmac.compare_digest(
+            str(expected).encode(), secret.encode("utf-8", "replace")
+        ):
+            return Auth(token=token, meta_type="APP", grant=None, scopes=[], app_id=client_id)
         return None
     grant = ctx.tokens.resolve(token)
     if grant is None:
@@ -279,7 +289,9 @@ def require_auth(
     proof = params.get("appsecret_proof")
     if proof:
         expected = hmac_sha256_hex(app_secret_for(ctx, auth.client_id), token)
-        if not hmac.compare_digest(expected.lower(), str(proof).lower()):
+        if not re.fullmatch(r"[0-9a-fA-F]{64}", str(proof)) or not hmac.compare_digest(
+            expected.lower(), str(proof).lower()
+        ):
             invalid_param(ctx, "Invalid appsecret_proof provided in the API argument")
     if types is not None and auth.meta_type not in types:
         permission_fail(
@@ -289,6 +301,24 @@ def require_auth(
             subcode=perm_subcode,
         )
     return auth
+
+
+def require_scopes(ctx: ProviderContext, auth: Auth, *scopes: str) -> None:
+    for scope in scopes:
+        if scope not in auth.scopes:
+            permission_fail(ctx, f"Requires {scope} permission.")
+
+
+def require_business_access(ctx: ProviderContext, auth: Auth) -> None:
+    """Scopes alone do not assign a business asset to a user."""
+    business = ctx.store.collection("businesses").get(ctx.store.meta["business_id"]) or {}
+    if auth.meta_type == "SYSTEM_USER" and auth.fb_user_id == ctx.store.meta["system_user_id"]:
+        return
+    person_id = auth.person_id
+    if not person_id and auth.fb_user_id:
+        person_id = (ctx.store.collection("fb_users").get(auth.fb_user_id) or {}).get("_person_id")
+    if auth.meta_type != "USER" or person_id not in business.get("_roles", {}):
+        permission_fail(ctx, "Permissions error: the token does not have access to this business asset.")
 
 
 def issue_meta_token(
@@ -331,15 +361,20 @@ class FieldSpec:
     children: list[FieldSpec] = field(default_factory=list)
 
 
+class FieldSelectionError(ValueError):
+    """Keep field errors inside a batch's individual response envelope."""
+
+
 def parse_fields(raw: str | None) -> list[FieldSpec] | None:
     """Parse ``fields=a,b.limit(5){c,d},e{f}`` into specs (``None`` when absent).
 
-    Malformed input is tolerated (unknown characters are skipped) rather than
-    rejected, matching Graph's generally forgiving parser.
+    Bound depth so hostile field expansions cannot exhaust the Python stack.
     """
     if raw is None or not str(raw).strip():
         return None
     text = str(raw)
+    if len(text) > 16384 or text.count("{") > 32 or text.count(".") + text.count("{") > 64:
+        raise ValueError("fields expansion is too complex")
     pos = 0
     end = len(text)
 
@@ -365,7 +400,7 @@ def parse_fields(raw: str | None) -> list[FieldSpec] | None:
                     pos += 1
                     return inside
             pos += 1
-        return text[start:end]
+        raise ValueError("Unclosed field modifier")
 
     def parse_list(stop: str | None) -> list[FieldSpec]:
         nonlocal pos
@@ -381,13 +416,17 @@ def parse_fields(raw: str | None) -> list[FieldSpec] | None:
             spec = parse_field()
             if spec.name:
                 specs.append(spec)
-            if pos == before:
-                pos += 1  # guarantee progress on malformed input
+            if pos == before or (pos < end and text[pos] not in ", \t" and text[pos] != stop):
+                raise ValueError("Invalid fields syntax")
+        if stop and (pos == 0 or text[pos - 1] != stop):
+            raise ValueError("Unclosed field expansion")
         return specs
 
     def parse_field() -> FieldSpec:
         nonlocal pos
         root = FieldSpec(name=read_name())
+        if not root.name:
+            raise ValueError("A field name is required")
         leaf = root
         while pos < end:
             char = text[pos]
@@ -412,7 +451,19 @@ def parse_fields(raw: str | None) -> list[FieldSpec] | None:
             break
         return root
 
-    return parse_list(None)
+    result = parse_list(None)
+    if not result:
+        raise ValueError("A field name is required")
+    return result
+
+
+def format_fields(specs: list[FieldSpec]) -> str:
+    return ",".join(
+        s.name
+        + "".join(f".{k}({v})" for k, v in s.modifiers.items())
+        + ("{" + format_fields(s.children) + "}" if s.children else "")
+        for s in specs
+    )
 
 
 def _limit_of(spec: FieldSpec) -> int | None:
@@ -420,9 +471,12 @@ def _limit_of(spec: FieldSpec) -> int | None:
     if raw is None:
         return None
     try:
-        return max(0, int(raw))
+        limit = int(raw)
+        if limit < 0:
+            raise ValueError
+        return limit
     except ValueError:
-        return None
+        raise FieldSelectionError("Invalid limit modifier in fields.") from None
 
 
 def _shape(value: Any, specs: list[FieldSpec] | None, spec: FieldSpec | None = None) -> Any:
@@ -440,9 +494,11 @@ def _shape(value: Any, specs: list[FieldSpec] | None, spec: FieldSpec | None = N
                 items = items[:limit]
             out: dict[str, Any] = {"data": [_shape(item, children) for item in items]}
             if spec is not None and spec.modifiers.get("summary", "").lower() == "true":
-                out["summary"] = value.get("_summary") or {"total_count": len(value["data"])}
+                out["summary"] = (
+                    value.get("summary") or value.get("_summary") or {"total_count": len(value["data"])}
+                )
             for key in ("paging", "summary"):
-                if key in value and key not in out and limit is None:
+                if key in value and key not in out:
                     out[key] = value[key]
             return out
         if specs is None:
@@ -457,6 +513,10 @@ def _shape(value: Any, specs: list[FieldSpec] | None, spec: FieldSpec | None = N
             out["id"] = value["id"]
         for child in specs:
             if child.name not in value or child.name.startswith("_"):
+                if "_defaults" in value and child.name not in value.get("_known_fields", []):
+                    raise FieldSelectionError(
+                        f"Tried accessing nonexisting field ({child.name}) on this node."
+                    )
                 continue
             key = child.modifiers.get("as", child.name)
             out[key] = _shape(value[child.name], child.children or None, child)
@@ -491,8 +551,11 @@ def _decode_cursor(cursor: str | None) -> int | None:
         return None
     try:
         padded = cursor + "=" * (-len(cursor) % 4)
-        return int(json.loads(base64.urlsafe_b64decode(padded))["o"])
-    except (ValueError, KeyError, TypeError):
+        value = json.loads(base64.b64decode(padded, altchars=b"-_", validate=True))["o"]
+        if type(value) is not int or value < 0:
+            return None
+        return value
+    except (ValueError, KeyError, TypeError, UnicodeError, RecursionError):
         return None
 
 
@@ -512,10 +575,21 @@ def paged(
         limit = int(params.get("limit", default_limit))
     except (TypeError, ValueError):
         invalid_param(ctx, "Invalid limit parameter.")
-    limit = min(max(limit, 1), max_limit)
+    if limit < 0 or isinstance(params.get("limit"), bool):
+        invalid_param(ctx, "limit must be a non-negative integer.")
+    limit = min(limit, max_limit)
     total = len(items)
     after = _decode_cursor(str(params["after"])) if params.get("after") else None
     before = _decode_cursor(str(params["before"])) if params.get("before") else None
+    if (params.get("after") and after is None) or (params.get("before") and before is None):
+        invalid_param(ctx, "Invalid paging cursor.")
+    if params.get("after") and params.get("before"):
+        invalid_param(ctx, "Specify either after or before, not both.")
+    if limit == 0:
+        out: dict[str, Any] = {"data": []}
+        if str(params.get("summary", "")).lower() in ("true", "1"):
+            out["summary"] = {"total_count": total}
+        return out
     if after is not None:
         start = min(after + 1, total)
         page = items[start : start + limit]
@@ -549,8 +623,13 @@ def paged(
     return out
 
 
-def picture_url(ctx: ProviderContext, request: Request, object_id: str) -> str:
-    return url_for_host(request, ctx, "scontent-iad3-2.xx.fbcdn.net", f"/v/t39.30808-1/{object_id}.png")
+def picture_url(
+    ctx: ProviderContext, request: Request, object_id: str, *, width: int = 50, height: int = 50
+) -> str:
+    path = f"/v/t39.30808-1/{object_id}.png"
+    if (width, height) != (50, 50):
+        path += "?" + urlencode({"width": width, "height": height})
+    return url_for_host(request, ctx, "scontent-iad3-2.xx.fbcdn.net", path)
 
 
 def to_dt(value: Any) -> datetime:
@@ -609,16 +688,13 @@ __all__ = [
     "permission_fail",
     "picture_url",
     "require_auth",
+    "require_business_access",
+    "require_scopes",
     "resolve_auth",
     "strip_internal",
     "to_dt",
     "trace_id",
     "unix_s",
-    "utc_now_unused",
     "wa_fail",
     "wamid",
 ]
-
-
-def utc_now_unused() -> datetime:  # pragma: no cover - keeps UTC import meaningful for callers
-    return datetime.now(UTC)

@@ -62,17 +62,18 @@ async def test_fields_expansion_selects_and_defaults(client: httpx.AsyncClient) 
     assert "link" not in body
     default = await client.get(f"{GRAPH}/me", headers=USER)
     assert set(default.json()) == {"id", "name"}
-    # Malformed fields values are tolerated, never a hang or a 500.
+    # Malformed expansions return Graph parameter errors.
     for weird in ("name.", "name{", ",,", "name.limit(5"):
         resp = await client.get(f"{GRAPH}/me", headers=USER, params={"fields": weird})
-        assert resp.status_code == 200, weird
+        assert resp.status_code == 400, weird
+        assert resp.json()["error"]["code"] == 100
 
 
-async def test_unknown_object_is_803(client: httpx.AsyncClient) -> None:
+async def test_unknown_numeric_object_is_100(client: httpx.AsyncClient) -> None:
     r = await client.get(f"{GRAPH}/999999999999999", headers=SYS)
     assert r.status_code == 400
-    assert r.json()["error"]["code"] == 803
-    assert "do not exist" in r.json()["error"]["message"]
+    assert r.json()["error"]["code"] == 100
+    assert r.json()["error"]["error_subcode"] == 33
 
 
 async def test_appsecret_proof_verified_when_present(client: httpx.AsyncClient) -> None:
@@ -288,7 +289,7 @@ async def test_batch_requests(client: httpx.AsyncClient, ids: SimpleNamespace) -
     assert [entry["code"] for entry in results] == [200, 200, 400]
     assert json_module.loads(results[0]["body"])["name"] == "Halcyon System User"
     assert json_module.loads(results[1]["body"])["id"] == ids.waba_id
-    assert json_module.loads(results[2]["body"])["error"]["code"] == 803
+    assert json_module.loads(results[2]["body"])["error"]["code"] == 100
 
 
 async def test_picture_endpoint_and_cdn_bytes(client: httpx.AsyncClient, ids: SimpleNamespace) -> None:

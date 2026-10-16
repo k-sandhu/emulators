@@ -14,6 +14,7 @@ from emulators.core.provider import ProviderContext
 from emulators.providers.meta import shapes
 from emulators.providers.meta.common import (
     DISPLAY_PHONE_DIGITS,
+    Auth,
     apply_fields,
     digits_only,
     invalid_param,
@@ -21,10 +22,13 @@ from emulators.providers.meta.common import (
     not_found,
     numeric_id,
     paged,
-    permission_fail,
     require_auth,
+    require_business_access,
+    require_scopes,
     wa_fail,
 )
+from emulators.providers.meta.validation import http_url, list_value, multipart, object_value, string_value
+from emulators.providers.meta.wa_validation import MEDIA_LIMITS, send_payload, template_components
 from emulators.providers.meta.webhooks_out import deliver_wa_statuses
 
 WA_MESSAGE_TYPES = {
@@ -65,7 +69,7 @@ PLACEHOLDER = re.compile(r"\{\{\s*(\d+)\s*\}\}")
 
 
 def valid_wa_recipient(wa_id: str) -> bool:
-    if not wa_id.isdigit() or not (7 <= len(wa_id) <= 15) or wa_id.startswith("0"):
+    if not wa_id.isascii() or not wa_id.isdigit() or not (7 <= len(wa_id) <= 15) or wa_id.startswith("0"):
         return False
     if len(set(wa_id)) == 1:
         return False
@@ -81,6 +85,8 @@ def template_param_counts(template: dict[str, Any]) -> dict[str, int]:
         found = [int(n) for n in PLACEHOLDER.findall(text)]
         if found:
             counts[ctype] = max(found)
+        elif ctype == "header" and component.get("format") in ("IMAGE", "VIDEO", "DOCUMENT"):
+            counts[ctype] = 1
     return counts
 
 
@@ -92,7 +98,7 @@ class WhatsAppMixin:
     body: dict[str, Any]
 
     # -- helpers ---------------------------------------------------------------------------------
-    def require_whatsapp(self, management: bool = False):
+    def require_whatsapp(self, management: bool = False) -> Auth:
         auth = require_auth(
             self.ctx,
             self.request,
@@ -103,8 +109,8 @@ class WhatsAppMixin:
             perm_code=200,
         )
         needed = "whatsapp_business_management" if management else "whatsapp_business_messaging"
-        if auth.meta_type == "USER" and auth.scopes and needed not in auth.scopes:
-            permission_fail(self.ctx, f"Requires {needed} permission.", code=200)
+        require_scopes(self.ctx, auth, needed)
+        require_business_access(self.ctx, auth)
         return auth
 
     def get_phone(self, phone_id: str) -> dict[str, Any]:
@@ -178,11 +184,11 @@ class WhatsAppMixin:
         return paged(self.ctx, self.request, self.version, f"{waba_id}/phone_numbers", items, self.params)
 
     def handle_phone(self, phone_id: str) -> dict[str, Any]:
-        self.require_whatsapp()
+        self.require_whatsapp(management=True)
         return apply_fields(shapes.phone_shape(self.get_phone(phone_id)), self.params.get("fields"))
 
     def handle_profile_get(self, phone_id: str) -> dict[str, Any]:
-        self.require_whatsapp()
+        self.require_whatsapp(management=True)
         phone = self.get_phone(phone_id)
         shaped = apply_fields(shapes.profile_shape(self.ctx, self.request, phone), self.params.get("fields"))
         shaped.setdefault("messaging_product", "whatsapp")
@@ -192,7 +198,7 @@ class WhatsAppMixin:
         self.require_whatsapp(management=True)
         phone = self.get_phone(phone_id)
         body = self.body
-        if body.get("messaging_product") not in (None, "whatsapp"):
+        if body.get("messaging_product") != "whatsapp":
             invalid_param(self.ctx, "messaging_product must be 'whatsapp'.")
         fields = (
             "about",
@@ -204,10 +210,20 @@ class WhatsAppMixin:
             "profile_picture_handle",
         )
         updates = {k: body[k] for k in fields if k in body}
+        for key in fields:
+            if key in updates and key != "websites":
+                string_value(
+                    self.ctx,
+                    updates[key],
+                    key,
+                    maximum={"about": 139, "address": 256, "description": 512, "email": 128}.get(key, 512),
+                    empty=True,
+                )
         if "vertical" in updates and updates["vertical"] not in VERTICALS:
             invalid_param(self.ctx, "Invalid vertical value.")
-        if "websites" in updates and len(updates["websites"] or []) > 2:
-            invalid_param(self.ctx, "A business profile can have at most 2 websites.")
+        if "websites" in updates:
+            for website in list_value(self.ctx, updates["websites"], "websites", maximum=2):
+                http_url(self.ctx, website, "website")
         if "email" in updates and updates["email"] and "@" not in str(updates["email"]):
             invalid_param(self.ctx, "Invalid email address.")
         profile = dict(phone.get("_profile") or {})
@@ -251,13 +267,15 @@ class WhatsAppMixin:
 
     def handle_register(self, phone_id: str, deregister: bool) -> dict[str, Any]:
         self.require_whatsapp(management=True)
-        self.get_phone(phone_id)
-        if self.body.get("messaging_product") not in (None, "whatsapp"):
+        phone = self.get_phone(phone_id)
+        if not deregister and self.body.get("messaging_product") != "whatsapp":
             invalid_param(self.ctx, "messaging_product must be 'whatsapp'.")
-        if not deregister and self.body.get("pin") is not None:
-            pin = str(self.body["pin"])
-            if not (pin.isdigit() and len(pin) == 6):
+        if not deregister:
+            pin = self.body.get("pin")
+            if not (isinstance(pin, str) and pin.isascii() and pin.isdigit() and len(pin) == 6):
                 invalid_param(self.ctx, "pin must be a 6-digit number.")
+        phone["status"] = "DISCONNECTED" if deregister else "CONNECTED"
+        phone["_registered"] = not deregister
         return {"success": True}
 
     # -- templates ---------------------------------------------------------------------------------
@@ -280,6 +298,8 @@ class WhatsAppMixin:
                 continue
             if self.params.get("category") and template["category"] != self.params["category"]:
                 continue
+            if self.params.get("status") and template["status"] != self.params["status"]:
+                continue
             needle = self.params.get("name_or_content")
             if (
                 needle
@@ -287,8 +307,9 @@ class WhatsAppMixin:
                 and str(needle).lower() not in str(template["components"]).lower()
             ):
                 continue
-            items.append(apply_fields(shapes.template_shape(template), self.params.get("fields")))
+            items.append(template)
         items.sort(key=lambda t: t.get("name", ""))
+        items = [apply_fields(shapes.template_shape(t), self.params.get("fields")) for t in items]
         return paged(self.ctx, self.request, self.version, f"{waba_id}/message_templates", items, self.params)
 
     def handle_templates_post(self, waba_id: str) -> dict[str, Any]:
@@ -299,16 +320,13 @@ class WhatsAppMixin:
         language = body.get("language")
         category = body.get("category")
         components = body.get("components")
-        if not name or not re.fullmatch(r"[a-z0-9_]+", str(name)):
+        string_value(self.ctx, name, "name", maximum=512)
+        if not re.fullmatch(r"[a-z0-9_]+", name):
             invalid_param(self.ctx, "Template name must be lowercase letters, digits and underscores.")
-        if not language:
-            invalid_param(self.ctx, "The parameter language is required.")
+        string_value(self.ctx, language, "language", maximum=32)
         if category not in ("MARKETING", "UTILITY", "AUTHENTICATION"):
             invalid_param(self.ctx, "category must be MARKETING, UTILITY or AUTHENTICATION.")
-        if not isinstance(components, list) or not components:
-            invalid_param(self.ctx, "The parameter components is required.")
-        if not any(str(c.get("type", "")).upper() == "BODY" for c in components if isinstance(c, dict)):
-            invalid_param(self.ctx, "A template must have a BODY component.")
+        template_components(self.ctx, components)
         if self.find_template(str(name), str(language)) is not None:
             invalid_param(self.ctx, f"A template named {name} ({language}) already exists.")
         status = "APPROVED" if (self.ctx.tokens.lenient_clients and category == "UTILITY") else "PENDING"
@@ -329,16 +347,34 @@ class WhatsAppMixin:
         self.ctx.store.collection("templates").put(record)
         return {"id": record["id"], "status": status, "category": category}
 
+    def validate_template_update(self, record: dict[str, Any]) -> None:
+        if "components" in self.body:
+            template_components(self.ctx, self.body["components"])
+        if "category" in self.body and self.body["category"] not in (
+            "MARKETING",
+            "UTILITY",
+            "AUTHENTICATION",
+        ):
+            invalid_param(self.ctx, "Invalid template category.")
+
     def handle_templates_delete(self, waba_id: str) -> dict[str, Any]:
         self.require_whatsapp(management=True)
         self.get_waba(waba_id)
         name = self.params.get("name") or self.body.get("name")
         if not name:
             invalid_param(self.ctx, "The parameter name is required to delete templates.")
+        string_value(self.ctx, name, "name", maximum=512)
+        template_id = self.params.get("hsm_id") or self.body.get("hsm_id")
+        if template_id is not None:
+            string_value(self.ctx, template_id, "hsm_id")
         coll = self.ctx.store.collection("templates")
         deleted = 0
         for template in list(coll):
-            if template["name"] == name and template.get("_waba_id") == waba_id:
+            if (
+                template["name"] == name
+                and template.get("_waba_id") == waba_id
+                and (template_id is None or template["id"] == template_id)
+            ):
                 coll.delete(template["id"])
                 deleted += 1
         if deleted == 0:
@@ -349,14 +385,16 @@ class WhatsAppMixin:
     async def handle_media_upload(self, phone_id: str) -> dict[str, Any]:
         self.require_whatsapp()
         self.get_phone(phone_id)
-        form = await self.request.form()
+        form = await multipart(self.ctx, self.request)
         upload = form.get("file")
         if upload is None or not hasattr(upload, "read"):
             invalid_param(self.ctx, "The parameter file is required (multipart form upload).")
         content: bytes = await upload.read()  # type: ignore[union-attr]
         mime = str(form.get("type") or getattr(upload, "content_type", "") or "application/octet-stream")
-        if str(form.get("messaging_product") or "whatsapp") != "whatsapp":
+        if form.get("messaging_product") != "whatsapp":
             invalid_param(self.ctx, "messaging_product must be 'whatsapp'.")
+        if mime not in MEDIA_LIMITS or not content or len(content) > MEDIA_LIMITS[mime] * 1024 * 1024:
+            invalid_param(self.ctx, "Unsupported media type, empty file, or media size exceeds the limit.")
         blob_key = self.ctx.store.blobs.put(content)
         media_id = numeric_id("media", blob_key, self.ctx.ids.sequence("media"), digits=16)
         self.ctx.store.collection("media").put(
@@ -383,6 +421,9 @@ class WhatsAppMixin:
                 subcode=33,
             )
         assert record is not None
+        phone_scope = self.params.get("phone_number_id")
+        if phone_scope and phone_scope != record.get("_phone_number_id"):
+            invalid_param(self.ctx, "Media does not belong to the supplied phone_number_id.", subcode=33)
         return record
 
     def handle_media_get(self, media_id: str) -> dict[str, Any]:
@@ -412,7 +453,14 @@ class WhatsAppMixin:
 
     async def handle_wa_send(self, phone_id: str) -> dict[str, Any]:
         self.require_whatsapp()
-        self.get_phone(phone_id)
+        phone = self.get_phone(phone_id)
+        if not phone.get("_registered", True):
+            wa_fail(
+                self.ctx,
+                133010,
+                "Phone number not registered",
+                "Register this phone number before sending messages.",
+            )
         body = self.body
         if body.get("messaging_product") != "whatsapp":
             invalid_param(self.ctx, "messaging_product must be 'whatsapp'.")
@@ -424,6 +472,8 @@ class WhatsAppMixin:
             record = self.ctx.store.collection("wa_messages").get(str(message_id))
             if record is None:
                 invalid_param(self.ctx, f"Message with ID '{message_id}' does not exist.", subcode=33)
+            if record.get("direction") != "inbound" or record.get("_phone_number_id") != phone_id:
+                invalid_param(self.ctx, "Only inbound messages for this phone number can be marked read.")
             record["status"] = "read"
             return {"success": True}
         recipient_type = body.get("recipient_type", "individual")
@@ -434,7 +484,14 @@ class WhatsAppMixin:
                 "Unsupported message type",
                 f"recipient_type '{recipient_type}' is not supported; only 'individual' is.",
             )
-        to_raw = str(body.get("to") or "")
+        to_raw = string_value(self.ctx, body.get("to"), "to", maximum=64)
+        if not re.fullmatch(r"\+?[0-9][0-9 ()-]*", to_raw):
+            wa_fail(
+                self.ctx,
+                131026,
+                "Message undeliverable",
+                "Recipient must be a valid international phone number.",
+            )
         wa_id = digits_only(to_raw)
         if not to_raw or not valid_wa_recipient(wa_id):
             wa_fail(
@@ -443,8 +500,8 @@ class WhatsAppMixin:
                 "Message undeliverable",
                 f"Receiver {to_raw or '(empty)'} is not a valid WhatsApp user.",
             )
-        msg_type = body.get("type") or next((t for t in WA_MESSAGE_TYPES if t in body), None)
-        if msg_type not in WA_MESSAGE_TYPES:
+        msg_type = body.get("type", "text")
+        if not isinstance(msg_type, str) or msg_type not in WA_MESSAGE_TYPES:
             wa_fail(
                 self.ctx,
                 131051,
@@ -452,14 +509,20 @@ class WhatsAppMixin:
                 f"Message type '{msg_type}' is not supported.",
             )
         assert msg_type is not None
-        payload = body.get(msg_type)
+        payload = send_payload(self.ctx, msg_type, body.get(msg_type))
+        if msg_type in ("image", "document", "audio", "video", "sticker"):
+            self._validate_media_ref(payload, msg_type)
+        context = body.get("context")
+        if context is not None:
+            context = object_value(self.ctx, context, "context")
+            string_value(self.ctx, context.get("message_id"), "context.message_id")
         origin = "service"
         billable = False
         template_record: dict[str, Any] | None = None
         if msg_type == "template":
             if not isinstance(payload, dict) or not payload.get("name"):
                 invalid_param(self.ctx, "The parameter template['name'] is required.")
-            language = (payload.get("language") or {}).get("code") or payload.get("language")
+            language = payload["language"]["code"]
             template_record = self.find_template(str(payload["name"]), str(language) if language else None)
             if template_record is None or template_record["status"] != "APPROVED":
                 wa_fail(
@@ -492,7 +555,7 @@ class WhatsAppMixin:
                         f"Template {template_record['name']} has no {ctype} parameters but received {count}.",
                     )
             origin = template_record["category"].lower()
-            billable = True
+            billable = origin != "utility" or not self.window_open(self.find_or_create_contact(wa_id))
         else:
             contact = self.find_or_create_contact(wa_id)
             if not self.window_open(contact):
@@ -527,13 +590,20 @@ class WhatsAppMixin:
             elif msg_type == "reaction" and (not isinstance(payload, dict) or not payload.get("message_id")):
                 invalid_param(self.ctx, "The parameter reaction['message_id'] is required.")
         contact = self.find_or_create_contact(wa_id)
-        context = body.get("context")
         if (
             context
             and context.get("message_id")
             and self.ctx.store.collection("wa_messages").get(str(context["message_id"])) is None
         ):
             invalid_param(self.ctx, "context.message_id does not exist.", subcode=33)
+        if context:
+            original = self.ctx.store.collection("wa_messages").get(context["message_id"])
+            if original and original.get("recipient_id") != wa_id:
+                invalid_param(self.ctx, "context.message_id belongs to another recipient.")
+        if msg_type == "reaction":
+            original = self.ctx.store.collection("wa_messages").get(payload["message_id"])
+            if original is None or original.get("recipient_id") != wa_id:
+                invalid_param(self.ctx, "reaction.message_id does not exist for this recipient.")
         message_id = new_wamid(self.ctx)
         record: dict[str, Any] = {
             "id": message_id,

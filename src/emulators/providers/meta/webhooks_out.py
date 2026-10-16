@@ -11,10 +11,14 @@ import hashlib
 import hmac
 import json
 from typing import Any
+from urllib.parse import parse_qsl, urlsplit
 
 from emulators.core.ids import stable_hash
 from emulators.core.provider import ProviderContext
 from emulators.providers.meta.shapes import wa_message_webhook_value
+from emulators.providers.meta.validation import http_url
+
+PAGE_FIELDS = ["messages", "messaging_postbacks", "message_deliveries", "message_reads"]
 
 
 def webhook_config(ctx: ProviderContext, obj: str) -> dict[str, Any] | None:
@@ -44,18 +48,28 @@ async def configure_webhook_verified(
     """
     import httpx
 
+    if obj not in ("page", "whatsapp_business_account"):
+        return False, {"error": "unsupported_object"}
+    http_url(ctx, callback_url, "callback_url")
+    if fields is not None and any(not isinstance(f, str) or not f for f in fields):
+        return False, {"error": "invalid_fields"}
     challenge = str(ctx.ids.randint(10**9, 10**10))
     info: dict[str, Any] = {"challenge": int(challenge), "callback_url": callback_url, "object": obj}
     try:
         response = await ctx.webhooks.request(
             "GET",
             callback_url,
-            params={"hub.mode": "subscribe", "hub.verify_token": verify_token, "hub.challenge": challenge},
+            params={
+                **dict(parse_qsl(urlsplit(callback_url).query)),
+                "hub.mode": "subscribe",
+                "hub.verify_token": verify_token,
+                "hub.challenge": challenge,
+            },
         )
     except httpx.HTTPError as exc:
         return False, {**info, "error": f"{type(exc).__name__}: {exc}"}
     info["response_status"] = response.status_code
-    if response.status_code != 200 or response.text.strip() != challenge:
+    if response.status_code != 200 or response.text != challenge:
         info["response_body"] = response.text[:500]
         info["error"] = "challenge_mismatch"
         return False, info
@@ -67,7 +81,7 @@ async def configure_webhook_verified(
             "callback_url": callback_url,
             "verify_token": verify_token,
             "app_secret": app_secret or ctx.store.meta.get("app_secret"),
-            "fields": fields or ["messages"],
+            "fields": fields if fields is not None else ["messages"],
         },
     )
     return True, info
@@ -77,6 +91,24 @@ async def deliver_payload(ctx: ProviderContext, obj: str, payload: dict[str, Any
     config = webhook_config(ctx, obj)
     if not config or not config.get("callback_url"):
         return False
+    field = {
+        "whatsapp.messages": "messages",
+        "whatsapp.statuses": "messages",
+        "messenger.messages": "messages",
+        "messenger.postbacks": "messaging_postbacks",
+        "messenger.deliveries": "message_deliveries",
+        "messenger.reads": "message_reads",
+    }.get(event_type)
+    if field not in config.get("fields", []):
+        return False
+    if obj == "whatsapp_business_account":
+        apps = ctx.store.collection("subscribed_apps").get(ctx.store.meta["waba_id"]) or {}
+        if not any(a.get("id") == ctx.store.meta["app_id"] for a in apps.get("apps", [])):
+            return False
+    else:
+        page = ctx.store.collection("pages").get(ctx.store.meta["page_id"]) or {}
+        if field not in page.get("_subscribed_fields", []):
+            return False
     body = json.dumps(payload).encode()
     secret = str(config.get("app_secret") or ctx.store.meta.get("app_secret") or "")
     await ctx.webhooks.deliver(
@@ -164,6 +196,9 @@ async def deliver_wa_status(
     }
     if errors:
         status_obj["errors"] = errors
+    if status == "failed":
+        status_obj.pop("pricing", None)
+        status_obj.pop("conversation", None)
     payload = {
         "object": "whatsapp_business_account",
         "entry": [
@@ -248,10 +283,14 @@ async def deliver_ms_inbound(
     return await deliver_ms_messaging(ctx, [item], "messenger.messages")
 
 
-async def deliver_ms_delivery_and_read(ctx: ProviderContext, psid: str, mid: str, watermark_ms: int) -> None:
+async def deliver_ms_delivery_and_read(
+    ctx: ProviderContext, psid: str, mid: str, watermark_ms: int, *, status: str | None = None
+) -> None:
     page_id = ctx.store.meta["page_id"]
     base = {"sender": {"id": psid}, "recipient": {"id": page_id}, "timestamp": watermark_ms}
-    await deliver_ms_messaging(
-        ctx, [{**base, "delivery": {"mids": [mid], "watermark": watermark_ms}}], "messenger.deliveries"
-    )
-    await deliver_ms_messaging(ctx, [{**base, "read": {"watermark": watermark_ms}}], "messenger.reads")
+    if status in (None, "delivered"):
+        await deliver_ms_messaging(
+            ctx, [{**base, "delivery": {"mids": [mid], "watermark": watermark_ms}}], "messenger.deliveries"
+        )
+    if status in (None, "read"):
+        await deliver_ms_messaging(ctx, [{**base, "read": {"watermark": watermark_ms}}], "messenger.reads")

@@ -1,4 +1,4 @@
-"""Meta has no official Python SDK: drive the Graph API the way consumers do.
+"""Drive Meta messaging APIs with the HTTP clients available in the dev environment.
 
 Plain sync ``httpx`` and ``requests`` calls to the real ``graph.facebook.com``
 hostnames, rerouted to the emulator by ``emulator_intercept`` — exactly what a
@@ -162,7 +162,15 @@ def test_oauth_dialog_exchange_and_debug_token_with_requests() -> None:
     )
     assert debug.json()["data"]["is_valid"] is True
     accounts = requests.get(f"{GRAPH}/me/accounts", headers=USER, timeout=30)
-    assert accounts.json()["data"][0]["access_token"] == PAGE_ACCESS_TOKEN
+    page_token = accounts.json()["data"][0]["access_token"]
+    assert (
+        requests.get(
+            f"{GRAPH}/{ids['page_id']}/conversations",
+            headers={"Authorization": f"Bearer {page_token}"},
+            timeout=30,
+        ).status_code
+        == 200
+    )
 
 
 def test_whatsapp_media_upload_and_download_with_httpx() -> None:

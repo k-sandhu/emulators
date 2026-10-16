@@ -24,9 +24,9 @@ from emulators.providers.meta.api import MetaAPI, read_body
 from emulators.providers.meta.common import (
     APP_ID,
     APP_SECRET,
-    DEFAULT_VERSION,
     OLDEST_VERSION,
     PAGE_ACCESS_TOKEN,
+    SUPPORTED_VERSIONS,
     SYSTEM_USER_TOKEN,
     USER_ACCESS_TOKEN,
     VERIFY_TOKEN,
@@ -52,6 +52,15 @@ class MetaHeadersMiddleware:
         async def send_with_headers(message: Any) -> None:
             if message.get("type") == "http.response.start" and not path.startswith("/_emulator"):
                 headers = list(message.get("headers") or [])
+                headers = [
+                    (
+                        k,
+                        b"application/json; charset=UTF-8"
+                        if k.lower() == b"content-type" and v == b"application/json"
+                        else v,
+                    )
+                    for k, v in headers
+                ]
                 existing = {k.lower() for k, _ in headers}
                 meta = self.ctx.store.meta
                 business_id = meta.get("business_id", "")
@@ -59,6 +68,9 @@ class MetaHeadersMiddleware:
                     b"x-fb-trace-id": (self.ctx.ids.base62(1) + self.ctx.ids.urlsafe(12)).encode(),
                     b"x-app-usage": b'{"call_count":1,"total_cputime":1,"total_time":1}',
                     b"x-fb-request-id": self.ctx.ids.urlsafe(16).encode(),
+                    b"facebook-api-version": scope.get("state", {})
+                    .get("meta_version", OLDEST_VERSION)
+                    .encode(),
                 }
                 if business_id:
                     usage = {
@@ -157,20 +169,25 @@ class MetaProvider(Provider):
             message = "(#803) Some of the aliases you requested do not exist"
         return {"error": {"message": message, "type": err_type, "code": code_int, "fbtrace_id": "Aemulator"}}
 
-    def fault_response(self, rule: FaultRule) -> tuple[int, dict[str, str], bytes]:
-        status, headers, body = super().fault_response(rule)
+    def fault_response(
+        self, rule: FaultRule, scope: dict[str, Any] | None = None
+    ) -> tuple[int, dict[str, str], bytes]:
+        status, headers, body = super().fault_response(rule, scope)
         from emulators.core.ids import stable_hash
 
         trace = stable_hash("meta-fault", rule.id, rule.hits, length=16)
         headers.update(
             {
                 "x-fb-trace-id": trace,
+                "x-fb-request-id": trace,
                 "x-app-usage": '{"call_count":1,"total_cputime":1,"total_time":1}',
+                "x-business-use-case-usage": "{}",
+                "content-type": "application/json; charset=UTF-8",
             }
         )
         try:
             parsed = json.loads(body)
-            if isinstance(parsed, dict) and "error" in parsed:
+            if isinstance(parsed, dict) and isinstance(parsed.get("error"), dict):
                 parsed["error"]["fbtrace_id"] = trace
                 body = json.dumps(parsed).encode()
         except ValueError:
@@ -181,8 +198,14 @@ class MetaProvider(Provider):
         app.add_middleware(MetaHeadersMiddleware, ctx=ctx)
 
         async def handle(request: Request, version: str | None, rest: str) -> Any:
+            version = version or OLDEST_VERSION
+            from emulators.providers.meta.common import invalid_param
+
+            if version not in SUPPORTED_VERSIONS:
+                invalid_param(ctx, f"Unsupported API version {version}.")
+            request.scope.setdefault("state", {})["meta_version"] = version
             body = await read_body(ctx, request)
-            api = MetaAPI(ctx, request, version or OLDEST_VERSION, body)
+            api = MetaAPI(ctx, request, version, body)
             result = await api.dispatch(request.method, rest)
             if isinstance(result, Response):
                 return result
@@ -198,9 +221,7 @@ class MetaProvider(Provider):
 
         @app.api_route("/v{version}", methods=["GET", "POST", "DELETE", "PUT", "PATCH"])
         async def versioned_root(request: Request, version: str) -> Any:
-            return await handle(
-                request, f"v{version}" if _VERSION_RE.match(f"v{version}") else DEFAULT_VERSION, ""
-            )
+            return await handle(request, f"v{version}", "")
 
         @app.api_route("/{rest:path}", methods=["GET", "POST", "DELETE", "PUT", "PATCH"])
         async def unversioned(request: Request, rest: str) -> Any:

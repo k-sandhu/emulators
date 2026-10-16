@@ -7,6 +7,8 @@ Internal keys (``_person_id`` etc.) never survive shaping.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 from typing import Any
 
 from fastapi import Request
@@ -40,7 +42,10 @@ def business_shape(record: dict[str, Any]) -> dict[str, Any]:
 
 def clean(shape: dict[str, Any]) -> dict[str, Any]:
     """Drop keys whose value is ``None`` (Graph omits unset fields) except explicit nulls."""
-    return {k: v for k, v in shape.items() if v is not None or k.startswith("_")}
+    return {
+        **{k: v for k, v in shape.items() if v is not None or k.startswith("_")},
+        "_known_fields": [k for k in shape if not k.startswith("_")],
+    }
 
 
 def waba_shape(record: dict[str, Any]) -> dict[str, Any]:
@@ -56,7 +61,7 @@ def waba_shape(record: dict[str, Any]) -> dict[str, Any]:
             "owner_business_info": record.get("owner_business_info"),
             "primary_funding_id": record.get("primary_funding_id"),
             "is_enabled_for_insights": record.get("is_enabled_for_insights"),
-            "_defaults": ["id", "name"],
+            "_defaults": ["id", "name", "timezone_id", "message_template_namespace"],
         }
     )
 
@@ -95,7 +100,6 @@ def profile_shape(ctx: ProviderContext, request: Request, phone: dict[str, Any])
         "profile_picture_url": profile.get("profile_picture_url") or picture_url(ctx, request, phone["id"]),
         "websites": profile.get("websites") or [],
         "vertical": profile.get("vertical"),
-        "industry": profile.get("vertical"),
         "messaging_product": "whatsapp",
     }
     return clean(shape)
@@ -130,16 +134,17 @@ def template_shape(record: dict[str, Any]) -> dict[str, Any]:
 def media_shape(
     ctx: ProviderContext, request: Request, record: dict[str, Any], version: str
 ) -> dict[str, Any]:
-    from emulators.core.ids import stable_hash
     from emulators.core.provider import url_for_host
 
     ext = int(ctx.clock.now().timestamp()) + 300
+    signature = hmac.new(
+        str(ctx.store.meta["app_secret"]).encode(), f"{record['id']}:{ext}".encode(), hashlib.sha256
+    ).hexdigest()
     url = url_for_host(
         request,
         ctx,
         "lookaside.fbsbx.com",
-        f"/whatsapp_business/attachments/?mid={record['id']}&ext={ext}"
-        f"&hash={stable_hash('media', record['id'], length=32)}",
+        f"/whatsapp_business/attachments/?mid={record['id']}&ext={ext}&hash={signature}",
     )
     return {
         "messaging_product": "whatsapp",
@@ -267,6 +272,7 @@ def _ms(record: dict[str, Any]) -> dict[str, Any]:
         "message": record.get("message", ""),
         "tags": {"data": [{"name": "source:messenger"}]},
         "_defaults": ["id", "created_time", "from", "to", "message"],
+        "_known_fields": ["attachments", "sticker"],
     }
     attachments = record.get("_attachments") or record.get("attachments")
     if attachments:
@@ -283,7 +289,7 @@ def ms_conversation_shape(ctx: ProviderContext, record: dict[str, Any]) -> dict[
         item = coll.get(mid)
         if item is not None:
             messages.append(_ms(item))
-    messages.sort(key=lambda m: m["created_time"])
+    messages.sort(key=lambda m: m["created_time"], reverse=True)
     return {
         "id": record["id"],
         "link": record["link"],
@@ -320,7 +326,7 @@ def wa_message_webhook_value(ctx: ProviderContext, record: dict[str, Any]) -> di
         "type": record["type"],
     }
     payload_key = record["type"]
-    if payload_key in record and isinstance(record[payload_key], dict):
+    if payload_key in record and isinstance(record[payload_key], (dict, list)):
         item[payload_key] = record[payload_key]
     for key in ("context", "identity", "referral", "button", "interactive", "order", "system", "errors"):
         if key in record and record[key] is not None and key != payload_key:

@@ -8,11 +8,12 @@ object graph: ``/{object-id}/{edge}`` where the object kind decides the edges.
 
 from __future__ import annotations
 
-import html
+import hashlib
+import hmac
 import json
 from datetime import timedelta
 from typing import Any, NoReturn
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, quote, urlsplit
 
 from fastapi import Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
@@ -22,23 +23,34 @@ from emulators.core.errors import EmulatorError
 from emulators.core.provider import ProviderContext
 from emulators.providers.meta import shapes
 from emulators.providers.meta.common import (
-    APP_ID,
     APP_NAME,
-    USER_SCOPES,
+    SUPPORTED_VERSIONS,
     Auth,
+    FieldSelectionError,
     apply_fields,
+    error_dict,
     fail,
     invalid_param,
     issue_meta_token,
     not_found,
     paged,
+    parse_fields,
     permission_fail,
     picture_url,
     require_auth,
+    require_business_access,
+    require_scopes,
     resolve_auth,
 )
 from emulators.providers.meta.messenger import MessengerMixin
 from emulators.providers.meta.seed import fb_user_id
+from emulators.providers.meta.validation import (
+    decode_parameter,
+    http_url,
+    object_value,
+    string_value,
+    validate_json,
+)
 from emulators.providers.meta.webhooks_out import configure_webhook_verified
 from emulators.providers.meta.whatsapp import WhatsAppMixin
 
@@ -54,17 +66,19 @@ async def read_body(ctx: ProviderContext, request: Request) -> dict[str, Any]:
     if "application/json" in content_type or raw[:1] in (b"{", b"["):
         try:
             parsed = json.loads(raw)
-        except ValueError:
+        except (ValueError, RecursionError):
             invalid_param(ctx, "Invalid JSON in request body.")
-        return parsed if isinstance(parsed, dict) else {"_body": parsed}  # type: ignore[return-value]
+        validate_json(ctx, parsed)
+        return object_value(ctx, parsed, "Request body")
     if "application/x-www-form-urlencoded" in content_type:
         form = await request.form()
         return {k: v for k, v in form.items()}
     try:
         parsed = json.loads(raw)
-        return parsed if isinstance(parsed, dict) else {}
-    except ValueError:
-        return {}
+        validate_json(ctx, parsed)
+        return object_value(ctx, parsed, "Request body")
+    except (ValueError, RecursionError):
+        invalid_param(ctx, "Invalid JSON in request body.")
 
 
 def unsupported(ctx: ProviderContext, object_id: str) -> NoReturn:
@@ -89,9 +103,15 @@ class MetaAPI(WhatsAppMixin, MessengerMixin):
         params_override: dict[str, Any] | None = None,
     ) -> None:
         self.ctx = ctx
+        if version not in SUPPORTED_VERSIONS:
+            invalid_param(ctx, f"Unsupported API version {version}.")
+        if params_override is not None:
+            scope = dict(request.scope)
+            scope["headers"] = [(k, v) for k, v in scope.get("headers", []) if k.lower() != b"authorization"]
+            request = Request(scope, request.receive)
         self.request = request
         self.version = version
-        self.body = body
+        self.body = dict(body)
         if params_override is not None:
             self.params = dict(params_override)
         else:
@@ -101,6 +121,40 @@ class MetaAPI(WhatsAppMixin, MessengerMixin):
                     params[key] = value
             params.update(request.query_params)
             self.params = params
+        if request.method in ("POST", "DELETE", "PUT", "PATCH"):
+            self.body.update(self.params)
+            # Graph form/query parameters encode structured arguments as JSON strings.
+            for key in (
+                "recipient",
+                "message",
+                "text",
+                "image",
+                "video",
+                "audio",
+                "document",
+                "sticker",
+                "location",
+                "contacts",
+                "interactive",
+                "template",
+                "reaction",
+                "context",
+                "components",
+                "websites",
+                "greeting",
+                "get_started",
+                "persistent_menu",
+                "ice_breakers",
+                "domain_whitelist",
+            ):
+                if key in self.body and isinstance(self.body[key], str):
+                    self.body[key] = decode_parameter(ctx, self.body[key], key)
+        fields = self.params.get("fields")
+        if isinstance(fields, str) and not (request.method == "DELETE" and fields.lstrip().startswith("[")):
+            try:
+                parse_fields(fields)
+            except ValueError as exc:
+                invalid_param(ctx, str(exc))
 
     # -- small helpers -------------------------------------------------------------------------------
     def shaped(self, shape: dict[str, Any]) -> Any:
@@ -121,29 +175,36 @@ class MetaAPI(WhatsAppMixin, MessengerMixin):
         if auth.meta_type == "SYSTEM_USER":
             return str(auth.fb_user_id or meta["system_user_id"])
         if auth.meta_type == "APP":
-            return str(meta["app_id"])
+            return auth.client_id
         return str(auth.fb_user_id or "")
 
     # -- main dispatch ---------------------------------------------------------------------------------
     async def dispatch(self, method: str, rest: str) -> Any:
         segments = [s for s in rest.split("/") if s != ""]
         if segments == ["dialog", "oauth"]:
+            if method != "GET":
+                unsupported(self.ctx, "dialog/oauth")
             return await self.oauth_dialog()
         if segments == ["oauth", "access_token"]:
+            if method not in ("GET", "POST"):
+                unsupported(self.ctx, "oauth/access_token")
             return await self.oauth_access_token()
         if segments == ["debug_token"]:
             if method != "GET":
                 unsupported(self.ctx, "debug_token")
             return self.debug_token()
-        if segments[:2] == ["whatsapp_business", "attachments"]:
+        if segments[:2] == ["whatsapp_business", "attachments"] and method == "GET":
             return self.media_download()
         if segments and segments[0] == "v" and segments[-1].endswith(".png"):
             return self.cdn_picture(segments[-1])
         if not segments:
-            if method == "POST" and (self.body.get("batch") or self.params.get("batch")):
+            if method == "POST" and ("batch" in self.body or "batch" in self.params):
                 return await self.batch()
             not_found(self.ctx, "")
-        return await self.object_dispatch(method, segments)
+        try:
+            return await self.object_dispatch(method, segments)
+        except FieldSelectionError as exc:
+            invalid_param(self.ctx, str(exc))
 
     async def object_dispatch(self, method: str, segments: list[str]) -> Any:
         ctx = self.ctx
@@ -181,7 +242,7 @@ class MetaAPI(WhatsAppMixin, MessengerMixin):
                 return self.handle_ms_conversation_messages(first)
             if method == "GET" and rest == ["participants"]:
                 conv = self.get_ms_conversation(first)
-                self.require_page(conv["_page_id"])
+                self.require_conversation_access(conv["_page_id"])
                 return {"data": conv["participants"]["data"]}
             unsupported(ctx, first)
         if first in ctx.store.collection("ms_messages"):
@@ -196,6 +257,9 @@ class MetaAPI(WhatsAppMixin, MessengerMixin):
             unsupported(ctx, first)
         if first in ctx.store.collection("templates"):
             return self.template_dispatch(method, first, rest)
+        require_auth(ctx, self.request, self.params)
+        if first.isascii() and first.isdigit():
+            unsupported(ctx, first)
         not_found(ctx, first)
 
     # -- per-kind dispatch -------------------------------------------------------------------------------
@@ -241,6 +305,13 @@ class MetaAPI(WhatsAppMixin, MessengerMixin):
             waba = self.get_waba(waba_id)
             for key in ("name", "timezone_id", "currency"):
                 if key in self.body:
+                    string_value(self.ctx, self.body[key], key, maximum=512)
+                    if (key == "timezone_id" and not self.body[key].isascii()) or (
+                        key == "timezone_id" and not self.body[key].isdigit()
+                    ):
+                        invalid_param(self.ctx, "timezone_id must be a numeric timezone identifier.")
+            for key in ("name", "timezone_id", "currency"):
+                if key in self.body:
                     waba[key] = self.body[key]
             return {"success": True}
         unsupported(self.ctx, waba_id)
@@ -257,6 +328,7 @@ class MetaAPI(WhatsAppMixin, MessengerMixin):
             self.ctx.store.collection("templates").delete(template_id)
             return {"success": True}
         if method == "POST":
+            self.validate_template_update(record)
             if "components" in self.body:
                 record["components"] = self.body["components"]
                 record["status"] = "PENDING"
@@ -266,13 +338,15 @@ class MetaAPI(WhatsAppMixin, MessengerMixin):
         unsupported(self.ctx, template_id)
 
     def business_dispatch(self, method: str, business_id: str, rest: list[str]) -> Any:
-        require_auth(
+        auth = require_auth(
             self.ctx,
             self.request,
             self.params,
-            types={"SYSTEM_USER", "USER", "APP"},
-            perm_message="Permissions error: business objects require a user, system-user or app token.",
+            types={"SYSTEM_USER", "USER"},
+            perm_message="Permissions error: business objects require an assigned user or system-user token.",
         )
+        require_scopes(self.ctx, auth, "business_management")
+        require_business_access(self.ctx, auth)
         record = self.ctx.store.collection("businesses").get(business_id)
         assert record is not None
         if not rest and method == "GET":
@@ -308,21 +382,20 @@ class MetaAPI(WhatsAppMixin, MessengerMixin):
             manager = self.person_id_for_auth(auth) in (page.get("_roles") or {})
             include_token = wants_token and (
                 auth.page_id == page_id
-                or auth.meta_type == "SYSTEM_USER"
-                or (auth.meta_type == "USER" and manager)
+                or (auth.meta_type == "USER" and manager and "pages_show_list" in auth.scopes)
             )
             return self.shaped(shapes.page_shape(ctx, self.request, page, include_token=bool(include_token)))
         if not rest and method == "POST":
             auth = require_auth(ctx, self.request, self.params)
             manager = self.person_id_for_auth(auth) in (page.get("_roles") or {})
-            if not (
-                auth.page_id == page_id
-                or (auth.meta_type == "USER" and manager)
-                or auth.meta_type == "SYSTEM_USER"
-            ):
+            if not (auth.page_id == page_id or (auth.meta_type == "USER" and manager)):
                 permission_fail(
                     ctx, "Permissions error: updating a Page requires a page or admin user token."
                 )
+            require_scopes(ctx, auth, "pages_manage_metadata")
+            for key in ("about", "description", "phone", "website", "category", "bio"):
+                if key in self.body:
+                    string_value(ctx, self.body[key], key, maximum=10000, empty=True)
             for key in ("about", "description", "phone", "website", "category", "bio"):
                 if key in self.body:
                     page[key] = self.body[key]
@@ -343,11 +416,7 @@ class MetaAPI(WhatsAppMixin, MessengerMixin):
         if rest == ["roles"] and method == "GET":
             auth = require_auth(ctx, self.request, self.params)
             manager = self.person_id_for_auth(auth) in (page.get("_roles") or {})
-            if not (
-                auth.page_id == page_id
-                or auth.meta_type == "SYSTEM_USER"
-                or (auth.meta_type == "USER" and manager)
-            ):
+            if not (auth.page_id == page_id or (auth.meta_type == "USER" and manager)):
                 permission_fail(ctx, "Permissions error: listing Page roles requires an admin token.")
             data = []
             for person_id, role in (page.get("_roles") or {}).items():
@@ -356,7 +425,7 @@ class MetaAPI(WhatsAppMixin, MessengerMixin):
                     data.append({"id": user["id"], "name": user["name"], "role": role})
             return {"data": data}
         if rest == ["subscribed_apps"]:
-            self.require_page(page_id)
+            self.require_page(page_id, permission="pages_manage_metadata")
             if method == "GET":
                 fields_list = page.get("_subscribed_fields") or []
                 data = (
@@ -392,13 +461,15 @@ class MetaAPI(WhatsAppMixin, MessengerMixin):
 
     async def app_subscriptions(self, method: str) -> Any:
         ctx = self.ctx
-        require_auth(
+        auth = require_auth(
             ctx,
             self.request,
             self.params,
             types={"APP"},
             perm_message="Manage subscriptions requires an app access token.",
         )
+        if auth.client_id != ctx.store.meta["app_id"]:
+            permission_fail(ctx, "The app token must belong to the app being configured.")
         configs = ctx.store.collection("webhook_configs")
         if method == "GET":
             data = [
@@ -425,7 +496,7 @@ class MetaAPI(WhatsAppMixin, MessengerMixin):
             )
             if not obj or not callback or not verify_token:
                 invalid_param(ctx, "object, callback_url and verify_token are required.")
-            ok, info = await configure_webhook_verified(
+            ok, _info = await configure_webhook_verified(
                 ctx,
                 obj=obj,
                 callback_url=callback,
@@ -440,7 +511,7 @@ class MetaAPI(WhatsAppMixin, MessengerMixin):
                     "(#100) Callback verification failed: the callback URL did not echo the hub.challenge.",
                     subcode=2200,
                 )
-            return {"success": True, **({"data": info} if info else {})}
+            return {"success": True}
         if method == "DELETE":
             obj = str(self.params.get("object") or self.body.get("object") or "")
             if not obj:
@@ -457,7 +528,7 @@ class MetaAPI(WhatsAppMixin, MessengerMixin):
                 return self.shaped(shapes.system_user_shape(ctx))
             record = ctx.store.collection("fb_users").get(user_id)
             assert record is not None
-            with_email = auth.fb_user_id == user_id or auth.meta_type in ("APP", "SYSTEM_USER")
+            with_email = auth.fb_user_id == user_id and "email" in auth.scopes
             return self.shaped(shapes.fb_user_shape(ctx, self.request, record, with_email=bool(with_email)))
         if rest == ["accounts"] and method == "GET":
             auth = require_auth(
@@ -472,7 +543,14 @@ class MetaAPI(WhatsAppMixin, MessengerMixin):
             return self.accounts_for(auth)
         if rest == ["permissions"]:
             auth = require_auth(ctx, self.request, self.params)
+            if auth.meta_type != "USER" or auth.fb_user_id != user_id:
+                permission_fail(ctx, "You can only manage your own permissions.")
             return self.permissions(auth, method)
+        if len(rest) == 2 and rest[0] == "permissions" and method == "DELETE":
+            auth = require_auth(ctx, self.request, self.params)
+            if auth.meta_type != "USER" or auth.fb_user_id != user_id:
+                permission_fail(ctx, "You can only manage your own permissions.")
+            return self.permissions(auth, method, rest[1])
         unsupported(ctx, user_id)
 
     # -- /me ----------------------------------------------------------------------------------------------
@@ -510,6 +588,10 @@ class MetaAPI(WhatsAppMixin, MessengerMixin):
             return self.accounts_for(auth)
         if rest == ["permissions"]:
             return self.permissions(auth, method)
+        if len(rest) == 2 and rest[0] == "permissions" and method == "DELETE":
+            return self.permissions(auth, method, rest[1])
+        if rest == ["conversations"] and method == "GET" and auth.meta_type == "PAGE":
+            return self.handle_ms_conversations(str(auth.page_id))
         unsupported(ctx, "me")
 
     def me_shape(self, auth: Auth) -> Any:
@@ -521,7 +603,10 @@ class MetaAPI(WhatsAppMixin, MessengerMixin):
         if auth.meta_type == "SYSTEM_USER":
             return self.shaped(shapes.system_user_shape(ctx))
         if auth.meta_type == "APP":
-            return self.shaped(shapes.app_shape(ctx))
+            if auth.client_id == ctx.store.meta["app_id"]:
+                return self.shaped(shapes.app_shape(ctx))
+            client = ctx.tokens.client(auth.client_id) or {}
+            return self.shaped({"id": auth.client_id, "name": client.get("name", auth.client_id)})
         record = ctx.store.collection("fb_users").get(auth.fb_user_id or "")
         if record is None:
             not_found(ctx, auth.fb_user_id or "me")
@@ -529,6 +614,7 @@ class MetaAPI(WhatsAppMixin, MessengerMixin):
 
     def accounts_for(self, auth: Auth) -> Any:
         ctx = self.ctx
+        require_scopes(ctx, auth, "pages_show_list")
         person_id = self.person_id_for_auth(auth)
         items = []
         for page in ctx.store.collection("pages"):
@@ -540,22 +626,62 @@ class MetaAPI(WhatsAppMixin, MessengerMixin):
                 if role == "ADMIN"
                 else ["CREATE_CONTENT", "MODERATE", "ADVERTISE", "ANALYZE"]
             )
+            page_view = dict(page)
+            scopes = [s for s in auth.scopes if s.startswith("pages_")]
+            existing = next(
+                (
+                    g
+                    for g in ctx.store.collection("_grants")
+                    if not g.get("revoked")
+                    and g.get("client_id") == auth.client_id
+                    and g.get("scopes") == scopes
+                    and (g.get("extra") or {}).get("origin_user_id") == auth.fb_user_id
+                    and (g.get("extra") or {}).get("page_id") == page["id"]
+                ),
+                None,
+            )
+            if existing and ctx.tokens.resolve(existing["id"]):
+                page_view["access_token"] = existing["id"]
+            else:
+                grant = issue_meta_token(
+                    ctx,
+                    meta_type="PAGE",
+                    page_id=page["id"],
+                    person_id=person_id,
+                    scopes=scopes,
+                    ttl=None,
+                    client_id=auth.client_id,
+                )
+                saved = ctx.store.collection("_grants").get(grant.token)
+                assert saved is not None
+                saved["extra"]["origin_user_id"] = auth.fb_user_id
+                page_view["access_token"] = grant.token
             items.append(
-                self.shaped(shapes.page_shape(ctx, self.request, page, include_token=True, tasks=tasks))
+                self.shaped(shapes.page_shape(ctx, self.request, page_view, include_token=True, tasks=tasks))
             )
         return paged(ctx, self.request, self.version, "me/accounts", items, self.params)
 
-    def permissions(self, auth: Auth, method: str) -> Any:
+    def permissions(self, auth: Auth, method: str, permission: str | None = None) -> Any:
         ctx = self.ctx
+        if auth.meta_type != "USER":
+            permission_fail(ctx, "This endpoint requires a user access token.")
         if method == "GET":
             return {"data": [{"permission": s, "status": "granted"} for s in auth.scopes]}
         if method == "DELETE":
-            permission = self.params.get("permission") or self.body.get("permission")
-            if not permission:
-                invalid_param(ctx, "The parameter permission is required.")
-            if auth.grant is not None:
-                record = ctx.store.collection("_grants").get(auth.token)
-                if record and permission in (record.get("scopes") or []):
+            permission = permission or self.params.get("permission") or self.body.get("permission")
+            if permission is not None:
+                string_value(ctx, permission, "permission", maximum=256)
+            for record in ctx.store.collection("_grants"):
+                extra = record.get("extra") or {}
+                if record.get("client_id") != auth.client_id or auth.fb_user_id not in (
+                    record.get("user_id"),
+                    extra.get("origin_user_id"),
+                    extra.get("fb_user_id"),
+                ):
+                    continue
+                if not permission:
+                    record["revoked"] = True
+                else:
                     record["scopes"] = [s for s in record["scopes"] if s != permission]
             return {"success": True}
         unsupported(ctx, "permissions")
@@ -568,6 +694,7 @@ class MetaAPI(WhatsAppMixin, MessengerMixin):
         redirect_uri = str(params.get("redirect_uri") or "")
         if not client_id or not redirect_uri:
             invalid_param(ctx, "client_id and redirect_uri are required.")
+        http_url(ctx, redirect_uri, "redirect_uri")
         ctx.tokens.authenticate_client(client_id, None, require_secret=False)
         response_type = str(params.get("response_type") or "code")
         raw_scope = str(params.get("scope") or "")
@@ -600,6 +727,8 @@ class MetaAPI(WhatsAppMixin, MessengerMixin):
             )
             return HTMLResponse(page)
         parts = {p.strip() for p in response_type.replace(",", " ").split()}
+        if parts not in ({"code"}, {"token"}):
+            invalid_param(ctx, "Unsupported response_type.")
         state = params.get("state")
         if "token" in parts and "code" not in parts:
             grant = issue_meta_token(
@@ -636,7 +765,11 @@ class MetaAPI(WhatsAppMixin, MessengerMixin):
         client_id = str(p.get("client_id") or "")
         client_secret = str(p.get("client_secret") or "") or None
         grant_type = str(p.get("grant_type") or "")
-        if client_id == APP_ID and client_secret not in (None, ctx.store.meta["app_secret"]):
+        if not client_secret:
+            fail(ctx, 400, 100, "Error validating client secret.")
+        registered = ctx.tokens.client(client_id)
+        expected_secret = (registered or {}).get("client_secret")
+        if expected_secret and client_secret != expected_secret:
             fail(ctx, 400, 100, "Error validating client secret.")
         try:
             client = ctx.tokens.authenticate_client(
@@ -644,6 +777,8 @@ class MetaAPI(WhatsAppMixin, MessengerMixin):
             )
         except OAuthError as exc:
             fail(ctx, exc.status, 100, exc.description or "Error validating client secret.")
+        if not client.get("client_secret"):
+            client["client_secret"] = client_secret
         if grant_type == "client_credentials":
             secret = client_secret or str(client.get("client_secret") or "")
             if not secret:
@@ -654,18 +789,23 @@ class MetaAPI(WhatsAppMixin, MessengerMixin):
             if source is None or (source.extra or {}).get("meta_type") != "USER":
                 fail(ctx, 400, 190, "Error validating access token: Session is invalid.", subcode=467)
             extra = source.extra or {}
+            if source.client_id != client_id:
+                fail(ctx, 400, 100, "The access token was issued to a different app.")
             grant = issue_meta_token(
                 ctx,
                 meta_type="USER",
                 fb_user_id=extra.get("fb_user_id") or source.user_id,
                 person_id=extra.get("person_id"),
-                scopes=list(source.scopes or USER_SCOPES),
+                scopes=list(source.scopes),
                 ttl=timedelta(days=60),
                 client_id=client_id or source.client_id,
             )
             return {"access_token": grant.token, "token_type": "bearer", "expires_in": 5184000}
         code = p.get("code")
         if grant_type in ("", "authorization_code") and code:
+            pending = ctx.tokens.resolve(str(code), "code")
+            if pending and pending.redirect_uri != p.get("redirect_uri"):
+                invalid_param(ctx, "redirect_uri must be identical to the one used in the OAuth dialog.")
             try:
                 code_grant = ctx.tokens.redeem_code(
                     str(code),
@@ -706,21 +846,28 @@ class MetaAPI(WhatsAppMixin, MessengerMixin):
         if "|" in input_token:
             sub = MetaAPI(ctx, self.request, self.version, {}, {"access_token": input_token})
             resolved = resolve_auth(ctx, self.request, sub.params)
+            input_app_id = input_token.partition("|")[0]
+            if caller.client_id != input_app_id:
+                permission_fail(ctx, "Inspecting this token requires an access token for its app.")
             return {
                 "data": {
-                    "app_id": meta["app_id"],
+                    "app_id": input_app_id,
                     "type": "APP",
-                    "application": meta["app_name"],
+                    "application": (ctx.tokens.client(input_app_id) or {}).get("name", input_app_id),
                     "data_access_expires_at": 0,
                     "expires_at": 0,
                     "is_valid": resolved is not None,
                     "issued_at": now_ts,
                     "scopes": [],
                     "granular_scopes": [],
-                    "user_id": meta["app_id"],
+                    "user_id": input_app_id,
                 }
             }
         grant = ctx.tokens.get(input_token, "access")
+        if grant is not None and (
+            caller.client_id != grant.client_id or (caller.meta_type != "APP" and caller.token != input_token)
+        ):
+            permission_fail(ctx, "Inspecting this token requires an access token for its app.")
         if grant is None:
             return {
                 "data": {
@@ -783,33 +930,57 @@ class MetaAPI(WhatsAppMixin, MessengerMixin):
     def media_download(self) -> Response:
         ctx = self.ctx
         params: dict[str, Any] = dict(self.request.query_params)
-        if resolve_auth(ctx, self.request, params) is None:
-            fail(ctx, 401, 190, "Invalid OAuth access token.", subcode=467)
+        self.require_whatsapp()
         mid = str(params.get("mid") or "")
         record = ctx.store.collection("media").get(mid)
         if record is None or not record.get("_blob_key"):
             fail(ctx, 404, 100, "(#100) Media not found.", subcode=33)
         assert record is not None
+        ext = str(params.get("ext") or "")
+        signature = str(params.get("hash") or "")
+        expected = hmac.new(
+            str(ctx.store.meta["app_secret"]).encode(), f"{mid}:{ext}".encode(), hashlib.sha256
+        ).hexdigest()
+        if (
+            not ext.isascii()
+            or not ext.isdigit()
+            or len(ext) > 12
+            or int(ext) <= int(ctx.clock.now().timestamp())
+            or not hmac.compare_digest(expected.encode(), signature.encode("utf-8", "replace"))
+        ):
+            fail(ctx, 404, 100, "(#100) Media URL has expired or is invalid.", subcode=33)
         try:
             content = ctx.store.blobs.get(record["_blob_key"])
         except KeyError:
             fail(ctx, 404, 100, "(#100) Media not found.", subcode=33)
-        filename = html.escape(str(record.get("_filename") or "download"), quote=True)
+        filename = quote(str(record.get("_filename") or "download"), safe="")
         return Response(
             content,
             media_type=str(record.get("mime_type") or "application/octet-stream"),
             headers={
-                "Content-Disposition": f'attachment; filename="{filename}"',
+                "Content-Disposition": f"attachment; filename*=UTF-8''{filename}",
                 "Cache-Control": "private, max-age=300",
                 "Content-Length": str(len(content)),
             },
         )
 
     def cdn_picture(self, filename: str) -> Response:
+        from emulators.providers.meta.validation import integer_value
         from emulators.world.documents import make_png
 
-        seed = int(filename.split(".")[0][-4:] or "0", 36) if filename.split(".")[0] else 1
-        return Response(make_png(200, 200, seed=seed % 1000), media_type="image/png")
+        width = integer_value(self.ctx, self.params.get("width", 50), "width", maximum=2048)
+        height = integer_value(self.ctx, self.params.get("height", 50), "height", maximum=2048)
+        if min(width, height) < 1:
+            invalid_param(self.ctx, "Picture dimensions must be positive.")
+        seed = int(hashlib.sha256(filename.encode()).hexdigest()[:8], 16)
+        cache_id = f"{filename}:{width}:{height}"
+        pictures = self.ctx.store.collection("_pictures")
+        record = pictures.get(cache_id)
+        if record is None:
+            record = pictures.put(
+                {"id": cache_id, "blob": self.ctx.store.blobs.put(make_png(width, height, seed=seed % 1000))}
+            )
+        return Response(self.ctx.store.blobs.get(record["blob"]), media_type="image/png")
 
     def picture_endpoint(self, object_id: str) -> Response:
         ctx = self.ctx
@@ -823,24 +994,28 @@ class MetaAPI(WhatsAppMixin, MessengerMixin):
         )
         if not known:
             not_found(ctx, object_id)
+        from emulators.providers.meta.validation import integer_value
+
+        width = integer_value(ctx, self.params.get("width", 50), "width", maximum=2048)
+        height = integer_value(ctx, self.params.get("height", 50), "height", maximum=2048)
+        if min(width, height) < 1:
+            invalid_param(ctx, "Picture dimensions must be positive.")
         if str(self.params.get("redirect") or "true").lower() == "false":
             from fastapi.responses import JSONResponse
 
-            width = int(self.params.get("width", 50)) if str(self.params.get("width", "")).isdigit() else 50
-            height = (
-                int(self.params.get("height", 50)) if str(self.params.get("height", "")).isdigit() else 50
-            )
             return JSONResponse(
                 {
                     "data": {
-                        "url": picture_url(ctx, self.request, object_id),
+                        "url": picture_url(ctx, self.request, object_id, width=width, height=height),
                         "width": width,
                         "height": height,
                         "is_silhouette": False,
                     }
                 }
             )
-        return RedirectResponse(picture_url(ctx, self.request, object_id), status_code=302)
+        return RedirectResponse(
+            picture_url(ctx, self.request, object_id, width=width, height=height), status_code=302
+        )
 
     # -- batch ----------------------------------------------------------------------------------------------
     async def batch(self) -> Any:
@@ -851,8 +1026,8 @@ class MetaAPI(WhatsAppMixin, MessengerMixin):
             items = json.loads(raw) if isinstance(raw, str) else raw
         except ValueError:
             invalid_param(ctx, "batch must be a JSON-encoded list of requests.")
-        if not isinstance(items, list) or len(items) > 50:
-            invalid_param(ctx, "batch must be a list of at most 50 requests.")
+        if not isinstance(items, list) or not 1 <= len(items) <= 50:
+            invalid_param(ctx, "batch must be a list of 1 to 50 requests.")
         include_headers = str(self.params.get("include_headers", "true")).lower() != "false"
         results: list[dict[str, Any]] = []
         for item in items:
@@ -862,8 +1037,22 @@ class MetaAPI(WhatsAppMixin, MessengerMixin):
                 )
                 continue
             method = str(item.get("method") or "GET").upper()
-            relative = str(item.get("relative_url") or "")
-            split = urlsplit(relative)
+            try:
+                relative = string_value(ctx, item.get("relative_url"), "relative_url", maximum=16384)
+                split = urlsplit(relative)
+                if split.scheme or split.netloc or split.fragment:
+                    invalid_param(ctx, "relative_url must be a relative Graph API path.")
+            except (ValueError, EmulatorError) as exc:
+                body = (
+                    exc.body
+                    if isinstance(exc, EmulatorError)
+                    else error_dict(ctx, 100, "Invalid relative_url.")
+                )
+                entry = {"code": 400, "body": json.dumps(body)}
+                if include_headers:
+                    entry["headers"] = [{"name": "Content-Type", "value": "application/json; charset=UTF-8"}]
+                results.append(entry)
+                continue
             path = split.path.lstrip("/")
             version = self.version
             head, _, tail = path.partition("/")
@@ -875,8 +1064,8 @@ class MetaAPI(WhatsAppMixin, MessengerMixin):
                 sub_body = {k: v[-1] for k, v in parse_qs(str(item["body"])).items()}
             params = {**sub_body, **query}
             params.setdefault("access_token", auth.token)
-            sub = MetaAPI(ctx, self.request, version, sub_body, params)
             try:
+                sub = MetaAPI(ctx, self.request, version, sub_body, params)
                 result = await sub.dispatch(method, path)
                 if isinstance(result, Response):
                     body_text = result.body.decode("utf-8", "replace") if hasattr(result, "body") else ""  # type: ignore[attr-defined]

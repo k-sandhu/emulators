@@ -17,13 +17,16 @@ from emulators.providers.meta.common import (
     DISPLAY_PHONE_DIGITS,
     digits_only,
     graph_time,
+    invalid_param,
     issue_meta_token,
     new_mid,
     new_wamid,
     numeric_id,
 )
 from emulators.providers.meta.seed import fb_user_id, psid_for
+from emulators.providers.meta.validation import integer_value, object_value, string_value, validate_json
 from emulators.providers.meta.webhooks_out import (
+    PAGE_FIELDS,
     configure_webhook_verified,
     deliver_ms_delivery_and_read,
     deliver_ms_inbound,
@@ -31,9 +34,10 @@ from emulators.providers.meta.webhooks_out import (
     deliver_wa_status,
     failed_errors,
 )
+from emulators.world.model import Lead, Person
 
 
-def _find_person(ctx: ProviderContext, ref: str):
+def _find_person(ctx: ProviderContext, ref: str) -> Person | Lead | None:
     ref = str(ref)
     for person in ctx.world.people:
         if ref in (person.id, person.email, person.username) or fb_user_id(person.id) == ref:
@@ -78,6 +82,7 @@ def _ensure_fb_user(ctx: ProviderContext, person: Any) -> str:
 
 def mint_token(ctx: ProviderContext, payload: dict[str, Any]) -> dict[str, Any]:
     """Mint a Meta token: {"type": user|page|system_user|app, "user": id|email, "scopes", "expires_in"}."""
+    validate_json(ctx, payload)
     raw_type = str(
         payload.get("type")
         or payload.get("token_type")
@@ -93,14 +98,16 @@ def mint_token(ctx: ProviderContext, payload: dict[str, Any]) -> dict[str, Any]:
         "app": "APP",
     }
     meta_type = mapping.get(raw_type)
+    if raw_type and meta_type is None:
+        invalid_param(ctx, "Unknown Meta token type.")
     user_ref = payload.get("user") or payload.get("user_id") or payload.get("person")
     if meta_type is None:
         meta_type = "USER" if user_ref else "SYSTEM_USER"
-    scopes = _parse_scopes(payload.get("scopes") or payload.get("scope"))
+    scopes = _parse_scopes(payload.get("scopes") if "scopes" in payload else payload.get("scope"))
     client_id = str(payload.get("client_id") or APP_ID)
     if "expires_in" in payload and payload["expires_in"] is not None:
-        ttl: timedelta | None = timedelta(seconds=int(payload["expires_in"]))
-        expires_in: int | None = int(payload["expires_in"])
+        expires_in: int | None = integer_value(ctx, payload["expires_in"], "expires_in")
+        ttl: timedelta | None = timedelta(seconds=expires_in)
     elif meta_type == "USER":
         ttl, expires_in = timedelta(hours=1), 3600
     else:
@@ -173,12 +180,13 @@ def mint_token(ctx: ProviderContext, payload: dict[str, Any]) -> dict[str, Any]:
 
 async def configure_webhook(ctx: ProviderContext, payload: dict[str, Any]) -> dict[str, Any]:
     """Verify (hub.challenge) and store a webhook subscription for an object type."""
+    validate_json(ctx, payload)
     obj = str(payload.get("object") or "")
     callback_url = str(payload.get("callback_url") or payload.get("url") or "")
     verify_token = str(payload.get("verify_token") or "")
     if not obj or not callback_url or not verify_token:
         return {"success": False, "error": "object, callback_url and verify_token are required"}
-    raw_fields = payload.get("fields") or ["messages"]
+    raw_fields = payload.get("fields", PAGE_FIELDS if obj == "page" else ["messages"])
     fields = (
         raw_fields
         if isinstance(raw_fields, list)
@@ -201,11 +209,18 @@ def _make_media(ctx: ProviderContext, media: dict[str, Any], kind: str, wa_id: s
     mime = str(media.get("mime_type") or "")
     filename = str(media.get("filename") or "")
     if media.get("content_base64"):
-        content = base64.b64decode(str(media["content_base64"]))
+        encoded = string_value(ctx, media["content_base64"], "content_base64", maximum=24 * 1024 * 1024)
+        try:
+            content = base64.b64decode(encoded, validate=True)
+        except ValueError:
+            invalid_param(ctx, "content_base64 must be valid base64.")
     elif media.get("doc_id"):
         from emulators.world.documents import render
 
-        doc = ctx.world.document(str(media["doc_id"]))
+        try:
+            doc = ctx.world.document(str(media["doc_id"]))
+        except KeyError:
+            invalid_param(ctx, "Unknown world document id.")
         content, mime = render(doc.kind, doc.title, list(doc.paragraphs), created=doc.created)
         filename = filename or doc.name
         if doc.kind in ("png",):
@@ -217,15 +232,18 @@ def _make_media(ctx: ProviderContext, media: dict[str, Any], kind: str, wa_id: s
             content, mime = make_png(320, 240, seed=int(wa_id[-4:])), "image/png"
             filename = filename or "photo.png"
         elif kind == "audio":
-            from emulators.world.media import make_wav
+            from emulators.world.media import make_m4a
 
-            content, mime = make_wav(2.0, seed=int(wa_id[-4:])), "audio/wav"
-            filename = filename or "voice-message.wav"
+            content, mime = make_m4a(2.0, seed=int(wa_id[-4:])), "audio/mp4"
+            filename = filename or "voice-message.m4a"
         elif kind == "video":
             from emulators.world.media import make_mp4
 
             content, mime = make_mp4(2.0, seed=int(wa_id[-4:])), "video/mp4"
             filename = filename or "video.mp4"
+        elif kind == "sticker":
+            content = base64.b64decode("UklGRiIAAABXRUJQVlA4IBYAAAAwAQCdASoBAAEADsD+JaQAA3AAAAAA")
+            mime, filename = "image/webp", filename or "sticker.webp"
         else:
             from emulators.world.documents import render
 
@@ -249,6 +267,21 @@ def _make_media(ctx: ProviderContext, media: dict[str, Any], kind: str, wa_id: s
 
 async def inbound_whatsapp(ctx: ProviderContext, payload: dict[str, Any]) -> dict[str, Any]:
     """Simulate a customer WhatsApp message (opens the 24h window, fires the webhook)."""
+    validate_json(ctx, payload)
+    for key in ("context", "location", "reaction", "media"):
+        if key in payload and payload[key] is not None:
+            object_value(ctx, payload[key], key)
+    if "text" in payload:
+        string_value(ctx, payload["text"], "text", maximum=4096, empty=True)
+    media = payload.get("media") or {}
+    if media.get("content_base64"):
+        encoded = string_value(ctx, media["content_base64"], "content_base64", maximum=24 * 1024 * 1024)
+        try:
+            base64.b64decode(encoded, validate=True)
+        except ValueError:
+            invalid_param(ctx, "content_base64 must be valid base64.")
+    if media.get("doc_id") and not any(d.id == media["doc_id"] for d in ctx.world.documents):
+        invalid_param(ctx, "Unknown world document id.")
     ref = str(
         payload.get("from") or payload.get("wa_id") or payload.get("phone") or payload.get("person") or ""
     )
@@ -264,7 +297,9 @@ async def inbound_whatsapp(ctx: ProviderContext, payload: dict[str, Any]) -> dic
         wa_id = digits_only(str(phone))
     else:
         wa_id = digits_only(ref)
-    if not wa_id:
+    from emulators.providers.meta.whatsapp import valid_wa_recipient
+
+    if not valid_wa_recipient(wa_id):
         return {"success": False, "error": f"could not resolve '{ref}' to a phone number"}
     now = ctx.clock.now()
     now_ts = int(now.timestamp())
@@ -314,7 +349,7 @@ async def inbound_whatsapp(ctx: ProviderContext, payload: dict[str, Any]) -> dic
         if msg_type == "document":
             item["filename"] = media_record["_filename"]
         if msg_type == "audio":
-            item["voice"] = bool(media_payload.get("voice", True))
+            item["voice"] = bool(media_payload.get("voice", False))
         if msg_type == "sticker":
             item["animated"] = False
         record[msg_type] = item
@@ -364,12 +399,23 @@ async def inbound_whatsapp(ctx: ProviderContext, payload: dict[str, Any]) -> dic
 
 async def deliver_statuses(ctx: ProviderContext, payload: dict[str, Any]) -> dict[str, Any]:
     """Emit one outbound status webhook (sent|delivered|read|failed) for a message."""
+    validate_json(ctx, payload)
     message_id = str(payload.get("message_id") or "")
     if not message_id:
         return {"success": False, "error": "'message_id' is required"}
-    statuses = payload.get("statuses") or [str(payload.get("status") or "delivered")]
+    error_code = integer_value(ctx, payload.get("error_code", 131026), "error_code")
+    statuses = payload.get("statuses", [str(payload.get("status") or "delivered")])
+    if (
+        not isinstance(statuses, list)
+        or not statuses
+        or any(s not in ("sent", "delivered", "read", "failed") for s in statuses if isinstance(s, str))
+        or any(not isinstance(s, str) for s in statuses)
+    ):
+        return {"success": False, "error": "statuses must be a non-empty array of valid status names"}
     record = ctx.store.collection("wa_messages").get(message_id)
     if record is not None:
+        if record.get("direction") != "outbound":
+            return {"success": False, "error": "Only outbound messages have delivery statuses"}
         delivered_any = False
         for status in statuses:
             status = str(status)
@@ -377,7 +423,7 @@ async def deliver_statuses(ctx: ProviderContext, payload: dict[str, Any]) -> dic
                 return {"success": False, "error": f"unknown status '{status}'"}
             errors = None
             if status == "failed":
-                errors = payload.get("errors") or failed_errors(int(payload.get("error_code", 131026)))
+                errors = payload.get("errors") or failed_errors(error_code)
             record["status"] = status
             delivered_any = await deliver_wa_status(ctx, record, status, errors=errors) or delivered_any
         return {
@@ -391,7 +437,10 @@ async def deliver_statuses(ctx: ProviderContext, payload: dict[str, Any]) -> dic
     if ms_record is not None:
         psid = str(ms_record.get("_psid") or "")
         watermark = int(ctx.clock.now().timestamp() * 1000)
-        await deliver_ms_delivery_and_read(ctx, psid, message_id, watermark)
+        if ms_record.get("_direction") != "outbound" or any(s not in ("delivered", "read") for s in statuses):
+            return {"success": False, "error": "Messenger supports delivered/read for outbound messages"}
+        for status in statuses:
+            await deliver_ms_delivery_and_read(ctx, psid, message_id, watermark, status=status)
         return {
             "success": True,
             "message_id": message_id,
@@ -402,6 +451,7 @@ async def deliver_statuses(ctx: ProviderContext, payload: dict[str, Any]) -> dic
 
 
 def _set_template_status(ctx: ProviderContext, payload: dict[str, Any], status: str) -> dict[str, Any]:
+    validate_json(ctx, payload)
     name = str(payload.get("name") or "")
     if not name:
         return {"success": False, "error": "'name' is required"}
@@ -486,6 +536,7 @@ def _ensure_psid_and_conversation(
 
 async def inbound_messenger(ctx: ProviderContext, payload: dict[str, Any]) -> dict[str, Any]:
     """Simulate a user messaging the Page (text and/or postback; opens the window)."""
+    validate_json(ctx, payload)
     page_id = ctx.store.meta["page_id"]
     psid: str | None = str(payload["psid"]) if payload.get("psid") else None
     person_ref = (
@@ -496,6 +547,18 @@ async def inbound_messenger(ctx: ProviderContext, payload: dict[str, Any]) -> di
         psid = psid_for(page_id, person.id)
     if not psid:
         return {"success": False, "error": "'psid' or 'person' (world person id/email) is required"}
+    text = payload.get("text") or payload.get("message") or ""
+    if not isinstance(text, str):
+        return {"success": False, "error": "text must be a string"}
+    if (
+        not text
+        and payload.get("postback") is None
+        and not payload.get("attachments")
+        and not payload.get("quick_reply_payload")
+    ):
+        return {"success": False, "error": "'text' (or 'postback') is required"}
+    if payload.get("quick_reply") is not None and not isinstance(payload["quick_reply"], dict):
+        return {"success": False, "error": "quick_reply must be an object"}
     name = _display_name(person) if person else str(payload.get("name") or "Facebook User")
     psid_record, conv = _ensure_psid_and_conversation(ctx, psid, person, name)
     now = ctx.clock.now()

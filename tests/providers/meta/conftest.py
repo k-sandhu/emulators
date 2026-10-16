@@ -83,11 +83,13 @@ class Receiver:
     def __init__(self, expected_verify_token: str = VERIFY_TOKEN) -> None:
         self.expected_verify_token = expected_verify_token
         self.deliveries: list[dict[str, Any]] = []
+        self.verifications: list[dict[str, str]] = []
         self.app = FastAPI()
 
         @self.app.get("/hook")
         async def verify(request: Request) -> PlainTextResponse:
             params = request.query_params
+            self.verifications.append(dict(params))
             if (
                 params.get("hub.mode") == "subscribe"
                 and params.get("hub.verify_token") == self.expected_verify_token

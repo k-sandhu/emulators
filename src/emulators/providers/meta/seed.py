@@ -7,7 +7,7 @@ client contacts talking to the Halcyon Page). All ids are stable hashes of world
 The world's last inbound messages all pre-date the 24-hour messaging window, so to
 leave at least one open window per channel (as a real account would have) the seed
 appends one recent inbound follow-up — from a real world contact, an hour before the
-hub clock — to the first WhatsApp and first Messenger thread.
+world anchor — to the first WhatsApp and first Messenger thread.
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ from __future__ import annotations
 from datetime import timedelta
 from typing import Any
 
+from emulators.core.ids import stable_guid
 from emulators.core.provider import ProviderContext
 from emulators.providers.meta.common import (
     APP_ID,
@@ -35,7 +36,7 @@ from emulators.providers.meta.common import (
 )
 
 PAGE_MANAGERS = {"p040": "ADMIN", "p042": "EDITOR"}  # Natalie Cho, Zoe Anderson
-TEMPLATE_NAMESPACE = "9a8b7c6d_5e4f_3a2b_1c0d_halcyon0001"
+TEMPLATE_NAMESPACE = stable_guid("meta", "template-namespace").replace("-", "_")
 
 
 def fb_user_id(person_id: str) -> str:
@@ -88,6 +89,7 @@ def _seed_business(ctx: ProviderContext, business_id: str, waba_id: str, phone_i
             "name": world.org.name,
             "created_time": graph_time(world.anchor - timedelta(days=800)),
             "_waba_id": waba_id,
+            "_roles": dict(PAGE_MANAGERS),
         }
     )
     ctx.store.collection("wabas").put(
@@ -95,7 +97,7 @@ def _seed_business(ctx: ProviderContext, business_id: str, waba_id: str, phone_i
             "id": waba_id,
             "name": world.org.name,
             "currency": world.org.currency,
-            "timezone_id": "America/Toronto",
+            "timezone_id": "35",
             "message_template_namespace": TEMPLATE_NAMESPACE,
             "account_review_status": "APPROVED",
             "status": "ACTIVE",
@@ -220,6 +222,7 @@ def _seed_page(ctx: ProviderContext, page_id: str) -> None:
             "access_token": PAGE_ACCESS_TOKEN,
             "_roles": dict(PAGE_MANAGERS),
             "_business_id": world.org.meta_business_id,
+            "_subscribed_fields": ["messages", "messaging_postbacks", "message_deliveries", "message_reads"],
             "_profile": {
                 "greeting": [
                     {
@@ -380,7 +383,7 @@ def _seed_whatsapp(ctx: ProviderContext, phone_id: str) -> None:
     world = ctx.world
     contacts = ctx.store.collection("wa_contacts")
     messages = ctx.store.collection("wa_messages")
-    now = ctx.clock.now()
+    now = world.anchor
     open_window_done = False
     for conv in world.conversations:
         if conv.channel != "whatsapp":
@@ -453,7 +456,7 @@ def _seed_messenger(ctx: ProviderContext, page_id: str) -> None:
     psids = ctx.store.collection("psids")
     conversations = ctx.store.collection("ms_conversations")
     messages = ctx.store.collection("ms_messages")
-    now = ctx.clock.now()
+    now = world.anchor
     open_window_done = False
     for conv in world.conversations:
         if conv.channel != "messenger":

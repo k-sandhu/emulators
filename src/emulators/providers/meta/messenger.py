@@ -12,6 +12,7 @@ from typing import Any
 from emulators.core.provider import ProviderContext
 from emulators.providers.meta import shapes
 from emulators.providers.meta.common import (
+    Auth,
     apply_fields,
     fail,
     graph_time,
@@ -20,7 +21,17 @@ from emulators.providers.meta.common import (
     not_found,
     numeric_id,
     paged,
+    parse_fields,
     require_auth,
+    require_scopes,
+)
+from emulators.providers.meta.ms_validation import attachment_value, message_value, profile_updates
+from emulators.providers.meta.validation import (
+    decode_parameter,
+    list_value,
+    multipart,
+    object_value,
+    string_value,
 )
 from emulators.providers.meta.webhooks_out import deliver_ms_delivery_and_read
 
@@ -45,7 +56,23 @@ class MessengerMixin:
     params: dict[str, Any]
     body: dict[str, Any]
 
-    def require_page(self, page_id: str | None = None):
+    def conversation_shape(self, record: dict[str, Any]) -> dict[str, Any]:
+        shape = shapes.ms_conversation_shape(self.ctx, record)
+        for spec in parse_fields(self.params.get("fields")) or []:
+            if spec.name != "messages":
+                continue
+            from emulators.providers.meta.common import format_fields
+
+            query = {k: v for k, v in spec.modifiers.items() if k in ("limit", "before", "after", "summary")}
+            if spec.children:
+                query["fields"] = format_fields(spec.children)
+            messages = shape["messages"]["data"]
+            shape["messages"] = paged(
+                self.ctx, self.request, self.version, f"{record['id']}/messages", messages, query
+            )
+        return shape
+
+    def require_page(self, page_id: str | None = None, *, permission: str = "pages_messaging") -> Auth:
         auth = require_auth(
             self.ctx,
             self.request,
@@ -55,6 +82,7 @@ class MessengerMixin:
             "perform this operation.",
             perm_code=200,
         )
+        require_scopes(self.ctx, auth, permission)
         if page_id is not None and auth.page_id and auth.page_id != page_id:
             invalid_param(
                 self.ctx,
@@ -71,6 +99,11 @@ class MessengerMixin:
         assert page is not None
         return page
 
+    def require_conversation_access(self, page_id: str | None) -> Auth:
+        auth = self.require_page(page_id)
+        require_scopes(self.ctx, auth, "pages_manage_metadata", "pages_read_engagement")
+        return auth
+
     def ms_window(self, psid_record: dict[str, Any]) -> tuple[bool, bool]:
         """(within 24h, within 7 days) for the PSID's last inbound message."""
         last = psid_record.get("_last_inbound_ts")
@@ -84,7 +117,7 @@ class MessengerMixin:
         self.require_page(page_id)
         page = self.get_page(page_id)
         body = self.body
-        recipient = body.get("recipient") or {}
+        recipient = object_value(self.ctx, body.get("recipient"), "recipient")
         psid = recipient.get("id")
         user_ref = recipient.get("user_ref")
         if not psid and not user_ref and recipient.get("phone_number"):
@@ -112,8 +145,15 @@ class MessengerMixin:
                 fail(self.ctx, 400, 100, "(#100) No matching user found.", subcode=2018001)
             psid = psid_record["id"]
         assert psid_record is not None and psid is not None
+        if psid_record.get("_page_id") != page_id:
+            invalid_param(self.ctx, "No matching user found for this Page.", subcode=2018001)
+        if psid is not None and isinstance(psid, (dict, list, bool)):
+            invalid_param(self.ctx, "recipient.id must be an ID.")
         sender_action = body.get("sender_action")
-        if sender_action:
+        if "sender_action" in body:
+            string_value(self.ctx, sender_action, "sender_action")
+            if "message" in body:
+                invalid_param(self.ctx, "sender_action and message are mutually exclusive.")
             if sender_action not in ("typing_on", "typing_off", "mark_seen"):
                 fail(
                     self.ctx,
@@ -129,7 +169,7 @@ class MessengerMixin:
             return {"recipient_id": str(psid)}
         message = body.get("message")
         if not isinstance(message, dict) or not (
-            message.get("text") or message.get("attachment") or message.get("quick_replies")
+            message.get("text") or message.get("attachment") or message.get("attachments")
         ):
             fail(
                 self.ctx,
@@ -139,6 +179,7 @@ class MessengerMixin:
                 subcode=2018035,
             )
         assert isinstance(message, dict)
+        message_value(self.ctx, message)
         if len(str(message.get("text") or "")) > 2000:
             fail(
                 self.ctx, 400, 100, "(#100) Message text is too long (max 2000 characters).", subcode=2018023
@@ -152,7 +193,7 @@ class MessengerMixin:
         within_24h, within_7d = self.ms_window(psid_record)
         if messaging_type == "MESSAGE_TAG":
             tag = body.get("tag")
-            if not tag or tag not in MESSAGE_TAGS:
+            if not isinstance(tag, str) or tag not in MESSAGE_TAGS:
                 fail(
                     self.ctx,
                     400,
@@ -179,8 +220,10 @@ class MessengerMixin:
             )
         attachment_record: dict[str, Any] | None = None
         attachment = message.get("attachment") if isinstance(message, dict) else None
-        attachments_shape: dict[str, Any] | None = None
-        if isinstance(attachment, dict):
+        attachment_list = message.get("attachments", [attachment] if attachment else [])
+        attachment_items: list[dict[str, Any]] = []
+        for attachment in attachment_list:
+            attachment_record = None
             payload = attachment.get("payload") or {}
             if isinstance(payload, dict) and payload.get("attachment_id"):
                 attachment_record = self.ctx.store.collection("attachments").get(
@@ -188,17 +231,22 @@ class MessengerMixin:
                 )
                 if attachment_record is None:
                     invalid_param(self.ctx, "attachment_id does not exist.", subcode=33)
-            attachments_shape = {
-                "data": [
-                    {
-                        "id": (attachment_record or {}).get("id")
-                        or numeric_id("msattach", str(payload)[:40], digits=15),
-                        "mime_type": (attachment_record or {}).get("mime_type", "application/octet-stream"),
-                        "name": (attachment_record or {}).get("name", "attachment"),
-                        "size": (attachment_record or {}).get("size", 0),
-                    }
-                ]
-            }
+                if attachment_record.get("_page_id") != page_id or attachment_record.get(
+                    "type"
+                ) != attachment.get("type"):
+                    invalid_param(
+                        self.ctx, "attachment_id does not belong to this Page or media type.", subcode=33
+                    )
+            attachment_items.append(
+                {
+                    "id": (attachment_record or {}).get("id")
+                    or numeric_id("msattach", str(payload)[:40], digits=15),
+                    "mime_type": (attachment_record or {}).get("mime_type", "application/octet-stream"),
+                    "name": (attachment_record or {}).get("name", "attachment"),
+                    "size": (attachment_record or {}).get("size", 0),
+                }
+            )
+        attachments_shape = {"data": attachment_items} if attachment_items else None
         mid = new_mid(self.ctx)
         now = self.ctx.clock.now()
         record: dict[str, Any] = {
@@ -234,7 +282,7 @@ class MessengerMixin:
 
     # -- conversations / messages edges -------------------------------------------------------------
     def handle_ms_conversations(self, page_id: str) -> dict[str, Any]:
-        self.require_page(page_id)
+        self.require_conversation_access(page_id)
         platform = self.params.get("platform")
         if platform and platform != "messenger":
             return {"data": []}
@@ -243,10 +291,7 @@ class MessengerMixin:
         user_id_filter = self.params.get("user_id")
         if user_id_filter:
             records = [r for r in records if r.get("_psid") == str(user_id_filter)]
-        items = [
-            apply_fields(shapes.ms_conversation_shape(self.ctx, r), self.params.get("fields"))
-            for r in records
-        ]
+        items = [apply_fields(self.conversation_shape(r), self.params.get("fields")) for r in records]
         return paged(self.ctx, self.request, self.version, f"{page_id}/conversations", items, self.params)
 
     def get_ms_conversation(self, conv_id: str) -> dict[str, Any]:
@@ -258,16 +303,16 @@ class MessengerMixin:
 
     def handle_ms_conversation(self, conv_id: str) -> dict[str, Any]:
         conv = self.get_ms_conversation(conv_id)
-        self.require_page(conv["_page_id"])
-        return apply_fields(shapes.ms_conversation_shape(self.ctx, conv), self.params.get("fields"))
+        self.require_conversation_access(conv["_page_id"])
+        return apply_fields(self.conversation_shape(conv), self.params.get("fields"))
 
     def handle_ms_conversation_messages(self, conv_id: str) -> dict[str, Any]:
         conv = self.get_ms_conversation(conv_id)
-        self.require_page(conv["_page_id"])
+        self.require_conversation_access(conv["_page_id"])
         coll = self.ctx.store.collection("ms_messages")
         records = [coll.get(mid) for mid in conv.get("_message_ids") or []]
         records = [r for r in records if r is not None]
-        records.sort(key=lambda r: r["_ts"])
+        records.sort(key=lambda r: r["_ts"], reverse=True)
         items = [apply_fields(shapes.ms_message_stub(r), self.params.get("fields")) for r in records]  # type: ignore[arg-type]
         return paged(self.ctx, self.request, self.version, f"{conv_id}/messages", items, self.params)
 
@@ -277,15 +322,15 @@ class MessengerMixin:
             not_found(self.ctx, message_id)
         assert record is not None
         conv = self.ctx.store.collection("ms_conversations").get(record.get("_conversation_id"))
-        self.require_page(conv["_page_id"] if conv else None)
+        self.require_conversation_access(conv["_page_id"] if conv else None)
         return apply_fields(shapes.ms_message_shape(self.ctx, record), self.params.get("fields"))
 
     def handle_psid_profile(self, psid: str) -> dict[str, Any]:
-        self.require_page()
         record = self.ctx.store.collection("psids").get(psid)
         if record is None:
             not_found(self.ctx, psid)
         assert record is not None
+        self.require_page(record.get("_page_id"))
         return apply_fields(shapes.psid_shape(self.ctx, self.request, record), self.params.get("fields"))
 
     # -- attachments / messenger profile ------------------------------------------------------------
@@ -299,7 +344,7 @@ class MessengerMixin:
         attach_type = "file"
         url: str | None = None
         if "multipart/form-data" in content_type:
-            form = await self.request.form()
+            form = await multipart(self.ctx, self.request)
             upload = form.get("filedata")
             if upload is None or not hasattr(upload, "read"):
                 invalid_param(self.ctx, "The parameter filedata is required for multipart uploads.")
@@ -309,20 +354,20 @@ class MessengerMixin:
             name = str(getattr(upload, "filename", "") or name)
             size = len(content)
             raw_message = form.get("message")
-            if raw_message:
-                import json
-
-                try:
-                    parsed = json.loads(str(raw_message))
-                    attach_type = str(((parsed.get("attachment") or {}).get("type")) or attach_type)
-                except ValueError:
-                    pass
+            parsed = object_value(self.ctx, decode_parameter(self.ctx, raw_message, "message"), "message")
+            attachment = object_value(self.ctx, parsed.get("attachment"), "attachment")
+            attach_type = string_value(self.ctx, attachment.get("type"), "attachment.type")
+            if attach_type not in ("image", "audio", "video", "file"):
+                invalid_param(self.ctx, "Invalid attachment type.")
+            if not content:
+                invalid_param(self.ctx, "filedata must not be empty.")
         else:
-            attachment = ((self.body.get("message") or {}).get("attachment")) or {}
-            payload = attachment.get("payload") or {}
+            message = object_value(self.ctx, self.body.get("message"), "message")
+            attachment = attachment_value(self.ctx, message.get("attachment"), reusable=True)
+            payload = attachment["payload"]
             attach_type = str(attachment.get("type") or attach_type)
             url = payload.get("url") if isinstance(payload, dict) else None
-            if url is None and payload.get("is_reusable") is None:
+            if url is None:
                 invalid_param(self.ctx, "attachment.payload.url is required.")
         attachment_id = numeric_id(
             "msattach", blob_key or url or "", self.ctx.ids.sequence("msattach"), digits=16
@@ -355,9 +400,7 @@ class MessengerMixin:
         self.require_page(page_id)
         page = self.get_page(page_id)
         profile = dict(page.get("_profile") or {})
-        for key in self.PROFILE_KEYS:
-            if key in self.body:
-                profile[key] = self.body[key]
+        profile.update(profile_updates(self.ctx, self.body, self.PROFILE_KEYS))
         page["_profile"] = profile
         return {"result": "success"}
 
@@ -365,7 +408,11 @@ class MessengerMixin:
         self.require_page(page_id)
         page = self.get_page(page_id)
         profile = dict(page.get("_profile") or {})
-        for key in self.body.get("fields") or []:
-            profile.pop(str(key), None)
+        fields = decode_parameter(self.ctx, self.body.get("fields"), "fields")
+        fields = list_value(self.ctx, fields, "fields", maximum=20)
+        if not fields or any(not isinstance(k, str) or k not in self.PROFILE_KEYS for k in fields):
+            invalid_param(self.ctx, "fields must contain supported Messenger profile fields.")
+        for key in fields:
+            profile.pop(key, None)
         page["_profile"] = profile
         return {"result": "success"}

@@ -47,7 +47,7 @@ async def test_graph_subscriptions_api(
         },
     )
     assert created.status_code == 200, created.text
-    assert created.json()["success"] is True
+    assert created.json() == {"success": True}
     listing = await client.get(f"{GRAPH}/{ids.app_id}/subscriptions", headers=headers)
     entry = listing.json()["data"][0]
     assert entry["object"] == "page"
