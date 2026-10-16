@@ -22,6 +22,20 @@ Sixteen emulators, all seeded from **one shared synthetic organisation** — *Ha
 and meeting line up across every system. All data is fictional (`*.example` emails, fictional
 phone ranges).
 
+## Verified compatibility
+
+* **4,247 tests** (unit, provider wire tests, official-SDK contract tests, consumer-flow replays,
+  cross-system consistency, fuzzing) — run on Python 3.12 and 3.13 in CI.
+* **Official SDKs drive the emulators unchanged:** `msal`, `google-api-python-client` (incl.
+  batch requests), `google-auth`, `stripe` (incl. `Webhook.construct_event`), `twilio` (incl.
+  `RequestValidator`), `dropbox`, `box-sdk-gen`, `simple-salesforce` (REST and SOAP login),
+  `slack_sdk` (sync, async, `SignatureVerifier`), `python-quickbooks`, `intuit-oauth`.
+* **Our products' real call sequences pass:** parlance's Teams/Zoom/Meet recording and transcript
+  imports and storage connectors, lumen-copilot's Google Drive incremental sync,
+  saas_backbone's Twilio SMS and Stripe webhook verification (`tests/e2e/`).
+* Every provider went through an independent adversarial audit (wire fidelity, permission leaks,
+  malformed-input fuzzing) after implementation.
+
 ## Quick start
 
 ```bash
