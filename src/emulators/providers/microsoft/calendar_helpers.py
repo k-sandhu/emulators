@@ -15,6 +15,7 @@ from emulators.core.ids import stable_hash
 from emulators.core.provider import ProviderContext
 from emulators.providers.microsoft import common as c
 from emulators.providers.microsoft import directory_support as s
+from emulators.providers.microsoft import outlook_payloads as payloads
 from emulators.world.model import Meeting
 
 ZONES = {
@@ -30,6 +31,8 @@ DAYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sun
 
 
 def zone(name: str) -> ZoneInfo:
+    if not isinstance(name, str):
+        raise c.invalid_json()
     try:
         return ZoneInfo(ZONES.get(name, name))
     except (ZoneInfoNotFoundError, ValueError):
@@ -58,10 +61,13 @@ def shape(request: Request, record: dict[str, Any]) -> dict[str, Any]:
     result = s.clean(record)
     timezone = preferred(request)
     for key in ("start", "end"):
+        if key not in record:
+            continue
         value = record[key]
         result[key] = datetime_zone(isoformat_z(parse(value["dateTime"], value["timeZone"])), timezone)
-    if 'outlook.body-content-type="text"' in request.headers.get("prefer", "").lower():
+    if "body" in result and 'outlook.body-content-type="text"' in request.headers.get("prefer", "").lower():
         result["body"] = {"contentType": "text", "content": s.text_body(result["body"]["content"])}
+        c.preference_applied(request, 'outlook.body-content-type="text"')
     return result
 
 
@@ -70,7 +76,10 @@ def calendar_id(ctx: ProviderContext, uid: str) -> str:
 
 
 def calendar(ctx: ProviderContext, owner: dict[str, Any]) -> dict[str, Any]:
-    return {
+    existing = ctx.store["calendars"].get(calendar_id(ctx, owner["id"]))
+    if existing is not None:
+        return existing
+    record = {
         "id": calendar_id(ctx, owner["id"]),
         "name": "Calendar",
         "color": "auto",
@@ -85,7 +94,18 @@ def calendar(ctx: ProviderContext, owner: dict[str, Any]) -> dict[str, Any]:
         "allowedOnlineMeetingProviders": ["teamsForBusiness"],
         "defaultOnlineMeetingProvider": "teamsForBusiness",
         "owner": {"name": owner["displayName"], "address": owner["mail"]},
+        "_owner": owner["id"],
     }
+    ctx.store["calendars"].put(record)
+    return record
+
+
+def get_calendar(ctx: ProviderContext, owner: dict[str, Any], cid: str | None) -> dict[str, Any]:
+    default = calendar(ctx, owner)
+    record = ctx.store["calendars"].get(cid) if cid else default
+    if record is None or record["_owner"] != owner["id"]:
+        raise c.graph_error(404, "ErrorItemNotFound", "The specified calendar was not found.")
+    return record
 
 
 def get_event(ctx: ProviderContext, uid: str, eid: str) -> dict[str, Any]:
@@ -103,13 +123,39 @@ def event(
     end = payload.get(
         "end", {"dateTime": isoformat_z(ctx.clock.now() + timedelta(hours=1)), "timeZone": "UTC"}
     )
+    start, end = payloads.datetime_zone(start), payloads.datetime_zone(end)
     start_dt, end_dt = (
         parse(start["dateTime"], start.get("timeZone", "UTC")),
         parse(end["dateTime"], end.get("timeZone", "UTC")),
     )
     if end_dt <= start_dt:
         raise c.graph_error(400, "ErrorInvalidParameter", "End time must be after start time.")
-    body = payload.get("body", {"contentType": "html", "content": ""})
+    body = payloads.item_body(payload.get("body", {"contentType": "html", "content": ""}))
+    payload = {
+        **payload,
+        **payloads.message({k: v for k, v in payload.items() if k in ("importance", "subject")}),
+    }
+    if "location" in payload:
+        payload = {**payload, "location": {"displayName": "", **c.json_object(payload["location"])}}
+    if "locations" in payload and (
+        not isinstance(payload["locations"], list)
+        or any(not isinstance(item, dict) for item in payload["locations"])
+    ):
+        raise c.invalid_json()
+    if "attendees" in payload:
+        payloads.recipients(payload["attendees"])
+    for key in ("isAllDay", "isOnlineMeeting", "responseRequested", "allowNewTimeProposals", "isReminderOn"):
+        if key in payload and not isinstance(payload[key], bool):
+            raise c.invalid_json()
+    if "showAs" in payload and payload["showAs"] not in (
+        "free",
+        "tentative",
+        "busy",
+        "oof",
+        "workingElsewhere",
+        "unknown",
+    ):
+        raise c.graph_error(400, "BadRequest", "Invalid showAs value.")
     ck = stable_hash(eid, stamp)
     result = {
         "id": eid,
@@ -158,6 +204,8 @@ def event(
         "organizer": organizer,
         "@odata.etag": f'W/"{ck}"',
         "_owner": uid,
+        "_calendar": calendar_id(ctx, uid),
+        "_attachments": [],
     }
     for key in (
         "subject",
@@ -183,7 +231,7 @@ def event(
     if result["location"]["displayName"] and not result["locations"]:
         result["locations"] = [copy.deepcopy(result["location"])]
     if payload.get("isOnlineMeeting"):
-        join = payload.get("onlineMeeting", {}).get("joinUrl") or (
+        join = c.json_object(payload.get("onlineMeeting") or {}).get("joinUrl") or (
             f"https://teams.microsoft.com/l/meetup-join/19%3ameeting_{ctx.ids.urlsafe(32)}%40thread.v2/0"
         )
         result.update(
@@ -334,6 +382,9 @@ def seed(ctx: ProviderContext) -> None:
 
 async def changed(ctx: ProviderContext, record: dict[str, Any], kind: str) -> None:
     await c.publish_change(ctx, f"users/{record['_owner']}/events/{record['id']}", kind, record)
+    await c.publish_change(
+        ctx, f"users/{record['_owner']}/calendars/{record['_calendar']}/events/{record['id']}", kind, record
+    )
 
 
 def bounds(request: Request) -> tuple[datetime, datetime]:

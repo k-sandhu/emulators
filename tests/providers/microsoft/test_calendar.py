@@ -147,7 +147,10 @@ async def test_event_crud_invites_responses_delta_schedule_and_suggestions(
                 "timeConstraint": {"timeSlots": [{"start": payload["start"], "end": payload["end"]}]},
             },
         )
-        assert suggestions.json()["meetingTimeSuggestions"][0]["meetingTimeSlot"]["start"] == payload["start"]
+        assert suggestions.json()["meetingTimeSuggestions"][0]["meetingTimeSlot"]["start"] == {
+            "dateTime": "2026-10-20T09:00:00.0000000",
+            "timeZone": "Eastern Standard Time",
+        }
         view_delta = await client.get("/v1.0/me/calendarView/delta", params={**RANGE, "$top": 1000})
         assert "@odata.deltaLink" in view_delta.json()
 

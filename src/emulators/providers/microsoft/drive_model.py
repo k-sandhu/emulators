@@ -35,13 +35,7 @@ METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE"]
 
 
 async def json_body(request: Request) -> dict[str, Any]:
-    try:
-        value = await request.json()
-    except (ValueError, UnicodeDecodeError):
-        raise common.graph_error(400, "invalidRequest", "The request body must contain valid JSON.") from None
-    if not isinstance(value, dict):
-        raise common.graph_error(400, "invalidRequest", "The request body must be a JSON object.")
-    return value
+    return await common.json_body(request, code="invalidRequest")
 
 
 def public(record: dict[str, Any]) -> dict[str, Any]:

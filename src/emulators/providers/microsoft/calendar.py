@@ -15,6 +15,8 @@ from emulators.providers.microsoft import calendar_helpers as h
 from emulators.providers.microsoft import calendar_recurrence as recurrence
 from emulators.providers.microsoft import common as c
 from emulators.providers.microsoft import directory_support as s
+from emulators.providers.microsoft import outlook_attachments as attachments_api
+from emulators.providers.microsoft import outlook_payloads as payloads
 from emulators.providers.microsoft.calendar_helpers import seed  # noqa: F401
 
 
@@ -25,9 +27,22 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         request: Request, identifier: str = "me", cid: str | None = None, gid: str | None = None
     ) -> Any:
         owner = s.mailbox(request, ctx, identifier)
-        record = h.calendar(ctx, owner)
-        if cid and cid != record["id"]:
-            raise c.not_found(cid)
+        record = h.get_calendar(ctx, owner, cid)
+        if request.method == "POST":
+            body = await c.json_body(request)
+            if not isinstance(body.get("name"), str) or not body["name"].strip():
+                raise c.graph_error(400, "ErrorInvalidParameter", "name is required.")
+            record = {
+                **h.calendar(ctx, owner),
+                "id": s.outlook_id(ctx),
+                "name": body["name"],
+                "color": body.get("color", "auto"),
+                "isDefaultCalendar": False,
+                "isRemovable": True,
+                "changeKey": ctx.ids.urlsafe(24),
+            }
+            ctx.store["calendars"].put(record)
+            return JSONResponse(s.single(request, record, "calendars/$entity"), status_code=201)
         path = s.local_path(request)
         if path.endswith("calendarGroups"):
             return s.collection(
@@ -43,14 +58,13 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
                 "calendarGroups",
             )
         if path.endswith("calendars"):
-            return s.collection(request, [record], "calendars")
+            return s.collection(request, ctx.store["calendars"].where(_owner=owner["id"]), "calendars")
         return s.single(request, record, "calendars/$entity")
 
     async def events(request: Request, identifier: str = "me", cid: str | None = None) -> Any:
         owner = s.mailbox(request, ctx, identifier)
-        if cid and cid != h.calendar_id(ctx, owner["id"]):
-            raise c.not_found(cid)
-        rows = ctx.store["calendar_events"].where(_owner=owner["id"])
+        calendar = h.get_calendar(ctx, owner, cid)
+        rows = ctx.store["calendar_events"].where(_owner=owner["id"], _calendar=calendar["id"])
         view = "calendarView" in s.local_path(request)
         if view:
             low, high = h.bounds(request)
@@ -64,8 +78,11 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
                     rows.append(instance)
         else:
             rows = [r for r in rows if r["type"] in {"seriesMaster", "singleInstance"}]
+        if request.url.path.endswith("/$count"):
+            return c.count_response(request, rows)
         if request.url.path.endswith("/delta"):
-            result = s.delta(request, ctx, rows, f"users/{owner['id']}/events", "events")
+            resource = f"users/{owner['id']}/calendars/{cid}/events" if cid else f"users/{owner['id']}/events"
+            result = s.delta(request, ctx, rows, resource, "events")
             result["value"] = [h.shape(request, r) if "start" in r else r for r in result["value"]]
             return result
         return s.collection(
@@ -80,7 +97,7 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
     async def get_event(request: Request, eid: str, identifier: str = "me", cid: str | None = None) -> Any:
         owner = s.mailbox(request, ctx, identifier)
         record = h.get_event(ctx, owner["id"], eid)
-        if cid and cid != h.calendar_id(ctx, owner["id"]):
+        if cid and record["_calendar"] != h.get_calendar(ctx, owner, cid)["id"]:
             raise c.not_found(cid)
         if request.url.path.endswith("/instances"):
             low, high = h.bounds(request)
@@ -93,13 +110,17 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
                 if h.in_range(r, low, high)
             ]
             return s.collection(request, [h.shape(request, r) for r in rows], "events")
-        return s.single(request, h.shape(request, record), "events/$entity")
+        result = s.single(request, h.shape(request, record), "events/$entity")
+        if "attachments" in request.query_params.get("$expand", ""):
+            result["attachments"] = [
+                attachments_api.wire(ctx, item) for item in record.get("_attachments", [])
+            ]
+        return result
 
     async def create(request: Request, identifier: str = "me", cid: str | None = None) -> Any:
         owner = s.mailbox(request, ctx, identifier)
-        if cid and cid != h.calendar_id(ctx, owner["id"]):
-            raise c.not_found(cid)
-        payload = await request.json()
+        calendar = h.get_calendar(ctx, owner, cid)
+        payload = await c.json_body(request)
         if not all(k in payload for k in ("start", "end")):
             raise c.graph_error(400, "ErrorInvalidParameter", "Start and end are required.")
         if payload.get("transactionId"):
@@ -112,6 +133,7 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
                 )
         organizer = {"emailAddress": {"name": owner["displayName"], "address": owner["mail"]}}
         record = h.event(ctx, owner["id"], s.outlook_id(ctx), payload, organizer)
+        record["_calendar"] = calendar["id"]
         ctx.store["calendar_events"].put(record)
         await h.changed(ctx, record, "created")
         await invite(record)
@@ -134,6 +156,7 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
                     {
                         "id": s.outlook_id(ctx),
                         "_owner": target["id"],
+                        "_calendar": h.calendar_id(ctx, target["id"]),
                         "isOrganizer": False,
                         "responseStatus": {"response": "notResponded", "time": "0001-01-01T00:00:00Z"},
                         "_organizer_event": record["id"],
@@ -145,7 +168,9 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
     async def patch(request: Request, eid: str, identifier: str = "me", cid: str | None = None) -> Any:
         owner = s.mailbox(request, ctx, identifier)
         record = h.get_event(ctx, owner["id"], eid)
-        payload = await request.json()
+        if cid and record["_calendar"] != h.get_calendar(ctx, owner, cid)["id"]:
+            raise c.not_found(eid)
+        payload = await c.json_body(request)
         merged = {**record, **payload}
         # Validate and normalize dates while preserving the original event identity.
         validated = h.event(ctx, owner["id"], eid, merged, record["organizer"])
@@ -153,12 +178,18 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
             for instance in ctx.store["calendar_events"].where(_owner=owner["id"], seriesMasterId=eid):
                 ctx.store["calendar_events"].delete(instance["id"])
         for key in payload:
-            if key in validated and key not in {"id", "organizer", "isOrganizer", "createdDateTime"}:
+            if (
+                key in validated
+                and key not in {"id", "organizer", "isOrganizer", "createdDateTime"}
+                and not key.startswith(("_", "@"))
+            ):
                 record[key] = validated[key]
         if "isOnlineMeeting" in payload:
             for key in ("onlineMeeting", "onlineMeetingProvider", "body"):
                 record[key] = validated[key]
         record.update({"lastModifiedDateTime": s.now(ctx), "changeKey": ctx.ids.urlsafe(24)})
+        if "body" in payload:
+            record["bodyPreview"] = validated["bodyPreview"]
         record["@odata.etag"] = f'W/"{record["changeKey"]}"'
         if record.get("_runtime_series"):
             record["type"] = "seriesMaster" if record["recurrence"] else "singleInstance"
@@ -192,6 +223,8 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
     async def delete(request: Request, eid: str, identifier: str = "me", cid: str | None = None) -> Response:
         owner = s.mailbox(request, ctx, identifier)
         record = h.get_event(ctx, owner["id"], eid)
+        if cid and record["_calendar"] != h.get_calendar(ctx, owner, cid)["id"]:
+            raise c.not_found(eid)
         rows = [record, *ctx.store["calendar_events"].where(_owner=owner["id"], seriesMasterId=eid)]
         for row in rows:
             ctx.store["calendar_events"].delete(row["id"])
@@ -201,15 +234,25 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
     async def action(request: Request, eid: str, identifier: str = "me", cid: str | None = None) -> Response:
         owner = s.mailbox(request, ctx, identifier)
         record = h.get_event(ctx, owner["id"], eid)
+        if cid and record["_calendar"] != h.get_calendar(ctx, owner, cid)["id"]:
+            raise c.not_found(eid)
         name = request.url.path.rsplit("/", 1)[-1]
-        payload = await request.json() if await request.body() else {}
+        payload = await c.json_body(request, optional=True)
+        if name == "snoozeReminder":
+            value = payloads.datetime_zone(payload.get("newReminderTime"))
+            instant = h.parse(value["dateTime"], value["timeZone"])
+            record["_reminder_time"] = isoformat_z(instant)
+            await h.changed(ctx, record, "updated")
+            return Response(status_code=204)
         if name == "cancel":
             if not record["isOrganizer"]:
                 raise c.graph_error(400, "ErrorInvalidOperation", "Only the organizer can cancel a meeting.")
             record["isCancelled"] = True
         elif name == "forward":
             forwarded = copy.deepcopy(record)
-            forwarded["attendees"] = [{**r, "type": "required"} for r in payload.get("toRecipients", [])]
+            forwarded["attendees"] = [
+                {**r, "type": "required"} for r in payloads.recipients(payload.get("toRecipients", []))
+            ]
             await invite(forwarded)
         else:
             if record["isOrganizer"]:
@@ -234,8 +277,11 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
     async def schedule(request: Request, identifier: str = "me") -> dict[str, Any]:
         s.mailbox(request, ctx, identifier)
         caller = c.principal(request, ctx)
-        body = await request.json()
-        start, end = body.get("startTime", {}), body.get("endTime", {})
+        body = await c.json_body(request)
+        start, end = (
+            payloads.datetime_zone(body.get("startTime")),
+            payloads.datetime_zone(body.get("endTime")),
+        )
         low = h.parse(start.get("dateTime"), start.get("timeZone", "UTC"))
         high = h.parse(end.get("dateTime"), end.get("timeZone", "UTC"))
         interval = body.get("availabilityViewInterval", 30)
@@ -248,8 +294,15 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
             raise c.graph_error(
                 400, "ErrorInvalidParameter", "Invalid schedule range or availabilityViewInterval."
             )
+        addresses = body.get("schedules")
+        if (
+            not isinstance(addresses, list)
+            or not 1 <= len(addresses) <= 20
+            or not all(isinstance(address, str) for address in addresses)
+        ):
+            raise c.invalid_json()
         values = []
-        for address in body.get("schedules", []):
+        for address in addresses:
             owner = next(
                 (u for u in ctx.store["users"] if str(u.get("mail", "")).lower() == address.lower()), None
             )
@@ -257,7 +310,10 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
                 values.append(
                     {
                         "scheduleId": address,
-                        "error": {"responseCode": "5000", "message": "The recipient was not found."},
+                        "error": {
+                            "responseCode": "ErrorMailRecipientNotFound",
+                            "message": "The recipient was not found.",
+                        },
                     }
                 )
                 continue
@@ -268,10 +324,19 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
             ]
             cursor, slots = low, []
             while cursor < high:
+                # Graph folds workingElsewhere into free for Outlook compatibility.
+                codes = {"free": 0, "tentative": 1, "busy": 2, "oof": 3, "workingElsewhere": 0, "unknown": 0}
                 slots.append(
-                    "2"
-                    if any(h.in_range(r, cursor, cursor + timedelta(minutes=interval)) for r in rows)
-                    else "0"
+                    str(
+                        max(
+                            (
+                                codes.get(r["showAs"], 0)
+                                for r in rows
+                                if h.in_range(r, cursor, cursor + timedelta(minutes=interval))
+                            ),
+                            default=0,
+                        )
+                    )
                 )
                 cursor += timedelta(minutes=interval)
             values.append(
@@ -305,8 +370,14 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
 
     async def meeting_times(request: Request, identifier: str = "me") -> dict[str, Any]:
         s.mailbox(request, ctx, identifier)
-        payload = await request.json()
-        slots = payload.get("timeConstraint", {}).get("timeSlots", [])
+        payload = await c.json_body(request)
+        slots = c.json_object(payload.get("timeConstraint", {})).get("timeSlots", [])
+        if not isinstance(slots, list):
+            raise c.invalid_json()
+        for slot in slots:
+            for key in ("start", "end"):
+                value = payloads.datetime_zone(c.json_object(slot).get(key))
+                h.parse(value["dateTime"], value["timeZone"])
         start = (
             slots[0]["start"]
             if slots
@@ -315,11 +386,16 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         duration = payload.get("meetingDuration", "PT30M")
         import re
 
-        match = re.fullmatch(r"PT(?:(\d+)H)?(?:(\d+)M)?", duration)
+        match = re.fullmatch(r"PT(?:(\d+)H)?(?:(\d+)M)?", duration) if isinstance(duration, str) else None
         if not match:
             raise c.graph_error(400, "ErrorInvalidParameter", "Invalid meetingDuration.")
         minutes = int(match[1] or 0) * 60 + int(match[2] or 0)
+        if minutes <= 0:
+            raise c.graph_error(400, "ErrorInvalidParameter", "Invalid meetingDuration.")
         finish = h.parse(start["dateTime"], start["timeZone"]) + timedelta(minutes=minutes)
+        normalized_start = h.datetime_zone(
+            isoformat_z(h.parse(start["dateTime"], start["timeZone"])), start["timeZone"]
+        )
         return {
             "@odata.context": c.context_url(request, "microsoft.graph.meetingTimeSuggestionsResult"),
             "emptySuggestionsReason": "",
@@ -332,13 +408,39 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
                     ],
                     "locations": [],
                     "meetingTimeSlot": {
-                        "start": start,
+                        "start": normalized_start,
                         "end": h.datetime_zone(isoformat_z(finish), start["timeZone"]),
                     },
                     "suggestionReason": "Suggested time within the requested interval.",
                 }
             ],
         }
+
+    async def attachments(
+        request: Request, eid: str, identifier: str = "me", cid: str | None = None, aid: str | None = None
+    ) -> Any:
+        owner = s.mailbox(request, ctx, identifier)
+        record = h.get_event(ctx, owner["id"], eid)
+        if cid and record["_calendar"] != h.get_calendar(ctx, owner, cid)["id"]:
+            raise c.not_found(eid)
+        items = record.setdefault("_attachments", [])
+        if request.method == "POST":
+            item = attachments_api.create(ctx, await c.json_body(request))
+            items.append(item)
+            record["hasAttachments"] = any(not item["isInline"] for item in items)
+            attachments_api.touch(ctx, record)
+            await h.changed(ctx, record, "updated")
+            return attachments_api.created(request, ctx, item)
+        if request.method == "DELETE":
+            item = next((item for item in items if item["id"] == aid), None)
+            if item is None:
+                raise c.not_found(str(aid))
+            items.remove(item)
+            record["hasAttachments"] = any(not item["isInline"] for item in items)
+            attachments_api.touch(ctx, record)
+            await h.changed(ctx, record, "updated")
+            return Response(status_code=204)
+        return attachments_api.read(request, ctx, [attachments_api.wire(ctx, item) for item in items], aid)
 
     for base in ("/me", "/users/{identifier}"):
         for suffix in (
@@ -349,6 +451,7 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
             "calendarGroups/{gid}/calendars",
         ):
             router.add_api_route(f"{base}/{suffix}", calendars, methods=["GET"])
+        router.add_api_route(f"{base}/calendars", calendars, methods=["POST"])
         for suffix in (
             "events",
             "calendar/events",
@@ -362,12 +465,20 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
             router.add_api_route(f"{base}/{suffix}", events, methods=["GET"])
         for prefix in ("events", "calendar/events", "calendars/{cid}/events"):
             router.add_api_route(f"{base}/{prefix}", create, methods=["POST"])
+            router.add_api_route(f"{base}/{prefix}/$count", events, methods=["GET"])
             for suffix in ("{eid}", "{eid}/instances"):
                 router.add_api_route(f"{base}/{prefix}/{suffix}", get_event, methods=["GET"])
             router.add_api_route(f"{base}/{prefix}/{{eid}}", patch, methods=["PATCH"])
             router.add_api_route(f"{base}/{prefix}/{{eid}}", delete, methods=["DELETE"])
-            for suffix in ("accept", "decline", "tentativelyAccept", "cancel", "forward"):
+            for suffix in ("accept", "decline", "tentativelyAccept", "cancel", "forward", "snoozeReminder"):
                 router.add_api_route(f"{base}/{prefix}/{{eid}}/{suffix}", action, methods=["POST"])
+            router.add_api_route(f"{base}/{prefix}/{{eid}}/attachments", attachments, methods=["GET", "POST"])
+            router.add_api_route(
+                f"{base}/{prefix}/{{eid}}/attachments/{{aid}}", attachments, methods=["GET", "DELETE"]
+            )
+            router.add_api_route(
+                f"{base}/{prefix}/{{eid}}/attachments/{{aid}}/$value", attachments, methods=["GET"]
+            )
         router.add_api_route(f"{base}/calendar/getSchedule", schedule, methods=["POST"])
         router.add_api_route(f"{base}/findMeetingTimes", meeting_times, methods=["POST"])
     for version in c.GRAPH_VERSIONS:

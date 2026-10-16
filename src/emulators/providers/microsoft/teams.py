@@ -10,9 +10,11 @@ from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 
 from emulators.core.clock import isoformat_z
+from emulators.core.odata import select_record
 from emulators.core.provider import ProviderContext, external_base
 from emulators.providers.microsoft import common
 from emulators.providers.microsoft import drive_model as dm
+from emulators.providers.microsoft import outlook_payloads as payloads
 from emulators.providers.microsoft import teams_model as tm
 
 seed = tm.seed
@@ -64,8 +66,9 @@ def delta_messages(request: Request, ctx: ProviderContext, scope: str, p: common
             if token == "latest"
             else [copy.deepcopy(r) for r in ctx.store[tm.MESSAGES].where(_scope=scope)]
         )
-    size = min(common.query_options(request).top or 20, 50)
-    more = len(records) > size
+    options = common.query_options(request)
+    size = common.page_size(request, options.top, 20, 50)
+    more = bool(size and len(records) > size)
     cursor_id = dm.delta_token(
         ctx, "channel/" + scope, p, records if more else [], sequence, size if more else 0
     )
@@ -73,11 +76,11 @@ def delta_messages(request: Request, ctx: ProviderContext, scope: str, p: common
     params["$deltatoken"] = cursor_id
     return {
         "@odata.context": common.context_url(request, "Collection(microsoft.graph.chatMessage)"),
-        "value": [dm.public(r) for r in records[:size]],
+        "value": [select_record(dm.public(r), options.select) for r in records[:size]],
         "@odata.nextLink" if more else "@odata.deltaLink": external_base(request)
         + dm.path_of(request)
         + "?"
-        + urlencode(params),
+        + urlencode(params, safe="$"),
     }
 
 
@@ -111,13 +114,7 @@ async def messages_dispatch(
                     "Sending messages requires delegated authentication outside migration mode."
                 )
             payload = await dm.json_body(request)
-            body = payload.get("body")
-            if (
-                not isinstance(body, dict)
-                or not isinstance(body.get("content"), str)
-                or body.get("contentType", "text") not in ("html", "text")
-            ):
-                raise common.graph_error(400, "BadRequest", "A valid message body is required.")
+            body = payloads.item_body(payload.get("body"))
             if not body["content"].strip() and not payload.get("attachments"):
                 raise common.graph_error(400, "BadRequest", "Message content cannot be empty.")
             timestamp = isoformat_z(ctx.clock.now(), timespec="milliseconds")
@@ -141,6 +138,7 @@ async def messages_dispatch(
                 chat["lastUpdatedDateTime"] = timestamp
             await tm.changed(ctx, record, "created")
             return JSONResponse(dm.public(record), status_code=201)
+        raise common.graph_error(405, "methodNotAllowed", "The HTTP method is not allowed on this resource.")
     message = ctx.store[tm.MESSAGES].get(tm.message_key(scope, parts[0]))
     if message is None or message["replyToId"] != reply_to:
         raise common.item_not_found()
@@ -157,9 +155,7 @@ async def messages_dispatch(
         if message["deletedDateTime"]:
             raise common.graph_error(400, "BadRequest", "A deleted message cannot be edited.")
         payload = await dm.json_body(request)
-        body = payload.get("body")
-        if not isinstance(body, dict) or not isinstance(body.get("content"), str):
-            raise common.graph_error(400, "BadRequest", "A message body is required.")
+        body = payloads.item_body(payload.get("body"))
         timestamp = isoformat_z(ctx.clock.now(), timespec="milliseconds")
         message["messageHistory"].append(
             {"modifiedDateTime": timestamp, "actions": "contentEdited", "reaction": None}

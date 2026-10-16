@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import copy
-import uuid
+import re
 from typing import Any
 
 from fastapi import APIRouter, FastAPI, Request
@@ -14,6 +14,7 @@ from emulators.core.provider import ProviderContext
 from emulators.providers.microsoft import batch
 from emulators.providers.microsoft import common as c
 from emulators.providers.microsoft import directory_support as s
+from emulators.providers.microsoft.query_validation import PROPERTIES
 from emulators.world import documents
 
 DEFAULT_USER = (
@@ -28,6 +29,28 @@ DEFAULT_USER = (
     "preferredLanguage",
     "surname",
     "userPrincipalName",
+)
+DEFAULT_GROUP = tuple(
+    sorted(
+        PROPERTIES["groups"]
+        - {
+            "allowExternalSenders",
+            "assignedLabels",
+            "assignedLicenses",
+            "autoSubscribeNewMembers",
+            "hasMembersWithLicenseErrors",
+            "hideFromAddressLists",
+            "hideFromOutlookClients",
+            "isArchived",
+            "isSubscribedByMail",
+            "unseenCount",
+            "isManagementRestricted",
+            "members",
+            "owners",
+            "memberOf",
+            "transitiveMembers",
+        }
+    )
 )
 E3 = "05e9a617-0261-4cee-bb44-138d3ef5d965"
 E5 = "06ebc4ee-1bb5-47dd-8120-11324bc54e06"
@@ -129,10 +152,24 @@ def seed(ctx: ProviderContext) -> None:
 
 
 class GraphHeaders:
-    def __init__(self, app: Any) -> None:
+    def __init__(self, app: Any, ctx: ProviderContext) -> None:
         self.app = app
+        self.ctx = ctx
 
     async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        # Normalize OData's equivalent key addressing before Starlette matches routes.
+        scope["path"] = re.sub(
+            r"\b(users|groups|mailFolders|contactFolders|calendars)\('((?:''|[^'])*)'\)",
+            lambda m: m[1] + "/" + m[2].replace("''", "'"),
+            scope["path"],
+        )
+        rid, client_id = c.request_ids(scope)
+        scope["state"]["graph_now"] = isoformat_z(self.ctx.clock.now())
+        token = c.REQUEST_SCOPE.set(scope)
+
         async def with_headers(message: dict[str, Any]) -> None:
             if message["type"] == "http.response.start":
                 headers = [
@@ -140,14 +177,20 @@ class GraphHeaders:
                     for k, v in message.get("headers", [])
                     if k.lower() not in (b"request-id", b"client-request-id")
                 ]
-                rid = str(uuid.uuid4()).encode()
-                client_id = next(
-                    (v for k, v in scope.get("headers", []) if k.lower() == b"client-request-id"), rid
-                )
-                message["headers"] = [*headers, (b"request-id", rid), (b"client-request-id", client_id)]
+                message["headers"] = [
+                    *headers,
+                    (b"request-id", rid.encode()),
+                    (b"client-request-id", client_id.encode()),
+                ]
+                preferences = scope.get("state", {}).get("graph_preferences", [])
+                if preferences:
+                    message["headers"].append((b"preference-applied", ", ".join(preferences).encode()))
             await send(message)
 
-        await self.app(scope, receive, with_headers)
+        try:
+            await self.app(scope, receive, with_headers)
+        finally:
+            c.REQUEST_SCOPE.reset(token)
 
 
 def expanded(ctx: ProviderContext, request: Request, record: dict[str, Any]) -> dict[str, Any]:
@@ -170,7 +213,8 @@ def expanded(ctx: ProviderContext, request: Request, record: dict[str, Any]) -> 
             if not manager:
                 break
             current["manager"] = {
-                k: v for k, v in manager.items() if k in (select or DEFAULT_USER) or k == "id"
+                "@odata.type": "#microsoft.graph.user",
+                **{k: v for k, v in manager.items() if k in (select or DEFAULT_USER) or k == "id"},
             }
             current = current["manager"]
             uid = mid
@@ -194,6 +238,38 @@ def object_record(ctx: ProviderContext, identifier: str) -> dict[str, Any]:
         if record:
             return {"@odata.type": f"#microsoft.graph.{kind}", **record}
     raise c.not_found(identifier)
+
+
+def project_object(request: Request, record: dict[str, Any]) -> dict[str, Any]:
+    if request.query_params.get("$select"):
+        return record
+    defaults = DEFAULT_USER if record.get("@odata.type") == "#microsoft.graph.user" else DEFAULT_GROUP
+    return {k: v for k, v in record.items() if k in defaults or k.startswith("@")}
+
+
+def object_collection(request: Request, rows: list[dict[str, Any]]) -> Any:
+    segments = s.local_path(request).split("/")
+    cast = next((part for part in segments if part.startswith("microsoft.graph.")), None)
+    advanced(request)
+    needs_index = cast or any(key in request.query_params for key in ("$filter", "$orderby", "$search"))
+    if (
+        needs_index
+        and segments[-1] != "$count"
+        and (
+            request.headers.get("ConsistencyLevel", "").lower() != "eventual"
+            or request.query_params.get("$count") != "true"
+        )
+    ):
+        raise c.graph_error(
+            400, "Request_UnsupportedQuery", "This query requires ConsistencyLevel: eventual and $count=true."
+        )
+    if cast:
+        rows = [r for r in rows if r["@odata.type"] == "#" + cast]
+    if segments[-1] == "$count":
+        return c.count_response(request, rows, directory=True)
+    result = s.collection(request, rows, "directoryObjects")
+    result["value"] = [project_object(request, row) for row in result["value"]]
+    return result
 
 
 def group_members(ctx: ProviderContext, gid: str, transitive: bool = False) -> list[dict[str, Any]]:
@@ -225,7 +301,7 @@ def memberships(ctx: ProviderContext, uid: str) -> list[dict[str, Any]]:
 def register(app: FastAPI, ctx: ProviderContext) -> None:
     # Include shared fault responses in Graph's correlation headers.
     build_stack = app.build_middleware_stack
-    app.build_middleware_stack = lambda: GraphHeaders(build_stack())
+    app.build_middleware_stack = lambda: GraphHeaders(build_stack(), ctx)
     router = APIRouter()
 
     @router.post("/$batch")
@@ -333,12 +409,35 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
     @router.get("/users/delta")
     async def users_delta(request: Request) -> dict[str, Any]:
         c.principal(request, ctx)
-        return s.delta(request, ctx, ctx.store["users"].values(), "users", "users")
+        return s.delta(request, ctx, ctx.store["users"].values(), "users", "users", defaults=DEFAULT_USER)
 
     @router.get("/groups/delta")
     async def groups_delta(request: Request) -> dict[str, Any]:
         c.principal(request, ctx)
-        return s.delta(request, ctx, ctx.store["groups"].values(), "groups", "groups")
+        return s.delta(request, ctx, ctx.store["groups"].values(), "groups", "groups", defaults=DEFAULT_GROUP)
+
+    @router.get("/users/$count")
+    @router.get("/groups/$count")
+    async def directory_count(request: Request) -> Response:
+        caller = c.principal(request, ctx)
+        if caller.delegated and s.user(ctx, c.me_user_id(caller)).get("userType") == "Guest":
+            raise c.access_denied()
+        kind = s.local_path(request).split("/")[-2]
+        return c.count_response(request, ctx.store[kind].values(), directory=True)
+
+    async def directory_single(request: Request, identifier: str) -> dict[str, Any]:
+        kind = s.local_path(request).split("/")[-2]
+        handler = {"organization": organization, "domains": domains, "subscribedSkus": skus}[kind]
+        # Resolve before projecting; an id needn't be included in $select.
+        scope = {**request.scope, "query_string": b""}
+        records = (await handler(Request(scope)))["value"]
+        record = next((r for r in records if r["id"].casefold() == identifier.casefold()), None)
+        if record is None:
+            raise c.not_found(identifier)
+        return s.single(request, record, kind + "/$entity")
+
+    for name in ("organization", "domains", "subscribedSkus"):
+        router.add_api_route(f"/{name}/{{identifier}}", directory_single, methods=["GET"])
 
     @router.get("/users")
     async def users(request: Request) -> dict[str, Any]:
@@ -353,12 +452,21 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
     @router.post("/users", status_code=201)
     async def create_user(request: Request) -> dict[str, Any]:
         s.admin(request, ctx)
-        body = await request.json()
+        body = await c.json_body(request)
         if not all(
             k in body
             for k in ("accountEnabled", "displayName", "mailNickname", "userPrincipalName", "passwordProfile")
         ):
             raise c.graph_error(400, "Request_BadRequest", "Required user properties are missing.")
+        if (
+            not isinstance(body["userPrincipalName"], str)
+            or "@" not in body["userPrincipalName"]
+            or not isinstance(body["displayName"], str)
+            or not isinstance(body["mailNickname"], str)
+            or not isinstance(body["accountEnabled"], bool)
+            or not isinstance(body["passwordProfile"], dict)
+        ):
+            raise c.invalid_json()
         if any(
             u["userPrincipalName"].casefold() == body["userPrincipalName"].casefold()
             for u in ctx.store["users"]
@@ -380,6 +488,11 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
             }
         )
         ctx.store["users"].put(record)
+        from emulators.providers.microsoft.contacts import ensure_contacts
+        from emulators.providers.microsoft.mail_seed import ensure_mailbox
+
+        ensure_mailbox(ctx, record["id"])
+        ensure_contacts(ctx, record["id"])
         await c.publish_change(ctx, f"users/{record['id']}", "created", record)
         return s.single(request, record, "users/$entity")
 
@@ -396,11 +509,57 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
             result["manager"] = record["manager"]
         return result
 
+    @router.patch("/me")
     @router.patch("/users/{identifier}")
-    async def patch_user(identifier: str, request: Request) -> Response:
-        s.admin(request, ctx)
-        record = s.user(ctx, identifier)
-        record.update({k: v for k, v in (await request.json()).items() if k not in ("id", "passwordProfile")})
+    async def patch_user(request: Request, identifier: str = "me") -> Response:
+        caller = c.principal(request, ctx)
+        record = s.user(ctx, c.me_user_id(caller) if identifier == "me" else identifier)
+        body = await c.json_body(request)
+        for key in (
+            "displayName",
+            "givenName",
+            "surname",
+            "jobTitle",
+            "mobilePhone",
+            "officeLocation",
+            "department",
+            "mailNickname",
+            "userPrincipalName",
+            "preferredLanguage",
+        ):
+            if key in body and body[key] is not None and not isinstance(body[key], str):
+                raise c.invalid_json()
+        if "accountEnabled" in body and not isinstance(body["accountEnabled"], bool):
+            raise c.invalid_json()
+        if "businessPhones" in body and (
+            not isinstance(body["businessPhones"], list)
+            or not all(isinstance(phone, str) for phone in body["businessPhones"])
+        ):
+            raise c.invalid_json()
+        # User.ReadWrite permits self-service profile fields, never directory privileges.
+        self_fields = {
+            "aboutMe",
+            "birthday",
+            "interests",
+            "mySite",
+            "pastProjects",
+            "preferredLanguage",
+            "responsibilities",
+            "schools",
+            "skills",
+            "displayName",
+            "givenName",
+            "surname",
+            "jobTitle",
+            "mobilePhone",
+            "businessPhones",
+            "officeLocation",
+        }
+        if identifier != "me" or caller.app_only or record["id"] != caller.user_id or set(body) - self_fields:
+            s.admin(request, ctx)
+        record.update(
+            {k: v for k, v in body.items() if k not in ("id", "passwordProfile") and not k.startswith("_")}
+        )
         await c.publish_change(ctx, f"users/{record['id']}", "updated", record)
         return Response(status_code=204)
 
@@ -419,12 +578,18 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         caller = c.principal(request, ctx)
         record = s.user(ctx, c.me_user_id(caller) if identifier == "me" else identifier)
         uid = record["id"]
-        kind = s.local_path(request).split("/")[-1]
+        kind = next(
+            part
+            for part in s.local_path(request).split("/")
+            if part in ("manager", "directReports", "ownedObjects", "memberOf", "transitiveMemberOf")
+        )
         if kind == "manager":
             mid = ctx.store.meta["ms_managers"].get(uid)
             if not mid or not ctx.store["users"].get(mid):
                 raise c.not_found("manager")
-            return s.single(request, ctx.store["users"].get(mid), "directoryObjects/$entity")
+            return s.single(
+                request, project_object(request, object_record(ctx, mid)), "directoryObjects/$entity"
+            )
         if kind == "directReports":
             rows = [
                 object_record(ctx, k)
@@ -437,11 +602,21 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
             rows = [object_record(ctx, k) for k, v in ctx.store.meta["ms_group_members"].items() if uid in v]
         else:
             rows = memberships(ctx, uid)
-        return s.collection(request, rows, "directoryObjects")
+        return object_collection(request, rows)
 
     for relation_name in ("manager", "directReports", "memberOf", "transitiveMemberOf", "ownedObjects"):
         router.add_api_route(f"/me/{relation_name}", user_relation, methods=["GET"])
         router.add_api_route(f"/users/{{identifier}}/{relation_name}", user_relation, methods=["GET"])
+        if relation_name != "manager":
+            for suffix in (
+                "/$count",
+                "/microsoft.graph.user",
+                "/microsoft.graph.group",
+                "/microsoft.graph.user/$count",
+                "/microsoft.graph.group/$count",
+            ):
+                for base in ("/me", "/users/{identifier}"):
+                    router.add_api_route(f"{base}/{relation_name}{suffix}", user_relation, methods=["GET"])
 
     async def photo(request: Request, identifier: str = "me") -> Any:
         caller = c.principal(request, ctx)
@@ -469,15 +644,28 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
 
     @router.post("/users/{identifier}/checkMemberGroups")
     @router.post("/users/{identifier}/getMemberGroups")
-    async def check_groups(identifier: str, request: Request) -> dict[str, Any]:
-        c.principal(request, ctx)
-        record = s.user(ctx, identifier)
-        body = await request.json()
+    @router.post("/users/{identifier}/getMemberObjects")
+    @router.post("/users/{identifier}/checkMemberObjects")
+    @router.post("/me/getMemberGroups")
+    @router.post("/me/checkMemberGroups")
+    @router.post("/me/getMemberObjects")
+    @router.post("/me/checkMemberObjects")
+    async def check_groups(request: Request, identifier: str = "me") -> dict[str, Any]:
+        caller = c.principal(request, ctx)
+        record = s.user(ctx, c.me_user_id(caller) if identifier == "me" else identifier)
+        body = await c.json_body(request)
         groups = memberships(ctx, record["id"])
-        if request.url.path.endswith("checkMemberGroups"):
-            groups = [g for g in groups if g["id"] in body.get("groupIds", [])]
+        operation = request.url.path.rsplit("/", 1)[-1]
+        if operation.startswith("checkMember"):
+            key = "groupIds" if operation == "checkMemberGroups" else "ids"
+            ids = body.get(key)
+            if not isinstance(ids, list) or not all(isinstance(i, str) for i in ids) or len(ids) > 20:
+                raise c.invalid_json()
+            groups = [g for g in groups if g["id"] in ids]
         elif body.get("securityEnabledOnly"):
             groups = [g for g in groups if g.get("securityEnabled")]
+        if "securityEnabledOnly" in body and not isinstance(body["securityEnabledOnly"], bool):
+            raise c.invalid_json()
         return {
             "@odata.context": c.context_url(request, "Collection(Edm.String)"),
             "value": [g["id"] for g in groups],
@@ -486,25 +674,33 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
     @router.post("/directoryObjects/getByIds")
     async def get_by_ids(request: Request) -> dict[str, Any]:
         c.principal(request, ctx)
-        body = await request.json()
+        body = await c.json_body(request)
+        if not isinstance(body.get("ids"), list) or not all(isinstance(uid, str) for uid in body["ids"]):
+            raise c.invalid_json()
+        if "types" in body and (
+            not isinstance(body["types"], list) or not all(isinstance(t, str) for t in body["types"])
+        ):
+            raise c.invalid_json()
         rows = []
         for identifier in body.get("ids", []):
             if identifier in ctx.store["users"] or identifier in ctx.store["groups"]:
                 record = object_record(ctx, identifier)
                 if not body.get("types") or record["@odata.type"].split(".")[-1] in body["types"]:
                     rows.append(record)
-        return s.collection(request, rows, "directoryObjects")
+        return object_collection(request, rows)
 
     @router.get("/directoryObjects/{identifier}")
     async def directory_object(identifier: str, request: Request) -> dict[str, Any]:
         c.principal(request, ctx)
-        return s.single(request, object_record(ctx, identifier), "directoryObjects/$entity")
+        return s.single(
+            request, project_object(request, object_record(ctx, identifier)), "directoryObjects/$entity"
+        )
 
     @router.get("/groups")
     async def groups(request: Request) -> dict[str, Any]:
         c.principal(request, ctx)
         advanced(request)
-        return s.collection(request, ctx.store["groups"].values(), "groups")
+        return s.collection(request, ctx.store["groups"].values(), "groups", defaults=DEFAULT_GROUP)
 
     @router.get("/groups/{gid}")
     async def get_group(gid: str, request: Request) -> dict[str, Any]:
@@ -512,22 +708,42 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         record = ctx.store["groups"].get(gid)
         if not record:
             raise c.not_found(gid)
+        if not request.query_params.get("$select"):
+            record = {k: v for k, v in record.items() if k in DEFAULT_GROUP}
         return s.single(request, record, "groups/$entity")
 
-    async def members(request: Request, gid: str) -> dict[str, Any]:
+    async def members(request: Request, gid: str) -> Any:
         c.principal(request, ctx)
         if gid not in ctx.store["groups"]:
             raise c.not_found(gid)
-        kind = request.url.path.split("/")[-1]
+        kind = next(
+            part
+            for part in s.local_path(request).split("/")
+            if part in ("owners", "members", "transitiveMembers")
+        )
+        if "microsoft.graph.group" in request.url.path and (
+            kind == "owners" or "Unified" in ctx.store["groups"].get(gid)["groupTypes"]
+        ):
+            raise c.graph_error(
+                400, "Request_UnsupportedQuery", "The requested OData cast is not supported for this group."
+            )
         rows = (
             [object_record(ctx, uid) for uid in ctx.store.meta["ms_group_owners"].get(gid, [])]
             if kind == "owners"
             else group_members(ctx, gid, kind == "transitiveMembers")
         )
-        return s.collection(request, rows, "directoryObjects")
+        return object_collection(request, rows)
 
     for suffix in ("members", "owners", "transitiveMembers"):
         router.add_api_route(f"/groups/{{gid}}/{suffix}", members, methods=["GET"])
+        for extra in (
+            "/$count",
+            "/microsoft.graph.user",
+            "/microsoft.graph.group",
+            "/microsoft.graph.user/$count",
+            "/microsoft.graph.group/$count",
+        ):
+            router.add_api_route(f"/groups/{{gid}}/{suffix}{extra}", members, methods=["GET"])
 
     async def change_members(request: Request, gid: str, uid: str | None = None) -> Response:
         caller = c.principal(request, ctx)
@@ -535,17 +751,24 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
             raise c.not_found(gid)
         if caller.user_id not in ctx.store.meta["ms_group_owners"].get(gid, []):
             s.admin(request, ctx)
-        values = ctx.store.meta["ms_group_members"][gid]
+        relation = "ms_group_owners" if "/owners/" in request.url.path else "ms_group_members"
+        values = ctx.store.meta[relation][gid]
         if request.method == "POST":
-            body = await request.json()
+            body = await c.json_body(request)
+            if not isinstance(body.get("@odata.id"), str):
+                raise c.invalid_json()
             uid = str(body.get("@odata.id", "")).rsplit("/", 1)[-1]
-            object_record(ctx, uid)
+            linked = object_record(ctx, uid)
+            if relation == "ms_group_owners" and linked["@odata.type"] != "#microsoft.graph.user":
+                raise c.graph_error(400, "Request_BadRequest", "Group owners must be users.")
             if uid in values:
                 raise c.graph_error(
                     400, "Request_BadRequest", "One or more added object references already exist."
                 )
             values.append(uid)
         elif uid in values:
+            if relation == "ms_group_owners" and len(values) == 1:
+                raise c.graph_error(400, "Request_BadRequest", "The last owner cannot be removed.")
             values.remove(uid)
         else:
             raise c.not_found(str(uid))
@@ -554,5 +777,10 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
 
     router.add_api_route("/groups/{gid}/members/$ref", change_members, methods=["POST"])
     router.add_api_route("/groups/{gid}/members/{uid}/$ref", change_members, methods=["DELETE"])
+    router.add_api_route("/groups/{gid}/owners/$ref", change_members, methods=["POST"])
+    router.add_api_route("/groups/{gid}/owners/{uid}/$ref", change_members, methods=["DELETE"])
+    from emulators.providers.microsoft.group_mutations import register as register_groups
+
+    register_groups(router, ctx)
     for version in c.GRAPH_VERSIONS:
         app.include_router(router, prefix=f"/{version}")

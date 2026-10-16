@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -12,24 +13,49 @@ from emulators.core.provider import ProviderContext
 from emulators.providers.microsoft import common as c
 from emulators.providers.microsoft.directory_support import local_path
 
+CANONICAL_HEADERS = {
+    "request-id": "request-id",
+    "client-request-id": "client-request-id",
+    "etag": "ETag",
+    "www-authenticate": "WWW-Authenticate",
+    "odata-version": "OData-Version",
+}
+
 
 async def execute(request: Request, ctx: ProviderContext) -> dict[str, Any]:
     c.principal(request, ctx)
-    data = await request.json()
+    data = await c.json_body(request)
     entries = data.get("requests")
     if not isinstance(entries, list) or not 1 <= len(entries) <= 20:
         raise c.graph_error(400, "BadRequest", "A batch must contain between 1 and 20 requests.")
+    if any(not isinstance(e, dict) for e in entries):
+        raise c.invalid_json()
+    for entry in entries:
+        if (
+            not isinstance(entry.get("id"), str)
+            or not isinstance(entry.get("url"), str)
+            or not isinstance(entry.get("method"), str)
+            or not isinstance(entry.get("headers", {}), dict)
+            or not all(isinstance(k, str) and isinstance(v, str) for k, v in entry.get("headers", {}).items())
+            or not isinstance(entry.get("dependsOn", []), list)
+            or not all(isinstance(d, str) for d in entry.get("dependsOn", []))
+        ):
+            raise c.invalid_json()
     ids = [str(e.get("id", "")) for e in entries]
     if len(set(ids)) != len(ids) or not all(ids):
         raise c.graph_error(400, "BadRequest", "Batch request ids must be unique and nonempty.")
     for entry in entries:
         url = entry.get("url", "")
+        try:
+            parsed = urlsplit(url)
+        except ValueError:
+            raise c.graph_error(400, "BadRequest", "Invalid batch URL.") from None
         if (
             not url
-            or urlsplit(url).netloc
-            or urlsplit(url).scheme
+            or parsed.netloc
+            or parsed.scheme
             or "$batch" in url
-            or any(part == ".." for part in urlsplit(url).path.split("/"))
+            or any(part == ".." for part in parsed.path.split("/"))
             or any(str(d) not in ids or str(d) == str(entry["id"]) for d in entry.get("dependsOn", []))
         ):
             raise c.graph_error(400, "BadRequest", "Invalid batch URL or dependency.")
@@ -71,13 +97,24 @@ async def execute(request: Request, ctx: ProviderContext) -> dict[str, Any]:
                     result: dict[str, Any] = {
                         "id": identifier,
                         "status": response.status_code,
-                        "headers": dict(response.headers),
+                        "headers": {
+                            CANONICAL_HEADERS.get(
+                                key, "-".join(part.capitalize() for part in key.split("-"))
+                            ): value
+                            for key, value in response.headers.items()
+                            if key.lower() not in ("content-length", "transfer-encoding")
+                        },
                     }
                     if response.content:
                         try:
                             result["body"] = response.json()
                         except ValueError:
-                            result["body"] = response.text
+                            content_type = response.headers.get("content-type", "")
+                            result["body"] = (
+                                response.text
+                                if content_type.startswith("text/")
+                                else base64.b64encode(response.content).decode()
+                            )
                     results[identifier] = result
                 pending.remove(entry)
     return {"responses": [results[i] for i in ids]}

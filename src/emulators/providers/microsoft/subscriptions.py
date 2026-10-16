@@ -39,13 +39,13 @@ def normalize(ctx: ProviderContext, resource: str, caller: c.Principal) -> tuple
                 )
         return value, 41760
     match = re.fullmatch(
-        r"users/([^/]+)/(messages|events|mailFolders/([^/]+)/messages|drive/root)", value, re.I
+        r"users/([^/]+)/(messages|events|contacts|mailFolders/([^/]+)/messages|drive/root)", value, re.I
     )
     if match:
         owner = s.user(ctx, match[1])
         if not caller.app_only and caller.user_id != owner["id"]:
             raise c.graph_error(403, "ErrorAccessDenied", "Access is denied.")
-        suffix = match[2]
+        suffix = match[2].lower() if not match[3] else match[2]
         if match[3]:
             suffix = f"mailFolders/{folder(ctx, owner['id'], match[3])['id']}/messages"
         if suffix == "drive/root":
@@ -54,7 +54,7 @@ def normalize(ctx: ProviderContext, resource: str, caller: c.Principal) -> tuple
             if not drive:
                 raise c.not_found("drive")
             return f"drives/{drive['id']}/root", 42300
-        return f"users/{owner['id']}/{suffix}", 42300 if suffix == "drive/root" else 10080
+        return f"users/{owner['id']}/{suffix}", 10070
     if re.fullmatch(r"drives/[^/]+/root", value):
         drive = ctx.store["ms_drives"].get(value.split("/")[1])
         if not drive:
@@ -147,6 +147,8 @@ async def notify(ctx: ProviderContext, resource: str, change_type: str, data: di
             if "/mailFolders/" in watched or (watched.endswith("/messages") and watched.startswith("users/"))
             else "event"
             if watched.endswith("/events")
+            else "contact"
+            if watched.endswith("/contacts")
             else "driveItem"
             if watched.endswith("/root")
             else "callRecord"
@@ -157,16 +159,20 @@ async def notify(ctx: ProviderContext, resource: str, change_type: str, data: di
             if "recordings" in watched
             else "chatMessage"
         )
+        notification_resource = resource
+        if kind in ("message", "event", "contact"):
+            uid = resource.split("/")[1]
+            notification_resource = f"Users/{uid}/{kind.capitalize()}s/{data['id']}"
         payload = {
             "value": [
                 {
                     "subscriptionId": subscription["id"],
                     "subscriptionExpirationDateTime": subscription["expirationDateTime"],
                     "changeType": actual,
-                    "resource": resource,
+                    "resource": notification_resource,
                     "resourceData": {
                         "@odata.type": f"#microsoft.graph.{kind}",
-                        "@odata.id": resource,
+                        "@odata.id": notification_resource,
                         "@odata.etag": data.get("@odata.etag", f'W/"{data.get("changeKey", "1")}"'),
                         "id": data["id"],
                     },
@@ -231,9 +237,14 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
     @router.post("/subscriptions")
     async def create(request: Request) -> Any:
         caller = c.principal(request, ctx)
-        body = await request.json()
+        body = await c.json_body(request)
         if not all(body.get(k) for k in ("changeType", "notificationUrl", "resource", "expirationDateTime")):
             raise invalid("changeType, notificationUrl, resource and expirationDateTime are required.")
+        if not all(
+            isinstance(body[k], str)
+            for k in ("changeType", "notificationUrl", "resource", "expirationDateTime")
+        ):
+            raise c.invalid_json()
         resource, maximum = normalize(ctx, body["resource"], caller)
         kinds = [x.strip() for x in body["changeType"].split(",")]
         allowed = (
@@ -245,6 +256,8 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         )
         if not kinds or not set(kinds).issubset(allowed) or len(set(kinds)) != len(kinds):
             raise invalid("Unsupported changeType for this resource.")
+        if "clientState" in body and not isinstance(body["clientState"], str):
+            raise c.invalid_json()
         if len(body.get("clientState", "")) > 128:
             raise invalid("clientState cannot exceed 128 characters.")
         if body.get("includeResourceData"):
@@ -310,7 +323,7 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
     @router.patch("/subscriptions/{sid}")
     async def patch(sid: str, request: Request) -> Any:
         record = get(request, sid)
-        body = await request.json()
+        body = await c.json_body(request)
         if "expirationDateTime" in body:
             record["expirationDateTime"] = expiration(ctx, body["expirationDateTime"], record["_maximum"])
         if "notificationUrl" in body:

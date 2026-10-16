@@ -10,7 +10,7 @@ from urllib.parse import urlencode
 
 from fastapi import Request
 
-from emulators.core.odata import ODataError
+from emulators.core.odata import ODataError, select_record
 from emulators.core.provider import ProviderContext, external_base
 from emulators.providers.microsoft import common as c
 
@@ -54,7 +54,8 @@ def collection(
         result.pop("@odata.nextLink", None)
     if defaults and not request.query_params.get("$select"):
         result["value"] = [
-            {k: v for k, v in r.items() if k in defaults or k == "manager"} for r in result["value"]
+            {k: v for k, v in r.items() if k in defaults or k in ("manager", "@odata.type", "@odata.etag")}
+            for r in result["value"]
         ]
     return result
 
@@ -147,6 +148,8 @@ def delta(
     rows: list[dict[str, Any]],
     resource: str,
     context: str,
+    *,
+    defaults: tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
     """Freeze a cursor boundary so writes during paging appear in the next round."""
     token = request.query_params.get("$deltatoken") or request.query_params.get("$skiptoken")
@@ -174,7 +177,10 @@ def delta(
                     changes[item["id"]] = {"id": item["id"], "@removed": {"reason": "deleted"}}
         rows = list(changes.values())
     options = c.query_options(request)
-    size = min(options.top if options.top is not None else 100, 999)
+    from emulators.providers.microsoft.query_validation import validate
+
+    validate(options, context)
+    size = c.page_size(request, options.top, 100, 999)
     page = rows[offset : offset + size]
     result = {"@odata.context": c.context_url(request, context), "value": [clean(r) for r in page]}
     more = bool(size and offset + size < len(rows))
@@ -192,11 +198,20 @@ def delta(
     params = [(k, v) for k, v in request.query_params.multi_items() if k not in ("$skiptoken", "$deltatoken")]
     params.append(("$skiptoken" if more else "$deltatoken", encoded))
     result["@odata.nextLink" if more else "@odata.deltaLink"] = (
-        external_base(request) + local_path(request) + "?" + urlencode(params)
+        external_base(request) + local_path(request) + "?" + urlencode(params, safe="$")
     )
     if options.select:
         result["value"] = [
-            {k: v for k, v in r.items() if k in options.select or k in ("id", "@removed")}
+            select_record(r, options.select, always=("id", "@removed", "@odata.type", "@odata.etag"))
+            for r in result["value"]
+        ]
+    elif defaults:
+        result["value"] = [
+            {
+                k: v
+                for k, v in r.items()
+                if k in defaults or k in ("id", "@removed", "@odata.type", "@odata.etag")
+            }
             for r in result["value"]
         ]
     return result

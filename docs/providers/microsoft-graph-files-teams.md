@@ -49,6 +49,14 @@ and unauthorized message edits return `403 accessDenied`. Only the organizer can
 modify a meeting, and only the author can edit a message. Sending ordinary messages
 requires delegated authentication.
 
+All JSON mutations use the shared Graph object-body parser and return 400 for malformed
+JSON, arrays or null. Collection and delta paging honor `Prefer: odata.maxpagesize=N`
+and return `Preference-Applied`. `$select` supports nested paths and `*` on single
+entities; directory-derived conversation members retain their `@odata.type` annotation.
+Teams bodies normalize `HTML`/`Text` to `html`/`text`, including edits. Channel delta
+applies selection without adding entity-level context fields. Paging links preserve
+literal OData parameter names, and prefix-mode links keep one routing prefix.
+
 ## Endpoint table
 
 In the drive rows, `{D}` means any of `/me/drive`, `/users/{userId}/drive`,

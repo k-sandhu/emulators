@@ -51,6 +51,38 @@ def ensure_folder(ctx: ProviderContext, uid: str, path: str) -> str:
     return fid
 
 
+def ensure_mailbox(ctx: ProviderContext, uid: str) -> dict[str, Any]:
+    """New directory users need the same usable Outlook defaults as seeded users."""
+    for name in FOLDERS:
+        ensure_folder(ctx, uid, name)
+    record = ctx.store["mailbox_settings"].get(uid)
+    if record is None:
+        record = {
+            "id": uid,
+            "timeZone": "UTC",
+            "language": {"locale": "en-US", "displayName": "English (United States)"},
+            "dateFormat": "MM/dd/yyyy",
+            "timeFormat": "h:mm tt",
+            "userPurpose": "user",
+            "workingHours": {
+                "daysOfWeek": ["monday", "tuesday", "wednesday", "thursday", "friday"],
+                "startTime": "09:00:00.0000000",
+                "endTime": "17:00:00.0000000",
+                "timeZone": {"name": "UTC"},
+            },
+            "automaticRepliesSetting": {
+                "status": "disabled",
+                "externalAudience": "all",
+                "scheduledStartDateTime": {"dateTime": "0001-01-01T00:00:00.0000000", "timeZone": "UTC"},
+                "scheduledEndDateTime": {"dateTime": "0001-01-01T00:00:00.0000000", "timeZone": "UTC"},
+                "internalReplyMessage": "",
+                "externalReplyMessage": "",
+            },
+        }
+        ctx.store["mailbox_settings"].put(record)
+    return record
+
+
 def message_shape(
     ctx: ProviderContext,
     uid: str,

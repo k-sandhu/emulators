@@ -187,7 +187,7 @@ def delta(
         ]
     records = [i for i in records if dm.role_for(ctx, i, p)]
     options = common.query_options(request)
-    size = min(options.top or 200, 200)
+    size = common.page_size(request, options.top, 200, 200)
     page = records[:size]
     result: dict[str, Any] = {
         "@odata.context": common.context_url(request, "Collection(driveItem)"),
@@ -207,12 +207,12 @@ def delta(
                 common.single_response(request, dm.wire_item(request, ctx, item), context="driveItem")
             )
             result["value"][-1].pop("@odata.context", None)
-    more = len(records) > size
+    more = bool(size and len(records) > size)
     next_token = dm.delta_token(ctx, resource, p, records if more else [], sequence, size if more else 0)
     params = {k: v for k, v in request.query_params.items() if k != "token"}
     params["token"] = next_token
     result["@odata.nextLink" if more else "@odata.deltaLink"] = (
-        external_base(request) + dm.path_of(request) + "?" + urlencode(params)
+        external_base(request) + dm.path_of(request) + "?" + urlencode(params, safe="$")
     )
     return result
 

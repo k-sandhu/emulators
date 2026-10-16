@@ -57,3 +57,23 @@ def test_msal_auth_code_flow_pkce_and_nonce(emulator_intercept: Any) -> None:
     result = application.acquire_token_by_auth_code_flow(flow, response)
     assert "access_token" in result, result
     assert result["id_token_claims"]["preferred_username"] == "maya.chen@halcyonadvisory.example"
+
+
+def test_msal_default_consent_refresh_and_discovered_userinfo(emulator_intercept: Any) -> None:
+    application = msal.PublicClientApplication(CLIENT_ID, authority=AUTHORITY)
+    initial = application.acquire_token_by_username_password(
+        "maya.chen@halcyonadvisory.example",
+        "synthetic-password",
+        scopes=["https://graph.microsoft.com/.default"],
+    )
+    assert "access_token" in initial, initial
+    account = application.get_accounts(username="maya.chen@halcyonadvisory.example")[0]
+    refreshed = application.acquire_token_silent(["User.Read"], account=account, force_refresh=True)
+    assert "access_token" in refreshed, refreshed
+    discovery = requests.get(AUTHORITY + "/v2.0/.well-known/openid-configuration").json()
+    userinfo = requests.get(
+        discovery["userinfo_endpoint"], headers={"Authorization": f"Bearer {refreshed['access_token']}"}
+    )
+    assert userinfo.status_code == 200
+    assert userinfo.json()["email"] == "maya.chen@halcyonadvisory.example"
+    assert userinfo.json()["sub"] == initial["id_token_claims"]["sub"]

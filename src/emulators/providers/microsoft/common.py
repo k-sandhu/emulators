@@ -8,25 +8,33 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 import uuid
 from collections.abc import Awaitable, Callable
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlencode
 
 from fastapi import Request
+from fastapi.responses import Response
 
 from emulators.core.auth import bearer_token
 from emulators.core.clock import isoformat_z
 from emulators.core.errors import EmulatorError
 from emulators.core.ids import stable_guid
-from emulators.core.odata import ODataError, QueryOptions, apply_query, parse_query_options
+from emulators.core.odata import ODataError, QueryOptions, apply_query, parse_query_options, select_record
 from emulators.core.provider import ProviderContext, external_base
 from emulators.world.model import DirectChat, Meeting, Person, World
 
 GRAPH_VERSIONS = ("v1.0", "beta")
 DEFAULT_PAGE_SIZE = 100
 MAX_PAGE_SIZE = 999
+REQUEST_SCOPE: ContextVar[dict[str, Any] | None] = ContextVar("microsoft_request_scope", default=None)
+BEARER_CHALLENGE = (
+    'Bearer realm="", authorization_uri="https://login.microsoftonline.com/common/oauth2/authorize", '
+    'client_id="00000003-0000-0000-c000-000000000000"'
+)
 
 
 # -- ids -------------------------------------------------------------------------------
@@ -71,26 +79,114 @@ def email_address(person: Person) -> dict[str, Any]:
 # -- errors ----------------------------------------------------------------------------
 
 
-def error_body(code: str, message: str, *, request_id: str | None = None) -> dict[str, Any]:
-    rid = request_id or str(uuid.uuid4())
+def request_ids(scope: dict[str, Any] | None = None) -> tuple[str, str]:
+    scope = scope if scope is not None else REQUEST_SCOPE.get()
+    state = scope.setdefault("state", {}) if scope is not None else {}
+    rid = state.setdefault("graph_request_id", str(uuid.uuid4()))
+    headers = dict(scope.get("headers", [])) if scope is not None else {}
+    return rid, headers.get(b"client-request-id", rid.encode()).decode("latin-1")
+
+
+def error_headers(status: int, scope: dict[str, Any] | None = None) -> dict[str, str]:
+    rid, client = request_ids(scope)
+    headers = {"request-id": rid, "client-request-id": client}
+    if status == 401:
+        headers["WWW-Authenticate"] = BEARER_CHALLENGE
+    return headers
+
+
+def error_body(
+    code: str, message: str, *, request_id: str | None = None, scope: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    rid, client = request_ids(scope)
+    rid = request_id or rid
     from datetime import UTC, datetime
 
+    scope = scope if scope is not None else REQUEST_SCOPE.get()
+    stamp = (scope or {}).get("state", {}).get("graph_now") or isoformat_z(datetime.now(UTC))
     return {
         "error": {
             "code": code,
             "message": message,
             "innerError": {
-                "date": isoformat_z(datetime.now(UTC)),
+                "date": stamp,
                 "request-id": rid,
-                "client-request-id": rid,
+                "client-request-id": client,
             },
         }
     }
 
 
 def graph_error(status: int, code: str, message: str) -> EmulatorError:
-    rid = str(uuid.uuid4())
-    return EmulatorError(status, error_body(code, message, request_id=rid), headers={"request-id": rid})
+    return EmulatorError(status, error_body(code, message), headers=error_headers(status))
+
+
+def invalid_json() -> EmulatorError:
+    return graph_error(400, "BadRequest", "Unable to read JSON request payload. Please ensure JSON is valid.")
+
+
+def json_object(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise invalid_json()
+    return value
+
+
+async def json_body(request: Request, *, optional: bool = False, code: str = "BadRequest") -> dict[str, Any]:
+    """Graph JSON operations require an object, including when JSON decoding fails."""
+    if optional and not await request.body():
+        return {}
+    try:
+        value = await request.json()
+    except (ValueError, UnicodeDecodeError):
+        raise graph_error(
+            400, code, "Unable to read JSON request payload. Please ensure JSON is valid."
+        ) from None
+    if not isinstance(value, dict):
+        raise graph_error(400, code, "Unable to read JSON request payload. Please ensure JSON is valid.")
+    return value
+
+
+def preference_applied(request: Request, value: str) -> None:
+    values = request.scope.setdefault("state", {}).setdefault("graph_preferences", [])
+    if value not in values:
+        values.append(value)
+
+
+def page_size(request: Request, top: int | None, default: int, maximum: int) -> int:
+    size = min(top if top is not None else default, maximum)
+    match = re.search(
+        r"(?:^|,)\s*odata.maxpagesize\s*=\s*(\d+)(?:\s*,|\s*$)", request.headers.get("prefer", ""), re.I
+    )
+    if match and int(match[1]) > 0:
+        preferred = min(int(match[1]), maximum)
+        size = min(top, preferred) if top is not None else preferred
+        preference_applied(request, f"odata.maxpagesize={preferred}")
+    return size
+
+
+def count_response(request: Request, records: list[dict[str, Any]], *, directory: bool = False) -> Response:
+    if directory and request.headers.get("ConsistencyLevel", "").lower() != "eventual":
+        raise graph_error(
+            400, "Request_UnsupportedQuery", "Advanced queries require ConsistencyLevel: eventual."
+        )
+    options = query_options(request)
+    from emulators.providers.microsoft.query_validation import validate
+
+    kind = next(
+        (
+            part
+            for part in reversed(request.url.path.split("/"))
+            if part in ("users", "groups", "messages", "events")
+        ),
+        "",
+    )
+    validate(options, kind)
+    options.top, options.skip = None, 0
+    try:
+        total = apply_query(records, options).total
+    except ODataError as exc:
+        raise graph_error(400, exc.code, exc.message) from None
+    return Response(str(total), media_type="text/plain")
 
 
 def not_found(what: str = "resource") -> EmulatorError:
@@ -209,11 +305,22 @@ def collection_response(
     options = query_options(request)
     token = request.query_params.get("$skiptoken") or request.query_params.get("skiptoken")
     start = _decode_skiptoken(token) if token else (options.skip or 0)
-    page_size = min(options.top or default_page_size, max_page_size)
+    size = page_size(request, options.top, default_page_size, max_page_size)
     options.top = None
     options.skip = start
-    result = apply_query(records, options, search_fields=search_fields, select_always=select_always)
-    page = result.items[:page_size]
+    from emulators.providers.microsoft.query_validation import validate
+
+    validate(options, context)
+    try:
+        result = apply_query(
+            records,
+            options,
+            search_fields=search_fields,
+            select_always=(*select_always, "@odata.type", "@odata.etag"),
+        )
+    except ODataError as exc:
+        raise graph_error(400, exc.code, exc.message) from None
+    page = result.items[:size]
     body: dict[str, Any] = {"@odata.context": context_url(request, context)}
     if options.count:
         body["@odata.count"] = result.total
@@ -223,9 +330,10 @@ def collection_response(
     if page and next_start < result.total:
         drop = {"$skiptoken", "skiptoken", "$skip", "skip", "$top", "top"}
         params = [(k, v) for k, v in request.query_params.multi_items() if k not in drop]
-        params.append(("$top", str(page_size)))
+        params.append(("$top", str(size)))
         params.append(("$skiptoken", _encode_skiptoken(next_start)))
-        body["@odata.nextLink"] = f"{external_base(request)}{request.url.path}?{urlencode(params)}"
+        path = request.url.path.removeprefix(request.scope.get("root_path", ""))
+        body["@odata.nextLink"] = f"{external_base(request)}{path}?{urlencode(params, safe='$')}"
     body["value"] = page
     return body
 
@@ -233,10 +341,10 @@ def collection_response(
 def single_response(request: Request, record: dict[str, Any], *, context: str) -> dict[str, Any]:
     """One entity with ``@odata.context`` and ``$select`` applied."""
     options = query_options(request)
-    item = dict(record)
-    if options.select:
-        keep = set(options.select) | {"id", "@odata.type", "@odata.etag"}
-        item = {k: v for k, v in item.items() if k in keep}
+    from emulators.providers.microsoft.query_validation import validate
+
+    validate(options, context)
+    item = select_record(record, options.select)
     return {"@odata.context": context_url(request, context), **item}
 
 

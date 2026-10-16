@@ -49,6 +49,15 @@ client binding and expiry, with intentionally loose signature validation. Reques
 for an ID token, `offline_access` for a refresh token, and `client_info=1` for MSAL account
 cache metadata. V1 token requests accept `resource`.
 
+Delegated `.default` grants expand to configured consented permissions instead of putting
+`.default` in `scp`. Tests can register a client with `delegated_scopes=["User.Read", ...]`
+through `hub.context("microsoft").tokens.register_client(...)`; lenient clients use
+the documented defaults in `identity.DEFAULT_DELEGATED_SCOPES`. Graph-prefixed and short
+scope names are equivalent during code redemption and refresh. Refresh tokens rotate
+when the original grant included `offline_access`, including after scope narrowing.
+V2 client credentials require `scope`, return no `scope` response field, and authentication
+failures return 401. V1 expiry fields are strings and device discovery uses `verification_url`.
+
 Authorization supports `code`, `id_token`, and hybrid `code id_token` responses;
 `response_mode=query|fragment|form_post`; state, nonce and login hints. Without `login_hint`,
 the shared account picker lists active employees. The form-post response submits itself.
@@ -66,6 +75,7 @@ the shared account picker lists active employees. The form-post response submits
 | POST | `/{tenant}/oauth2/v2.0/token`, `/{tenant}/oauth2/token` | Form-encoded grants |
 | POST | `/{tenant}/oauth2/v2.0/devicecode`, `/{tenant}/oauth2/devicecode` | Device code, 900-second lifetime, 5-second polling interval |
 | GET | `/{tenant}/oauth2/v2.0/logout`, `/{tenant}/oauth2/logout` | Optional post-logout redirect |
+| GET, POST | `https://graph.microsoft.com/oidc/userinfo` | Discovered OIDC endpoint; pairwise subject, names, email and photo URL |
 
 ## Directory endpoints
 
@@ -73,24 +83,40 @@ the shared account picker lists active employees. The form-post response submits
 | --- | --- | --- |
 | GET | `/me`, `/users`, `/users/{id-or-upn}` | Default 11 properties including ID; extended fields with `$select` |
 | POST, PATCH, DELETE | `/users`, `/users/{id-or-upn}` | Create, update, delete; app or world tenant admin required |
+| PATCH | `/me` | Self-service profile fields; directory privilege changes require an administrator |
 | GET | `/users/delta`, `/groups/delta` | Snapshot pages, opaque resource-bound cursors, changed entities and deletion markers |
-| GET | `/organization`, `/domains`, `/subscribedSkus` | Verified domains, licenses and service plans |
+| GET | `/organization`, `/domains`, `/subscribedSkus`, each also `/{id}` | Verified domains, licenses and service plans |
 | GET | `/users/{id}/manager`, `/directReports`, `/memberOf`, `/transitiveMemberOf`, `/ownedObjects` | Also under `/me`; manager expansions support `$select` and `$levels=max` |
 | GET | `/users/{id}/photo`, `/photo/$value`, `/photos`, `/photos/{size}`, `/photos/{size}/$value` | Also under `/me`; generated 64px PNG or `ImageNotFound` |
-| POST | `/users/{id}/checkMemberGroups`, `/getMemberGroups` | Group ID collections |
+| POST | `/users/{id}/checkMemberGroups`, `/getMemberGroups`, `/checkMemberObjects`, `/getMemberObjects` | Also under `/me`; transitive ID collections and membership checks |
 | POST | `/directoryObjects/getByIds` | ID and optional type filtering |
 | GET | `/directoryObjects/{id}` | User or group with directory object type annotation |
 | GET | `/groups`, `/groups/{id}`, `/groups/{id}/members`, `/owners`, `/transitiveMembers` | World group types, membership and owners |
-| POST | `/groups/{id}/members/$ref` | Owner or tenant admin; `@odata.id` body |
-| DELETE | `/groups/{id}/members/{id}/$ref` | Owner or tenant admin |
-| POST | `/$batch` | Up to 20 requests; dependencies, failure propagation, same-app dispatch |
+| POST, PATCH, DELETE | `/groups`, `/groups/{id}` | Create as administrator/application; update/delete as owner or administrator |
+| POST | `/groups/{id}/members/$ref`, `/groups/{id}/owners/$ref` | Owner or tenant admin; `@odata.id` body |
+| DELETE | `/groups/{id}/members/{id}/$ref`, `/groups/{id}/owners/{id}/$ref` | Owner or tenant admin; final owner cannot be removed |
+| GET | `/users/$count`, `/groups/$count`, `/groups/{id}/members/$count` | Plain text; `ConsistencyLevel: eventual` required; other directory relationships also support count |
+| GET | `/groups/{id}/members/microsoft.graph.user`, `/me/memberOf/microsoft.graph.group` | User/group casts on directory relationship collections, including transitive variants |
+| POST | `/$batch` | Up to 20 requests; dependencies, failure propagation, same-app dispatch; canonical content headers, no subresponse Content-Length, binary bodies base64 encoded |
 
 Directory collections default to 100 records, capped at 999. OData filtering, ordering,
 selection, searching and skip-token paging use the shared OData engine. `$search` and
 `$count=true` on directory collections require `ConsistencyLevel: eventual`. Guest users
 cannot enumerate users. User/group writes enforce world administrator or group-owner roles.
 Every Graph response includes `request-id` and `client-request-id`, including failures
-and injected faults. The latter echoes the caller's header when supplied.
+and injected faults. Each error's `innerError` uses the same IDs; the latter echoes
+the caller's header when supplied. Graph 401s include the Bearer authorization challenge.
+User defaults also apply to directory relationships and delta; directory objects retain
+`@odata.type` when projected. Explicit `$select` can request additional properties.
+OData key syntax such as `/users('maya.chen@halcyonadvisory.example')` and
+`/me/mailFolders('Inbox')/messages` is accepted.
+Directory relationship filters, searches, ordering and type casts require
+`ConsistencyLevel: eventual` and `$count=true`; count segments need the header alone.
+
+Collections and delta honor `Prefer: odata.maxpagesize=N`, echo `Preference-Applied`,
+and preserve literal `$top` and `$skiptoken` keys in paging links. Unknown root property
+names in `$select`, `$filter` and `$orderby` are rejected for users, groups, messages and
+events. JSON mutation endpoints reject malformed JSON and nonobject payloads with 400.
 
 ## Outlook endpoints
 
@@ -101,30 +127,43 @@ and calendar data use the same ownership check.
 | Method | Graph path | Notes |
 | --- | --- | --- |
 | GET | `{mailbox}/mailFolders`, `/mailFolders/{id}`, `/mailFolders/{id}/childFolders` | Well-known names and nested folders; computed item/unread/child counts |
+| POST | `{mailbox}/mailFolders`, `/mailFolders/{id}/childFolders` | Create folders with a parent and optional hidden state |
+| GET | `{mailbox}/mailFolders/delta` | Initial folder hierarchy and resource-bound change cursor |
 | GET, POST | `{mailbox}/messages`, `/mailFolders/{id}/messages` | List or create draft; list default 10, maximum 1000 |
 | GET | `{mailbox}/messages/{id}`, `/messages/{id}/$value` | Message JSON or RFC 822 MIME; folder-qualified GET aliases also supported |
 | GET | `{mailbox}/messages/{id}/attachments`, `/attachments/{id}`, `/attachments/{id}/$value` | File attachment metadata, base64 content or bytes; folder-qualified aliases |
-| PATCH, DELETE | `{mailbox}/messages/{id}` | Read/flag/category updates; drafts also editable; delete moves to Deleted Items |
+| POST | `{mailbox}/messages/{id}/attachments` | File attachments smaller than 3 MiB; folder-qualified alias supported |
+| PATCH, DELETE | `{mailbox}/messages/{id}`, `/mailFolders/{fid}/messages/{id}` | Read/flag/category updates; drafts also editable; delete moves to Deleted Items; folder membership checked |
 | POST | `{mailbox}/sendMail` | JSON message or base64 MIME; internal delivery; `saveToSentItems` |
-| POST | `{mailbox}/messages/{id}/send`, `/createReply`, `/reply`, `/replyAll`, `/forward`, `/move`, `/copy` | Correct action status codes, per-mailbox copies and new move/copy IDs |
+| POST | `{mailbox}/messages/{id}/send`, `/createReply`, `/createReplyAll`, `/createForward`, `/reply`, `/replyAll`, `/forward`, `/move`, `/copy` | Draft creation returns 201; sending returns 202; per-mailbox copies and new move/copy IDs |
+| GET | `{mailbox}/messages/$count`, `/mailFolders/{id}/messages/$count` | Plain-text mailbox/folder message count |
 | GET | `{mailbox}/mailFolders/{id}/messages/delta` | Folder-specific delta; move/delete tombstones |
 | GET, PATCH | `{mailbox}/mailboxSettings` | Time zone, working hours and automatic replies |
 | GET | `{mailbox}/calendars`, `/calendar`, `/calendars/{id}`, `/calendarGroups`, `/calendarGroups/{id}/calendars` | Default calendar and calendar group |
+| POST | `{mailbox}/calendars` | Create an additional calendar; events remain scoped to their calendar |
 | GET, POST | `{mailbox}/events`, `/calendar/events`, `/calendars/{id}/events` | Single instances and series masters; create events and internal invitations |
 | GET | `{mailbox}/calendarView`, `/calendar/calendarView`, `/calendars/{id}/calendarView` | Both date range parameters required; occurrences expanded |
 | GET, PATCH, DELETE | `{mailbox}/events/{id}` | Calendar-qualified aliases; transactional event creation |
 | GET | `{mailbox}/events/{id}/instances` | Seeded and runtime recurrence expansion, date range required |
 | POST | `{mailbox}/events/{id}/accept`, `/decline`, `/tentativelyAccept`, `/cancel`, `/forward` | Attendee response state and organizer checks |
+| POST | `{mailbox}/events/{id}/snoozeReminder` | Validated `newReminderTime`; returns 204; calendar-qualified aliases |
+| GET, POST | `{mailbox}/events/{id}/attachments` | List or create small file attachments; calendar-qualified aliases |
+| GET, DELETE | `{mailbox}/events/{id}/attachments/{aid}` | Metadata or delete; `/{aid}/$value` downloads bytes |
 | POST | `{mailbox}/calendar/getSchedule` | Availability views and schedule items |
 | POST | `{mailbox}/findMeetingTimes` | Simplified suggestion response |
 | GET | `{mailbox}/events/delta`, `/calendarView/delta` | Delta links and changed events |
 | GET, POST | `{mailbox}/contacts`, `/contactFolders/{id}/contacts` | Private relationship and colleague contacts; list/create |
 | GET, PATCH, DELETE | `{mailbox}/contacts/{id}`, `/contactFolders/{id}/contacts/{id}` | Contact CRUD |
+| GET | `{mailbox}/contacts/delta`, `/contactFolders/{id}/contacts/delta` | Contact changes and deletion markers |
 | GET, POST | `{mailbox}/contactFolders`, `/contactFolders/{id}/childFolders` | Folder hierarchy and creation |
 | GET | `{mailbox}/contactFolders/{id}` | Folder metadata |
 
 Mail supports `$search` terms, sender-qualified searches, read/attachment/date/sender filters,
-and `Prefer: outlook.body-content-type="text"`. Attachment documents are rendered on demand
+and `Prefer: outlook.body-content-type="text"` with `Preference-Applied` when honored.
+Messages are newest first by default; folder collections default to ten items.
+Message and event bodies normalize `HTML`/`Text` to `html`/`text`. Sending requires at
+least one valid recipient and a recognized importance value; rejected sends do not
+create drafts. Attachment documents are rendered on demand
 and cached in the blob store; uploaded attachment bytes also use the blob store.
 Well-known folders include `inbox`, `drafts`, `sentitems`, `deleteditems`, `junkemail`,
 `archive`, `outbox`, `conversationhistory` and `msgfolderroot`.
@@ -135,6 +174,11 @@ onlineMeeting resources; Zoom/Meet links are included in event bodies. Runtime r
 supports daily, weekly, absolute/relative monthly and yearly patterns, preserving local
 wall time across DST. CalendarView pagination preserves the original request path, query,
 and routing prefix.
+Contacts carry `changeKey`, `@odata.etag`, and the Outlook create defaults. Directory
+users created at runtime receive mailbox settings and an empty contacts folder.
+Meeting-time suggestions normalize both ends to Graph's seven-digit `dateTimeTimeZone`
+form. Free/busy codes are `0` free/workingElsewhere, `1` tentative, `2` busy and `3` oof;
+unknown mailboxes report `ErrorMailRecipientNotFound`.
 
 ## Seeded data
 
@@ -165,7 +209,7 @@ client ownership/engagement membership and department colleague relationships.
 | GET, PATCH, DELETE | `/subscriptions/{id}` | Get, renew/update URL or remove |
 | POST | `/subscriptions/{id}/reauthorize` | Reauthorization acknowledgement |
 
-Supported resources include mailbox messages/folder messages/events, users, groups,
+Supported resources include mailbox messages/folder messages/events/contacts, users, groups,
 drive roots, channel/chat messages, callRecords and communications onlineMeeting artifacts.
 Mailbox, drive and conversation access is checked when creating the subscription.
 Creation POSTs a `validationToken` query parameter to notification and lifecycle URLs,
@@ -178,11 +222,15 @@ changeType, resource, resourceData (`@odata.type`, `@odata.id`, `@odata.etag`, `
 clientState and tenantId. Graph basic webhooks use clientState verification, **no HMAC
 signature**. Resource writes publish through the shared change bus; webhook delivery
 uses the hub's sync/async/manual dispatcher and delivery journal.
+Outlook notification paths use Graph's `Users/{id}/Messages/{id}` casing (and Events/Contacts),
+including notifications for folder-scoped subscriptions.
 
-Expiration limits follow the public resource table: Outlook 10,080 minutes; directory
+Expiration limits are Outlook 10,070 minutes (the review's verified service limit); directory
 41,760; drive roots 42,300; Teams messages 4,320; callRecords/onlineMeeting 4,230.
 Expiries below 45 minutes are increased to 45 minutes. Teams message subscriptions
 longer than one hour require a lifecycle URL.
+Duplicate subscriptions retain the documented 409 behavior for the same application,
+resource and change types; see the review decisions below.
 
 ## Actions
 
@@ -217,6 +265,19 @@ All actions are POSTs under `/_emulator/actions/` (or `/microsoft/_emulator/acti
   lifecycle delivery is explicitly simulated with the action.
 - Delta cursors are retained for the lifetime of the local store. There is no production
   delta-token expiry/retention policy; reset clears them.
+- Type/name validation for complex query properties is partial. UserInfo shares the
+  provider's lenient permission-consent model; optional claims are not scope-filtered.
+
+## Review decisions
+
+The suspected duplicate-subscription change was checked against Microsoft's
+[create-subscription reference](https://learn.microsoft.com/en-us/graph/api/subscription-post-subscriptions?view=graph-rest-1.0#duplicate-subscription-behavior),
+which still specifies 409 for duplicates. That behavior is retained and regression tested.
+Microsoft's [scheduleInformation reference](https://learn.microsoft.com/en-us/graph/api/resources/scheduleinformation?view=graph-rest-1.0)
+explicitly maps workingElsewhere to `0` for backward compatibility, so the suggested `4`
+mapping was not adopted. Other showAs statuses and missing-mailbox errors are fixed.
+The subscription lifetime table currently lists 10,080 minutes for Outlook; this emulator
+uses the brief's confirmed 10,070-minute boundary, with tests at and above the boundary.
 
 ## Reference and verification
 
@@ -234,3 +295,6 @@ uv run pytest tests/sdk/test_microsoft_msal_sdk.py -q
 The MSAL tests use the official library and real vendor hostnames through
 `emulator_intercept`, covering client credentials, username/password with account-cache
 refresh, and authorization-code flow with PKCE and nonce validation.
+They also verify delegated `.default` consent, forced refresh to `User.Read`, and the
+OIDC-discovered UserInfo endpoint. Review regressions live in `test_review_*.py` and
+cover malformed payloads, projections, IDs, paging, directory writes and Outlook additions.

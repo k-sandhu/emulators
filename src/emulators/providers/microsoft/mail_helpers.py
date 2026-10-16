@@ -16,6 +16,8 @@ from emulators.core.ids import stable_hash
 from emulators.core.provider import ProviderContext
 from emulators.providers.microsoft import common as c
 from emulators.providers.microsoft import directory_support as s
+from emulators.providers.microsoft import outlook_attachments as attachments_api
+from emulators.providers.microsoft import outlook_payloads as payloads
 from emulators.providers.microsoft.mail_seed import ensure_folder, folder_id, message_shape
 from emulators.world import documents
 
@@ -53,6 +55,7 @@ def shape(request: Request, record: dict[str, Any]) -> dict[str, Any]:
     result = s.clean(record)
     if "body" in result and 'outlook.body-content-type="text"' in request.headers.get("prefer", "").lower():
         result["body"] = {"contentType": "text", "content": s.text_body(result["body"]["content"])}
+        c.preference_applied(request, 'outlook.body-content-type="text"')
     return result
 
 
@@ -136,6 +139,8 @@ async def changed(ctx: ProviderContext, record: dict[str, Any], change_type: str
 
 
 def draft(ctx: ProviderContext, owner: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
+    body = payloads.message(body)
+    attachment_items = [attachments_api.create(ctx, item) for item in body.get("attachments", [])]
     uid = owner["id"]
     sender = {
         "emailAddress": {"name": owner["displayName"], "address": owner["mail"] or owner["userPrincipalName"]}
@@ -161,27 +166,14 @@ def draft(ctx: ProviderContext, owner: dict[str, Any], body: dict[str, Any]) -> 
     ):
         if key in body:
             record[key] = copy.deepcopy(body[key])
-    for attachment in body.get("attachments", []):
-        item = copy.deepcopy(attachment)
-        content = base64.b64decode(item.get("contentBytes", ""))
-        item.update(
-            {
-                "id": s.outlook_id(ctx),
-                "@odata.type": "#microsoft.graph.fileAttachment",
-                "size": len(content),
-                "isInline": item.get("isInline", False),
-                "lastModifiedDateTime": record["lastModifiedDateTime"],
-            }
-        )
-        item["_blob"] = ctx.store.blobs.put(content)
-        item.pop("contentBytes", None)
-        record["_attachments"].append(item)
-    record["hasAttachments"] = bool(record["_attachments"])
+    record["_attachments"] = attachment_items
+    record["hasAttachments"] = any(not item["isInline"] for item in attachment_items)
     ctx.store["mail_messages"].put(record)
     return record
 
 
 async def deliver(ctx: ProviderContext, record: dict[str, Any], save: bool = True) -> None:
+    payloads.message(record, sending=True)
     if record["isDraft"] and record.get("_published"):
         await changed(ctx, copy.deepcopy(record), "deleted")
     stamp = s.now(ctx)

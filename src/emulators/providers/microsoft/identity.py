@@ -30,7 +30,7 @@ def aad(ctx: ProviderContext, code: int, message: str, error: str = "invalid_gra
         f"AADSTS{code}: {message}\r\nTrace ID: {trace}\r\nCorrelation ID: {correlation}\r\nTimestamp: {stamp}"
     )
     return EmulatorError(
-        400,
+        401 if error == "invalid_client" else 400,
         {
             "error": error,
             "error_description": description,
@@ -40,6 +40,41 @@ def aad(ctx: ProviderContext, code: int, message: str, error: str = "invalid_gra
             "correlation_id": correlation,
             "error_uri": f"https://login.microsoftonline.com/error?code={code}",
         },
+    )
+
+
+DEFAULT_DELEGATED_SCOPES = (
+    "User.Read",
+    "User.Read.All",
+    "Group.Read.All",
+    "Mail.Read",
+    "Mail.ReadWrite",
+    "Mail.Send",
+    "Calendars.ReadWrite",
+    "Contacts.ReadWrite",
+    "Files.ReadWrite.All",
+    "OnlineMeetings.ReadWrite",
+)
+
+
+def canonical_scope(scope: str) -> str:
+    return scope.removeprefix("https://graph.microsoft.com/")
+
+
+def consented_scopes(ctx: ProviderContext, client_id: str, scopes: list[str]) -> list[str]:
+    result = []
+    for scope in scopes:
+        if canonical_scope(scope) == ".default":
+            client = ctx.tokens.client(client_id) or {}
+            result.extend(client.get("delegated_scopes", DEFAULT_DELEGATED_SCOPES))
+        else:
+            result.append(canonical_scope(scope))
+    return list(dict.fromkeys(result))
+
+
+def scope_subset(ctx: ProviderContext, client_id: str, requested: list[str], granted: list[str]) -> bool:
+    return set(consented_scopes(ctx, client_id, requested)).issubset(
+        consented_scopes(ctx, client_id, granted)
     )
 
 
@@ -124,7 +159,10 @@ def issue_tokens(
     nonce: str | None = None,
     audience: str = "https://graph.microsoft.com",
     include_client_info: bool = False,
+    refresh_scopes: list[str] | None = None,
 ) -> dict[str, Any]:
+    if not app_only:
+        scopes = consented_scopes(ctx, client_id, scopes)
     person = resolve_user(ctx, user) if not app_only else None
     timestamp = ctx.clock.timestamp()
     oid = (
@@ -187,9 +225,12 @@ def issue_tokens(
         "ext_expires_in": expires_in,
         "access_token": token,
     }
-    if "offline_access" in scopes and person:
+    if app_only:
+        response.pop("scope", None)
+    rotation_scopes = refresh_scopes if refresh_scopes is not None else scopes
+    if "offline_access" in rotation_scopes and person:
         response["refresh_token"] = ctx.tokens.issue_refresh(
-            client_id=client_id, user_id=person.id, scopes=scopes, nonce=nonce
+            client_id=client_id, user_id=person.id, scopes=rotation_scopes, nonce=nonce
         ).token
     if "openid" in scopes and person:
         response["id_token"] = id_token(ctx, person, client_id, nonce, access_token=token)
@@ -232,6 +273,22 @@ async def form(request: Request) -> dict[str, str]:
 
 
 def register(app: FastAPI, ctx: ProviderContext) -> None:
+    @app.api_route("/oidc/userinfo", methods=["GET", "POST"])
+    async def userinfo(request: Request) -> dict[str, Any]:
+        caller = c.principal(request, ctx)
+        uid = c.me_user_id(caller)
+        user = ctx.store["users"].get(uid)
+        if user is None:
+            raise c.not_found(uid)
+        return {
+            "sub": c.object_id(ctx.world, caller.person_id, caller.client_id),
+            "name": user["displayName"],
+            "family_name": user["surname"],
+            "given_name": user["givenName"],
+            "email": user["mail"] or user["userPrincipalName"],
+            "picture": f"{external_base(request)}/v1.0/me/photo/$value",
+        }
+
     @app.get("/common/discovery/instance")
     async def instance(request: Request) -> dict[str, Any]:
         endpoint = request.query_params.get("authorization_endpoint", "")
@@ -399,7 +456,7 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
                 "used": False,
             }
         )
-        return {
+        result = {
             "device_code": code,
             "user_code": user_code,
             "verification_uri": "https://microsoft.com/devicelogin",
@@ -407,6 +464,9 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
             "interval": 5,
             "message": f"To sign in, open https://microsoft.com/devicelogin and enter the code {user_code}.",
         }
+        if "/v2.0/" not in request.url.path:
+            result["verification_url"] = result.pop("verification_uri")
+        return result
 
     @app.post("/{tenant}/oauth2/v2.0/token")
     @app.post("/{tenant}/oauth2/token")
@@ -431,13 +491,19 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
                         raise ValueError
                 except (jwt.PyJWTError, ValueError, TypeError):
                     raise aad(ctx, 700027, "Client assertion is invalid.", "invalid_client") from None
-            ctx.tokens.authenticate_client(client_id, client_secret, require_secret=False)
+            ctx.tokens.authenticate_client(
+                client_id,
+                client_secret,
+                require_secret=data.get("grant_type") == "client_credentials"
+                and not data.get("client_assertion"),
+            )
             client_id = str(client_id)
             scopes = data.get("scope", "").split()
             kind = data.get("grant_type")
             nonce = None
             user = None
             app_only = kind == "client_credentials"
+            refresh_scopes = None
             if kind == "authorization_code":
                 existing = ctx.tokens.resolve(data.get("code"), "code")
                 if existing and existing.redirect_uri != data.get("redirect_uri"):
@@ -452,7 +518,7 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
                 )
                 user, nonce = grant.user_id, grant.nonce
                 scopes = scopes or grant.scopes
-                if not set(scopes).issubset(set(grant.scopes)):
+                if not scope_subset(ctx, client_id, scopes, grant.scopes):
                     raise aad(ctx, 70011, "The requested scope is invalid.", "invalid_scope")
             elif kind == "refresh_token":
                 grant = ctx.tokens.resolve(data.get("refresh_token"), "refresh")
@@ -460,11 +526,19 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
                     raise aad(ctx, 70008, "The provided authorization code or refresh token has expired.")
                 user, nonce = grant.user_id, grant.nonce
                 scopes = scopes or grant.scopes
-                if not set(scopes).issubset(set(grant.scopes)):
+                if not scope_subset(ctx, client_id, scopes, grant.scopes):
                     raise aad(ctx, 70011, "The requested scope is invalid.", "invalid_scope")
+                refresh_scopes = grant.scopes
             elif kind == "password":
                 user = resolve_user(ctx, data.get("username")).id
             elif kind == "client_credentials":
+                if "/v2.0/" in request.url.path and not scopes:
+                    raise aad(
+                        ctx,
+                        90014,
+                        "The request body must contain the following parameter: 'scope'.",
+                        "invalid_request",
+                    )
                 if scopes and not all(s.endswith("/.default") for s in scopes):
                     raise aad(
                         ctx,
@@ -498,6 +572,7 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
                 nonce=nonce,
                 audience=data.get("resource", "https://graph.microsoft.com"),
                 include_client_info=data.get("client_info") == "1",
+                refresh_scopes=refresh_scopes,
             )
             if "/v2.0/" not in request.url.path:
                 response.update(
@@ -505,6 +580,8 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
                         "resource": data.get("resource", "https://graph.microsoft.com"),
                         "expires_on": str(ctx.clock.timestamp() + 3600),
                         "not_before": str(ctx.clock.timestamp()),
+                        "expires_in": str(response["expires_in"]),
+                        "ext_expires_in": str(response["ext_expires_in"]),
                     }
                 )
             return JSONResponse(response, headers={"Cache-Control": "no-store", "Pragma": "no-cache"})
