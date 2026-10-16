@@ -176,3 +176,14 @@ def meet_transcript_doc_id(world: World, meeting_id: str) -> str:
 def meet_artifact_name(meeting: Meeting, what: str) -> str:
     """Drive file names Meet uses, e.g. ``Weekly sync (2026-10-14 10:02 GMT-4) - Recording``."""
     return f"{meeting.title} ({meeting.start:%Y-%m-%d %H:%M} GMT) - {what}"
+
+
+async def json_object(request: Request, *, legacy: bool = True) -> dict[str, Any]:
+    """Reject malformed JSON before resource code can accidentally produce a 500."""
+    try:
+        value = await request.json()
+        if not isinstance(value, dict):
+            raise ValueError("Expected an object")
+        return value
+    except ValueError as exc:
+        raise google_error(400, "Invalid JSON payload received.", reason="badRequest", legacy=legacy) from exc

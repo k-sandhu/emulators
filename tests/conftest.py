@@ -28,6 +28,14 @@ from emulators.core.hub import EmulatorHub
 ANCHOR = "2026-10-16"
 # Pin the world for the plugin's session hub (emulator_server / emulator_intercept) too.
 os.environ.setdefault("EMULATORS_ANCHOR", ANCHOR)
+if os.name == "nt":
+    # A stale, ACL-locked %TEMP%/pytest-of-<user> breaks tmp_path on some Windows machines.
+    import tempfile
+    from pathlib import Path
+
+    _root = Path(tempfile.gettempdir()) / "emulators-pytest"
+    _root.mkdir(exist_ok=True)
+    os.environ.setdefault("PYTEST_DEBUG_TEMPROOT", str(_root))
 
 
 @lru_cache(maxsize=32)

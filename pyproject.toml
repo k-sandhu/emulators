@@ -95,5 +95,6 @@ addopts = "-ra --strict-markers -p no:cacheprovider --import-mode=importlib"
 markers = [
     "sdk: drives an official vendor SDK against the emulator (needs the 'sdk' dependency group)",
     "slow: long-running end-to-end scenario",
+    "e2e: replays a consumer product's real call sequence across one or more providers",
 ]
 filterwarnings = ["ignore::DeprecationWarning"]
