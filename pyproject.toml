@@ -1,0 +1,99 @@
+[project]
+name = "emulators"
+version = "0.1.0"
+description = "High-fidelity local emulators of SaaS APIs (Microsoft Graph, Google Workspace, Box, Dropbox, Stripe, Twilio, WhatsApp, Messenger, Salesforce, QuickBooks, Zoom, Slack) for realistic integration testing."
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+authors = [{ name = "k-sandhu" }]
+keywords = ["emulator", "mock", "integration-testing", "microsoft-graph", "google-drive", "stripe", "twilio", "zoom"]
+classifiers = [
+    "Framework :: FastAPI",
+    "Framework :: Pytest",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Testing :: Mocking",
+]
+# Deliberately loose lower bounds: consumers install this as a test dependency next to
+# their own pinned FastAPI/httpx (lumen-copilot pins httpx 0.27, fastapi 0.115).
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+    "httpx>=0.27",
+    "pyjwt[crypto]>=2.8",
+    "cryptography>=42",
+    "python-multipart>=0.0.9",
+    # zoneinfo needs an IANA database; Windows has none built in.
+    "tzdata>=2024.1",
+]
+
+[project.optional-dependencies]
+# ``requests``-based SDKs (stripe, twilio, dropbox, simple-salesforce) are intercepted when present.
+requests = ["requests>=2.31"]
+
+[project.scripts]
+emulators = "emulators.cli:main"
+
+[project.entry-points.pytest11]
+emulators = "emulators.testing.pytest_plugin"
+
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/emulators"]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.12",
+    "pytest>=8.4",
+    "pytest-asyncio>=1.1",
+    "requests>=2.32",
+    # File-format validators: generated seed documents must open in real parsers.
+    "pypdf>=5.9",
+    "openpyxl>=3.1",
+    "python-docx>=1.1",
+    "python-pptx>=1.0",
+]
+# Official vendor SDKs used only by the contract suites in tests/sdk: if the real SDK
+# can talk to the emulator, the wire signatures match.
+sdk = [
+    "stripe>=12",
+    "twilio>=9",
+    "dropbox>=12",
+    "box-sdk-gen>=1.10",
+    "google-api-python-client>=2.150",
+    "google-auth>=2.35",
+    "msal>=1.31",
+    "simple-salesforce>=1.12",
+    "slack-sdk>=3.33",
+    "python-quickbooks>=0.9",
+    "intuit-oauth>=1.2",
+]
+
+[tool.uv]
+default-groups = ["dev", "sdk"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py312"
+extend-exclude = ["*.md"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC", "SIM", "RUF"]
+ignore = ["E501", "RUF012", "B008", "SIM105", "RUF001", "RUF002", "RUF003"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["emulators"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+addopts = "-ra --strict-markers -p no:cacheprovider --import-mode=importlib"
+markers = [
+    "sdk: drives an official vendor SDK against the emulator (needs the 'sdk' dependency group)",
+    "slow: long-running end-to-end scenario",
+]
+filterwarnings = ["ignore::DeprecationWarning"]
