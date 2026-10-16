@@ -10,7 +10,7 @@ from fastapi.responses import JSONResponse, Response
 
 from emulators.providers.twilio.common import (
     CONVERSATIONS_HOST,
-    creds,
+    AuthInfo,
     fail,
     form_params,
     get_param,
@@ -37,19 +37,59 @@ if TYPE_CHECKING:
 Record = dict[str, Any]
 
 
-def _conv_or_404(ctx: ProviderContext, key: str) -> Record:
+def _conv_or_404(ctx: ProviderContext, auth: AuthInfo, key: str) -> Record:
+    """A conversation by SID or UniqueName, visible only to the account that owns it."""
     store = ctx.store.collection("conversations")
     record = store.get(key)
     if record is None:
-        record = store.first(unique_name=key)
-    if record is None:
+        record = store.first(unique_name=key, account_sid=auth.account_sid)
+    if record is None or record["account_sid"] != auth.account_sid:
         raise not_found(f"/v1/Conversations/{key}")
     return record
 
 
-def build_conversation(ctx: ProviderContext, params: dict[str, str], sid_: str | None = None) -> Record:
+_STATES = ("active", "inactive", "closed")
+
+
+def _json_attributes(value: str | None) -> str:
+    """``Attributes`` is a JSON *string*; Twilio rejects anything that is not a JSON object."""
+    if value is None or value == "":
+        return "{}"
+    try:
+        parsed = json.loads(value)
+    except ValueError:
+        raise fail(400, 50057, "Attributes must be a valid JSON string.") from None
+    if not isinstance(parsed, dict):
+        raise fail(400, 50057, "Attributes must be a JSON object.")
+    return value
+
+
+def _state(value: str | None, default: str = "active") -> str:
+    state = (value or default).lower()
+    if state not in _STATES:
+        raise fail(400, 50057, f"Invalid State: {value}. Must be one of active, inactive, closed.")
+    return state
+
+
+def _delivery_summary(non_chat: int, sent: bool = True) -> dict[str, Any] | None:
+    """Twilio's per-message delivery summary: counts for *non-chat* recipients, ``all/some/none``."""
+    if non_chat == 0:
+        return None
+    mark = "all" if sent else "none"
+    return {
+        "total": non_chat,
+        "sent": mark,
+        "delivered": mark,
+        "read": "none",
+        "failed": "none",
+        "undelivered": "none",
+    }
+
+
+def build_conversation(
+    ctx: ProviderContext, params: dict[str, str], account: str, sid_: str | None = None
+) -> Record:
     now = ctx.clock.now()
-    account = creds(ctx)["account_sid"]
     return {
         "id": sid_ or new_sid(ctx, "CH", "conversations"),
         "sid": sid_ or "",
@@ -57,11 +97,11 @@ def build_conversation(ctx: ProviderContext, params: dict[str, str], sid_: str |
         "chat_service_sid": ctx.store.meta.get("chat_service_sid", ""),
         "friendly_name": get_param(params, "FriendlyName"),
         "unique_name": get_param(params, "UniqueName"),
-        "attributes": get_param(params, "Attributes") or "{}",
+        "attributes": _json_attributes(param_value(params, "Attributes")),
         "messaging_service_sid": get_param(params, "MessagingServiceSid"),
         "date_created": iso8601(now),
         "date_updated": iso8601(now),
-        "state": (get_param(params, "State") or "active").lower(),
+        "state": _state(get_param(params, "State")),
         "timers": {"date_inactive": None, "date_closed": None},
         "bindings": {},
         "_account": account,
@@ -69,53 +109,68 @@ def build_conversation(ctx: ProviderContext, params: dict[str, str], sid_: str |
 
 
 def register(app: FastAPI, ctx: ProviderContext) -> None:
-    account_sid = creds(ctx)["account_sid"]
 
     @app.get("/v1/Conversations")
     async def list_conversations(request: Request) -> Any:
-        require_auth(request, ctx)
-        rows = [render_conversation(c, request, ctx) for c in ctx.store.collection("conversations").values()]
+        auth = require_auth(request, ctx)
+        records = [
+            c for c in ctx.store.collection("conversations").values() if c["account_sid"] == auth.account_sid
+        ]
+        wanted = request.query_params.get("State")
+        if wanted:
+            records = [c for c in records if c["state"] == wanted.lower()]
+        rows = [render_conversation(c, request, ctx) for c in records]
         return page_meta(request, ctx, CONVERSATIONS_HOST, "conversations", rows, "/v1/Conversations")
 
     @app.post("/v1/Conversations")
     async def create_conversation(request: Request) -> Response:
-        require_auth(request, ctx)
+        auth = require_auth(request, ctx)
         params, _ = await form_params(request)
         unique = get_param(params, "UniqueName")
         if unique and ctx.store.collection("conversations").first(unique_name=unique) is not None:
-            raise fail(400, 50412, "A Conversation with this UniqueName already exists.")
-        record = build_conversation(ctx, params)
+            raise fail(409, 50353, "Conversation with provided unique name already exists")
+        record = build_conversation(ctx, params, auth.account_sid)
         record["sid"] = record["id"]
         ctx.store.collection("conversations").put(record)
         return JSONResponse(render_conversation(record, request, ctx), status_code=201)
 
     @app.get("/v1/Conversations/{sid}")
     async def get_conversation(request: Request, sid: str) -> Any:
-        require_auth(request, ctx)
-        return render_conversation(_conv_or_404(ctx, sid), request, ctx)
+        auth = require_auth(request, ctx)
+        return render_conversation(_conv_or_404(ctx, auth, sid), request, ctx)
 
     @app.post("/v1/Conversations/{sid}")
     async def update_conversation(request: Request, sid: str) -> Any:
-        require_auth(request, ctx)
-        record = _conv_or_404(ctx, sid)
+        auth = require_auth(request, ctx)
+        record = _conv_or_404(ctx, auth, sid)
         params, _ = await form_params(request)
+        unique = get_param(params, "UniqueName")
+        taken = unique and ctx.store.collection("conversations").first(unique_name=unique)
+        if unique and unique != record.get("unique_name") and taken is not None:
+            raise fail(409, 50353, "Conversation with provided unique name already exists")
+        updates: dict[str, Any] = {}
         for pascal, snake in (
             ("FriendlyName", "friendly_name"),
             ("UniqueName", "unique_name"),
-            ("Attributes", "attributes"),
             ("MessagingServiceSid", "messaging_service_sid"),
-            ("State", "state"),
         ):
             value = param_value(params, pascal)
             if value is not None:
-                record[snake] = value or None
+                updates[snake] = value or None
+        attrs = param_value(params, "Attributes")
+        if attrs is not None:
+            updates["attributes"] = _json_attributes(attrs)
+        state = param_value(params, "State")
+        if state:
+            updates["state"] = _state(state)
+        record.update(updates)
         touch(record, ctx.clock.now(), rfc=False)
         return render_conversation(record, request, ctx)
 
     @app.delete("/v1/Conversations/{sid}")
     async def delete_conversation(request: Request, sid: str) -> Response:
-        require_auth(request, ctx)
-        record = _conv_or_404(ctx, sid)
+        auth = require_auth(request, ctx)
+        record = _conv_or_404(ctx, auth, sid)
         ctx.store.collection("conversations").delete(record["sid"])
         for coll in ("conv_participants", "conv_messages"):
             store = ctx.store.collection(coll)
@@ -126,8 +181,8 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
     # -- participants ------------------------------------------------------------
     @app.get("/v1/Conversations/{sid}/Participants")
     async def list_participants(request: Request, sid: str) -> Any:
-        require_auth(request, ctx)
-        conv = _conv_or_404(ctx, sid)
+        auth = require_auth(request, ctx)
+        conv = _conv_or_404(ctx, auth, sid)
         rows = [
             render_participant(p, request, ctx)
             for p in ctx.store.collection("conv_participants").values()
@@ -144,22 +199,36 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
 
     @app.post("/v1/Conversations/{sid}/Participants")
     async def add_participant(request: Request, sid: str) -> Response:
-        require_auth(request, ctx)
-        conv = _conv_or_404(ctx, sid)
+        auth = require_auth(request, ctx)
+        conv = _conv_or_404(ctx, auth, sid)
         params, _ = await form_params(request)
         identity = get_param(params, "Identity")
         address = get_param(params, "MessagingBinding.Address")
         proxy = get_param(params, "MessagingBinding.ProxyAddress")
         if not identity and not address:
             raise fail(400, 50400, "Identity or MessagingBinding.Address is required.")
+        siblings = [
+            p
+            for p in ctx.store.collection("conv_participants").values()
+            if p["conversation_sid"] == conv["sid"]
+        ]
+        if address and any((p.get("messaging_binding") or {}).get("address") == address for p in siblings):
+            raise fail(
+                409,
+                50416,
+                "A participant with the same messaging binding already exists in this Conversation.",
+            )
+        if identity and any(p.get("identity") == identity for p in siblings):
+            raise fail(409, 50433, "A participant with this Identity already exists in this Conversation.")
         now = ctx.clock.now()
         record: Record = {
             "id": new_sid(ctx, "MB", "participants"),
             "sid": "",
-            "account_sid": account_sid,
+            "account_sid": auth.account_sid,
+            "chat_service_sid": conv["chat_service_sid"],
             "conversation_sid": conv["sid"],
             "identity": identity,
-            "attributes": get_param(params, "Attributes") or "{}",
+            "attributes": _json_attributes(param_value(params, "Attributes")),
             "messaging_binding": _binding(address, proxy) if address else None,
             "role_sid": get_param(params, "RoleSid") or ctx.store.meta.get("participant_role_sid", ""),
             "date_created": iso8601(now),
@@ -173,8 +242,8 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
 
     @app.get("/v1/Conversations/{sid}/Participants/{participant_sid}")
     async def get_participant(request: Request, sid: str, participant_sid: str) -> Any:
-        require_auth(request, ctx)
-        conv = _conv_or_404(ctx, sid)
+        auth = require_auth(request, ctx)
+        conv = _conv_or_404(ctx, auth, sid)
         record = ctx.store.collection("conv_participants").get(participant_sid)
         if record is None or record["conversation_sid"] != conv["sid"]:
             raise not_found(f"/v1/Conversations/{conv['sid']}/Participants/{participant_sid}")
@@ -182,8 +251,8 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
 
     @app.post("/v1/Conversations/{sid}/Participants/{participant_sid}")
     async def update_participant(request: Request, sid: str, participant_sid: str) -> Any:
-        require_auth(request, ctx)
-        conv = _conv_or_404(ctx, sid)
+        auth = require_auth(request, ctx)
+        conv = _conv_or_404(ctx, auth, sid)
         record = ctx.store.collection("conv_participants").get(participant_sid)
         if record is None or record["conversation_sid"] != conv["sid"]:
             raise not_found(f"/v1/Conversations/{conv['sid']}/Participants/{participant_sid}")
@@ -193,7 +262,7 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
             record["last_read_message_index"] = parse_int(index, 0)
         attrs = param_value(params, "Attributes")
         if attrs is not None:
-            record["attributes"] = attrs
+            record["attributes"] = _json_attributes(attrs)
         role = param_value(params, "RoleSid")
         if role is not None:
             record["role_sid"] = role
@@ -202,8 +271,8 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
 
     @app.delete("/v1/Conversations/{sid}/Participants/{participant_sid}")
     async def delete_participant(request: Request, sid: str, participant_sid: str) -> Response:
-        require_auth(request, ctx)
-        conv = _conv_or_404(ctx, sid)
+        auth = require_auth(request, ctx)
+        conv = _conv_or_404(ctx, auth, sid)
         record = ctx.store.collection("conv_participants").get(participant_sid)
         if record is None or record["conversation_sid"] != conv["sid"]:
             raise not_found(f"/v1/Conversations/{conv['sid']}/Participants/{participant_sid}")
@@ -213,12 +282,13 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
     # -- messages ------------------------------------------------------------------
     @app.get("/v1/Conversations/{sid}/Messages")
     async def list_conv_messages(request: Request, sid: str) -> Any:
-        require_auth(request, ctx)
-        conv = _conv_or_404(ctx, sid)
+        auth = require_auth(request, ctx)
+        conv = _conv_or_404(ctx, auth, sid)
         records = [
             m for m in ctx.store.collection("conv_messages").values() if m["conversation_sid"] == conv["sid"]
         ]
-        records.sort(key=lambda m: m["index"])
+        descending = (request.query_params.get("Order") or "asc").lower() == "desc"
+        records.sort(key=lambda m: m["index"], reverse=descending)
         rows = [render_conv_message(m, request, ctx) for m in records]
         return page_meta(
             request, ctx, CONVERSATIONS_HOST, "messages", rows, f"/v1/Conversations/{conv['sid']}/Messages"
@@ -226,8 +296,8 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
 
     @app.post("/v1/Conversations/{sid}/Messages")
     async def create_conv_message(request: Request, sid: str) -> Response:
-        require_auth(request, ctx)
-        conv = _conv_or_404(ctx, sid)
+        auth = require_auth(request, ctx)
+        conv = _conv_or_404(ctx, auth, sid)
         params, _ = await form_params(request)
         body = param_value(params, "Body")
         author = get_param(params, "Author") or "system"
@@ -247,28 +317,25 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         existing = [
             m for m in ctx.store.collection("conv_messages").values() if m["conversation_sid"] == conv["sid"]
         ]
-        index = max((m["index"] for m in existing), default=-1) + 1
+        # Indexes are never reused, even after the newest message was deleted.
+        index = max(conv.get("_next_index", 0), max((m["index"] for m in existing), default=-1) + 1)
+        conv["_next_index"] = index + 1
+        non_chat = sum(1 for p in participants if p.get("messaging_binding"))
         now = ctx.clock.now()
         record: Record = {
             "id": new_sid(ctx, "IM", "conv_messages"),
             "sid": "",
-            "account_sid": account_sid,
+            "account_sid": auth.account_sid,
+            "chat_service_sid": conv["chat_service_sid"],
             "conversation_sid": conv["sid"],
             "author": author,
             "body": body,
-            "attributes": get_param(params, "Attributes") or "{}",
+            "attributes": _json_attributes(param_value(params, "Attributes")),
             "participant_sid": participant["sid"] if participant else None,
             "media": None,
             "content_sid": get_param(params, "ContentSid"),
             "index": index,
-            "delivery": {
-                "total": len(participants),
-                "sent": 0,
-                "delivered": 0,
-                "read": 0,
-                "failed": 0,
-                "undelivered": 0,
-            },
+            "delivery": _delivery_summary(non_chat),
             "date_created": iso8601(now),
             "date_updated": iso8601(now),
         }
@@ -279,8 +346,8 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
 
     @app.get("/v1/Conversations/{sid}/Messages/{message_sid}")
     async def get_conv_message(request: Request, sid: str, message_sid: str) -> Any:
-        require_auth(request, ctx)
-        conv = _conv_or_404(ctx, sid)
+        auth = require_auth(request, ctx)
+        conv = _conv_or_404(ctx, auth, sid)
         record = ctx.store.collection("conv_messages").get(message_sid)
         if record is None or record["conversation_sid"] != conv["sid"]:
             raise not_found(f"/v1/Conversations/{conv['sid']}/Messages/{message_sid}")
@@ -288,8 +355,8 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
 
     @app.post("/v1/Conversations/{sid}/Messages/{message_sid}")
     async def update_conv_message(request: Request, sid: str, message_sid: str) -> Any:
-        require_auth(request, ctx)
-        conv = _conv_or_404(ctx, sid)
+        auth = require_auth(request, ctx)
+        conv = _conv_or_404(ctx, auth, sid)
         record = ctx.store.collection("conv_messages").get(message_sid)
         if record is None or record["conversation_sid"] != conv["sid"]:
             raise not_found(f"/v1/Conversations/{conv['sid']}/Messages/{message_sid}")
@@ -299,18 +366,14 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
             record["body"] = body
         attrs = param_value(params, "Attributes")
         if attrs is not None:
-            try:
-                json.loads(attrs)
-            except ValueError:
-                raise fail(400, 50400, "Attributes must be valid JSON.") from None
-            record["attributes"] = attrs
+            record["attributes"] = _json_attributes(attrs)
         touch(record, ctx.clock.now(), rfc=False)
         return render_conv_message(record, request, ctx)
 
     @app.delete("/v1/Conversations/{sid}/Messages/{message_sid}")
     async def delete_conv_message(request: Request, sid: str, message_sid: str) -> Response:
-        require_auth(request, ctx)
-        conv = _conv_or_404(ctx, sid)
+        auth = require_auth(request, ctx)
+        conv = _conv_or_404(ctx, auth, sid)
         record = ctx.store.collection("conv_messages").get(message_sid)
         if record is None or record["conversation_sid"] != conv["sid"]:
             raise not_found(f"/v1/Conversations/{conv['sid']}/Messages/{message_sid}")

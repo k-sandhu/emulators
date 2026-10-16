@@ -122,7 +122,7 @@ async def test_magic_valid_from(twilio: httpx.AsyncClient) -> None:
 
 async def test_create_validation(twilio: httpx.AsyncClient) -> None:
     r = await twilio.post(messages_url(twilio), data={"From": FROM_NUMBER, "Body": "x"})
-    assert r.status_code == 400 and r.json()["code"] == 21601
+    assert r.status_code == 400 and r.json()["code"] == 21604
     r = await twilio.post(messages_url(twilio), data={"To": CONTACT, "Body": "x"})
     assert r.status_code == 400 and r.json()["code"] == 21603
     r = await twilio.post(messages_url(twilio), data={"To": CONTACT, "From": FROM_NUMBER})

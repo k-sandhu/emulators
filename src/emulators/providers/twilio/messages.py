@@ -12,7 +12,7 @@ from __future__ import annotations
 import asyncio
 import re
 import xml.etree.ElementTree as ET
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
@@ -20,6 +20,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 
 from emulators.core.clock import isoformat_z, parse_instant, utc
+from emulators.core.provider import ctx_url_for_host
 from emulators.providers.twilio.common import (
     API_HOST,
     API_VERSION,
@@ -29,7 +30,9 @@ from emulators.providers.twilio.common import (
     MAGIC_TO_ERRORS,
     OPT_IN_WORDS,
     OPT_OUT_WORDS,
+    WHATSAPP_SANDBOX,
     absolute,
+    auto_advance,
     bare_number,
     check_account,
     creds,
@@ -38,15 +41,20 @@ from emulators.providers.twilio.common import (
     form_params,
     geo_for,
     get_param,
+    newest_first,
     not_found,
     num_segments,
     page_2010,
     param_value,
+    payload_text,
     require_auth,
     rfc2822,
+    spawn,
     split_address,
     valid_e164,
+    valid_url,
 )
+from emulators.providers.twilio.payloads import render_for_content_type
 from emulators.providers.twilio.shapes import build_media, build_message, render_media, render_message, touch
 
 if TYPE_CHECKING:
@@ -55,6 +63,17 @@ if TYPE_CHECKING:
 Record = dict[str, Any]
 
 _CHAIN = ["queued", "sending", "sent", "delivered"]
+_ADVANCE_TARGETS = ("queued", "sending", "sent", "delivered", "undelivered", "failed", "canceled", "read")
+# Which statuses a message may be pushed to from each status (Twilio never moves backwards).
+_TRANSITIONS: dict[str, tuple[str, ...]] = {
+    # "Send now" for a scheduled message: release it, or push it straight through.
+    "scheduled": ("queued", "sending", "sent", "delivered", "undelivered", "failed", "canceled"),
+    "accepted": ("sending", "sent", "delivered", "undelivered", "failed"),
+    "queued": ("sending", "sent", "delivered", "undelivered", "failed"),
+    "sending": ("sent", "delivered", "undelivered", "failed"),
+    "sent": ("delivered", "undelivered", "failed", "read"),
+    "delivered": ("read",),
+}
 _CONTENT_TYPES = {
     ".png": "image/png",
     ".jpg": "image/jpeg",
@@ -138,9 +157,7 @@ async def _fire_status_callback(ctx: ProviderContext, record: Record) -> None:
         service = ctx.store.collection("messaging_services").get(record["messaging_service_sid"])
         url = service.get("status_callback") if service else None
     if not url:
-        number = numbers_by_phone(ctx).get(bare_number(record["from"] or ""))
-        url = number.get("status_callback") if number else None
-    if not url:
+        # An IncomingPhoneNumber's StatusCallback is for *voice* calls, so it never applies here.
         return
     params = {
         "MessageSid": record["sid"],
@@ -154,12 +171,18 @@ async def _fire_status_callback(ctx: ProviderContext, record: Record) -> None:
     }
     if record.get("messaging_service_sid"):
         params["MessagingServiceSid"] = record["messaging_service_sid"]
+    if split_address(record["to"])[0] == "whatsapp":
+        params["ChannelToAddress"] = bare_number(record["to"])
+        params["ChannelPrefix"] = "whatsapp"
     if record["status"] in ("delivered", "undelivered"):
         params["RawDlrDoneDate"] = utc(_now(ctx)).strftime("%y%m%d%H%M")
     if record.get("error_code") is not None:
         params["ErrorCode"] = str(record["error_code"])
     await deliver_form(
-        ctx, url, params, event_type="message.status", method=record.get("_status_callback_method") or "POST"
+        ctx,
+        url,
+        params,
+        event_type="message.status",  # Message callbacks are always POSTs
     )
 
 
@@ -170,13 +193,12 @@ def _apply_status(ctx: ProviderContext, record: Record, status: str) -> None:
     if status in ("sent", "delivered", "undelivered", "failed") and not record.get("_sent"):
         record["_sent"] = isoformat_z(now)
         record["date_sent"] = rfc2822(now)
-    if status in ("delivered", "undelivered", "failed"):
+    if status in ("delivered", "undelivered", "read"):  # failed messages are not billed
         segments = max(1, int(record.get("num_segments") or 1))
         record["price"] = f"-{0.0079 * segments:.5f}"
     if status in ("undelivered", "failed") and record.get("error_code") is None:
-        failure = _failure_for(record)
-        if failure:
-            record["error_code"], record["error_message"] = failure
+        # Twilio always attaches an error code to messages that did not reach the handset.
+        record["error_code"], record["error_message"] = _failure_for(record) or (30008, "Unknown error")
 
 
 async def advance_message(ctx: ProviderContext, record: Record, to_status: str | None = None) -> Record:
@@ -212,6 +234,8 @@ async def advance_message(ctx: ProviderContext, record: Record, to_status: str |
 
 
 async def maybe_advance(ctx: ProviderContext, record: Record) -> None:
+    if not auto_advance(ctx):
+        return  # EMULATORS_TWILIO_AUTO_ADVANCE=0: tests drive the message with advance_message
     mode = ctx.webhooks.mode
     if mode in ("sync", "manual"):
         await advance_message(ctx, record)
@@ -221,10 +245,35 @@ async def maybe_advance(ctx: ProviderContext, record: Record) -> None:
             await asyncio.sleep(0.05)
             await advance_message(ctx, record)
 
-        asyncio.get_running_loop().create_task(_delayed())
+        spawn(ctx, _delayed())
 
 
 # -- outbound creation -------------------------------------------------------------
+
+
+_SEND_AT_MIN = timedelta(minutes=15)
+_SEND_AT_MAX = timedelta(days=35)
+_CONTENT_SID_RE = re.compile(r"^HX[0-9a-f]{32}$")
+_SUPPORTED_CHANNELS = ("sms", "whatsapp")
+
+
+def parse_send_at(ctx: ProviderContext, send_at: str, schedule_type: str | None) -> datetime:
+    """``SendAt`` must be ISO 8601, 15 minutes to 35 days ahead, with ``ScheduleType=fixed``."""
+    if schedule_type and schedule_type.lower() != "fixed":
+        raise fail(400, 35115, f"Invalid ScheduleType: {schedule_type}. The only supported value is 'fixed'.")
+    try:
+        when = parse_instant(send_at)
+    except ValueError:
+        raise fail(400, 35114, f"Invalid SendAt: {send_at}. SendAt must be an ISO 8601 timestamp.") from None
+    now = _now(ctx)
+    if when < now + _SEND_AT_MIN or when > now + _SEND_AT_MAX:
+        raise fail(
+            400,
+            35114,
+            "Invalid SendAt: the scheduled time must be more than 15 minutes and fewer than 35 days "
+            "in the future.",
+        )
+    return when
 
 
 def validate_send(
@@ -237,39 +286,57 @@ def validate_send(
     media_urls: list[str],
     messaging_service_sid: str | None,
     send_at: str | None,
-) -> tuple[str | None, Record | None]:
-    """Twilio's create-time validation; returns (resolved From, messaging service)."""
+    schedule_type: str | None = None,
+    content_sid: str | None = None,
+    status_callback: str | None = None,
+) -> tuple[str | None, Record | None, datetime | None]:
+    """Twilio's create-time validation; returns (resolved From, messaging service, send time)."""
     if not to:
-        raise fail(400, 21601, "A 'To' phone number is required.")
+        raise fail(400, 21604, "A 'To' phone number is required.")
     to_channel, to_bare = split_address(to)
     magic_to = MAGIC_TO_ERRORS.get(to_bare)
     if magic_to:
         code, template = magic_to
         raise fail(400, code, template.format(to=to_bare, from_=from_ or ""))
-    if not valid_e164(to_bare):
+    if to_channel not in _SUPPORTED_CHANNELS or not valid_e164(to_bare):
         raise fail(400, 21211, f"The 'To' number {to} is not a valid phone number.")
     if body is not None and len(body) > 1600:
         raise fail(400, 21617, "The concatenated message body exceeds the 1600 character limit.")
     if len(media_urls) > 10:
         raise fail(400, 21623, "The message has more than the maximum allowed 10 media attachments.")
-    if not body and not media_urls:
+    for url in media_urls:
+        if not valid_url(url):
+            raise fail(400, 21620, f"Invalid media URL(s): {url}")
+    if status_callback and not valid_url(status_callback):
+        raise fail(400, 21609, f"StatusCallback URL {status_callback} is not a valid URL.")
+    if content_sid and not _CONTENT_SID_RE.match(content_sid):
+        raise fail(400, 21655, f"Invalid ContentSid: {content_sid}")
+    if not body and not media_urls and not content_sid:
         raise fail(400, 21602, "A text message body or media urls are required.")
 
     service = None
     if messaging_service_sid:
         service = ctx.store.collection("messaging_services").get(messaging_service_sid)
-        if service is None:
+        if service is None or service["account_sid"] != account_sid:
             raise not_found(f"/v1/Services/{messaging_service_sid}")
     resolved_from = from_
     if from_:
-        _, from_bare = split_address(from_)
+        from_channel, from_bare = split_address(from_)
         magic_from = MAGIC_FROM_ERRORS.get(from_bare)
         if magic_from:
             code, template = magic_from
             raise fail(400, code, template.format(from_=from_bare, to=to_bare))
         owned = numbers_by_phone(ctx)
         is_alphanumeric = bool(re.fullmatch(r"[A-Za-z0-9 ]{1,11}", from_)) and not from_.startswith("+")
-        if from_bare != MAGIC_FROM_OK and from_bare not in owned and not is_alphanumeric:
+        if from_channel not in _SUPPORTED_CHANNELS:
+            raise fail(400, 21212, f"The 'From' number {from_} is not a valid phone number.")
+        if from_channel != to_channel:
+            raise fail(400, 21910, "Invalid From and To pair. From and To should be of the same channel.")
+        if from_channel == "whatsapp":
+            sender = owned.get(from_bare)
+            if from_bare != WHATSAPP_SANDBOX and (sender is None or not sender.get("_whatsapp")):
+                raise fail(400, 63007, "Twilio could not find a Channel with the specified From address.")
+        elif from_bare != MAGIC_FROM_OK and from_bare not in owned and not is_alphanumeric:
             raise fail(
                 400,
                 21606,
@@ -299,12 +366,15 @@ def validate_send(
             resolved_from = f"whatsapp:{resolved_from}"
     else:
         raise fail(400, 21603, "A 'From' phone number is required to send a message.")
-    if send_at and not messaging_service_sid:
-        raise fail(400, 21704, "Scheduling is only available when sending via a Messaging Service.")
+    scheduled_for: datetime | None = None
+    if send_at:
+        if not messaging_service_sid:
+            raise fail(400, 21704, "Scheduling is only available when sending via a Messaging Service.")
+        scheduled_for = parse_send_at(ctx, send_at, schedule_type)
     senders = [resolved_from or "", messaging_service_sid or ""]
     if opted_out(ctx, senders, to):
         raise fail(400, 21610, "The recipient has blocked messages from this number or has opted out.")
-    return resolved_from, service
+    return resolved_from, service, scheduled_for
 
 
 async def create_outbound(
@@ -319,6 +389,8 @@ async def create_outbound(
     status_callback: str | None = None,
     status_callback_method: str = "POST",
     send_at: str | None = None,
+    schedule_type: str | None = None,
+    content_sid: str | None = None,
     direction: str = "outbound-api",
     is_test: bool = False,
     validate: bool = True,
@@ -326,8 +398,9 @@ async def create_outbound(
 ) -> tuple[Record, Record]:
     """Create (and normally advance) an outbound message; returns (record, snapshot)."""
     media_urls = media_urls or []
+    scheduled_for: datetime | None = None
     if validate:
-        from_, _service = validate_send(
+        from_, _service, scheduled_for = validate_send(
             ctx,
             account_sid=account_sid,
             to=to,
@@ -336,11 +409,14 @@ async def create_outbound(
             media_urls=media_urls,
             messaging_service_sid=messaging_service_sid,
             send_at=send_at,
+            schedule_type=schedule_type,
+            content_sid=content_sid,
+            status_callback=status_callback,
         )
     prefix = "MM" if media_urls else "SM"
     sid_ = prefix + ctx.ids.hex(32)
     now = _now(ctx)
-    if send_at:
+    if scheduled_for:
         status = "scheduled"
     elif messaging_service_sid:
         status = "accepted"
@@ -361,7 +437,10 @@ async def create_outbound(
         status_callback_method=status_callback_method,
     )
     record["_test"] = is_test
-    record["_send_at"] = send_at
+    record["_send_at"] = isoformat_z(scheduled_for) if scheduled_for else None
+    if content_sid:
+        record["_content_sid"] = content_sid
+        record["num_segments"] = "1"
     ctx.store.collection("messages").put(record)
     for url in media_urls:
         media = build_media(
@@ -379,6 +458,22 @@ async def create_outbound(
     return record, snapshot
 
 
+async def tick_scheduled(ctx: ProviderContext) -> None:
+    """Release scheduled messages whose ``SendAt`` has passed on the emulator clock.
+
+    Twilio sends them at that time (``scheduled`` → ``queued`` → ``sent`` → ``delivered``); the
+    emulator has no background timer, so it checks whenever messages are read or listed, which is
+    what tests that advance ``POST /_emulator/clock`` observe.
+    """
+    now = _now(ctx)
+    for record in ctx.store.collection("messages").values():
+        send_at = record.get("_send_at")
+        if record["status"] == "scheduled" and send_at and parse_instant(send_at) <= now:
+            record["status"] = "queued"
+            touch(record, now)
+            await maybe_advance(ctx, record)
+
+
 # -- media content -----------------------------------------------------------------
 
 
@@ -394,15 +489,10 @@ def media_bytes(ctx: ProviderContext, media: Record) -> bytes:
         table = [list(row) for row in doc.table] if doc.table else None
         content, _mime = documents.render(doc.kind, doc.title, list(doc.paragraphs), table=table)
     else:
-        url = media.get("_source_url") or "media"
-        ctype = media.get("content_type") or ""
         seed = int(media["sid"][-6:], 16) % 100000
-        if ctype.startswith("image/"):
-            content = documents.make_png(320, 240, seed=seed)
-        elif ctype == "application/pdf":
-            content, _ = documents.render("pdf", "Attachment", [f"Media attachment received via {url}"])
-        else:
-            content, _ = documents.render("txt", "Attachment", [f"Media attachment received via {url}"])
+        content = render_for_content_type(
+            media.get("content_type") or "", media.get("_source_url") or "media", seed
+        )
     media["_blob"] = ctx.store.blobs.put(content)
     return content
 
@@ -413,7 +503,9 @@ def media_content_url(ctx: ProviderContext, media: Record, request: Request | No
     )
     if request is not None:
         return absolute(request, ctx, API_HOST, path)
-    return f"https://{API_HOST}{path}"
+    # No request (webhook parameters): follow however the emulator was last reached, so the URL
+    # works in host, prefix and per-port mode alike.
+    return ctx_url_for_host(ctx, API_HOST, path)
 
 
 # -- inbound simulation ------------------------------------------------------------
@@ -448,16 +540,88 @@ def _parse_twiml_replies(xml_text: str) -> list[dict[str, Any]]:
     return replies
 
 
+def _profile_name(ctx: ProviderContext, number: str) -> str:
+    for person in ctx.world.people:
+        if person.phone_mobile == number:
+            return person.display_name
+    return ""
+
+
+def _inbound_params(
+    ctx: ProviderContext,
+    payload: dict[str, Any],
+    sid_: str,
+    account_sid: str,
+    from_: str,
+    to: str,
+    body: str | None,
+    service: Record | None,
+    media_records: list[Record],
+) -> dict[str, str]:
+    """The form parameters Twilio POSTs to an SMS/WhatsApp webhook (the two channels differ)."""
+    channel, from_bare = split_address(from_)
+    if channel == "whatsapp":
+        params = {
+            "SmsMessageSid": sid_,
+            "NumMedia": str(len(media_records)),
+            "ProfileName": str(payload.get("profile_name") or _profile_name(ctx, from_bare)),
+            "MessageType": "image" if media_records else "text",
+            "SmsSid": sid_,
+            "WaId": from_bare.lstrip("+"),
+            "SmsStatus": "received",
+            "Body": body or "",
+            "To": to,
+            "NumSegments": "1",
+            "ReferralNumMedia": "0",
+            "MessageSid": sid_,
+            "AccountSid": account_sid,
+            "From": from_,
+            "ApiVersion": API_VERSION,
+        }
+    else:
+        from_city, from_state, from_country = geo_for(from_)
+        to_city, to_state, to_country = geo_for(to)
+        params = {
+            "ToCountry": to_country,
+            "ToState": to_state,
+            "SmsMessageSid": sid_,
+            "NumMedia": str(len(media_records)),
+            "ToCity": to_city,
+            "FromZip": "",
+            "SmsSid": sid_,
+            "FromState": from_state,
+            "SmsStatus": "received",
+            "FromCity": from_city,
+            "Body": body or "",
+            "FromCountry": from_country,
+            "To": to,
+            "ToZip": "",
+            "NumSegments": str(num_segments(body or "")),
+            "MessageSid": sid_,
+            "AccountSid": account_sid,
+            "From": from_,
+            "ApiVersion": API_VERSION,
+        }
+    if service is not None:
+        params["MessagingServiceSid"] = service["sid"]
+    for i, media in enumerate(media_records):
+        params[f"MediaContentType{i}"] = media["content_type"]
+        params[f"MediaSid{i}"] = media["sid"]
+        params[f"MediaUrl{i}"] = media_content_url(ctx, media)
+    return params
+
+
 async def simulate_inbound(ctx: ProviderContext, payload: dict[str, Any]) -> dict[str, Any]:
     """``POST /_emulator/actions/inbound_sms`` — see docs/providers/twilio.md."""
     c = creds(ctx)
     account_sid = c["account_sid"]
-    from_ = payload.get("from") or payload.get("From") or payload.get("from_")
-    to = payload.get("to") or payload.get("To")
-    body = payload.get("body") if payload.get("body") is not None else payload.get("Body", "")
-    media_urls = payload.get("media_urls") or payload.get("MediaUrls") or []
+    from_ = payload_text(payload, "from", "From", "from_")
+    to = payload_text(payload, "to", "To")
+    body = payload_text(payload, "body", "Body") or ""
+    raw_media = payload.get("media_urls") or payload.get("MediaUrls") or []
+    media_urls = [str(u) for u in raw_media] if isinstance(raw_media, list) else [str(raw_media)]
     if not from_ or not to:
-        raise fail(400, 21200, "inbound_sms requires 'from' and 'to'.")
+        raise fail(400, 20001, "inbound_sms requires 'from' and 'to'.")
     now = _now(ctx)
     sid_ = ("MM" if media_urls else "SM") + ctx.ids.hex(32)
     record = build_message(
@@ -545,39 +709,26 @@ async def simulate_inbound(ctx: ProviderContext, payload: dict[str, Any]) -> dic
     if not webhook_url:
         return result
 
-    from_city, from_state, from_country = geo_for(from_)
-    to_city, to_state, to_country = geo_for(to)
-    params = {
-        "ToCountry": to_country,
-        "ToState": to_state,
-        "SmsMessageSid": sid_,
-        "NumMedia": str(len(media_records)),
-        "ToCity": to_city,
-        "FromZip": "",
-        "SmsSid": sid_,
-        "FromState": from_state,
-        "SmsStatus": "received",
-        "FromCity": from_city,
-        "Body": body or "",
-        "FromCountry": from_country,
-        "To": to,
-        "ToZip": "",
-        "NumSegments": str(num_segments(body or "")),
-        "MessageSid": sid_,
-        "AccountSid": account_sid,
-        "From": from_,
-        "ApiVersion": API_VERSION,
-    }
-    if service is not None:
-        params["MessagingServiceSid"] = service["sid"]
-    for i, media in enumerate(media_records):
-        params[f"MediaContentType{i}"] = media["content_type"]
-        params[f"MediaSid{i}"] = media["sid"]
-        params[f"MediaUrl{i}"] = media_content_url(ctx, media)
+    params = _inbound_params(ctx, payload, sid_, account_sid, from_, to, body, service, media_records)
     delivery = await deliver_form(ctx, webhook_url, params, event_type="message.inbound", method=method)
     if ctx.webhooks.mode == "async":
         await ctx.webhooks.drain()
         delivery = ctx.webhooks.deliveries.get(delivery["id"]) or delivery
+    fallback_url = number.get("sms_fallback_url") if number is not None else None
+    if delivery.get("status") == "failed" and fallback_url and ctx.webhooks.mode != "manual":
+        # Twilio retries the request against the SmsFallbackUrl when the primary URL errors.
+        fallback_params = {**params, "ErrorCode": "11200", "ErrorUrl": webhook_url}
+        delivery = await deliver_form(
+            ctx,
+            fallback_url,
+            fallback_params,
+            event_type="message.inbound",
+            method=number.get("sms_fallback_method") or "POST",
+        )
+        if ctx.webhooks.mode == "async":
+            await ctx.webhooks.drain()
+            delivery = ctx.webhooks.deliveries.get(delivery["id"]) or delivery
+        webhook_url = fallback_url
     result["webhook"] = {
         "url": webhook_url,
         "status": delivery.get("status"),
@@ -614,21 +765,23 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
     @app.post(base + ".json")
     async def create_message(request: Request, account_sid: str) -> Response:
         auth = require_auth(request, ctx)
-        account = check_account(ctx, account_sid)
+        account = check_account(ctx, account_sid, request)
         params, multi = await form_params(request)
+        media_urls = [
+            u for u in (multi.get("MediaUrl") or multi.get("mediaurl") or [params.get("MediaUrl", "")]) if u
+        ]
         _record, snapshot = await create_outbound(
             ctx,
             account_sid=account,
             to=get_param(params, "To") or "",
             from_=get_param(params, "From"),
             body=param_value(params, "Body"),
-            media_urls=multi.get("MediaUrl")
-            or multi.get("mediaurl")
-            or ([params["MediaUrl"]] if params.get("MediaUrl") else []),
+            media_urls=media_urls,
             messaging_service_sid=get_param(params, "MessagingServiceSid"),
             status_callback=get_param(params, "StatusCallback"),
-            status_callback_method=get_param(params, "StatusCallbackMethod") or "POST",
             send_at=get_param(params, "SendAt"),
+            schedule_type=get_param(params, "ScheduleType"),
+            content_sid=get_param(params, "ContentSid"),
             is_test=auth.is_test,
         )
         if account_sid != account:
@@ -644,34 +797,36 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
     @app.get(base + ".json")
     async def list_messages(request: Request, account_sid: str) -> Any:
         require_auth(request, ctx)
-        account = check_account(ctx, account_sid)
+        account = check_account(ctx, account_sid, request)
+        await tick_scheduled(ctx)
         records = [m for m in ctx.store.collection("messages").values() if m.get("_account") == account]
         query = request.query_params
         if query.get("To"):
             records = [m for m in records if m["to"] == query["To"]]
         if query.get("From"):
             records = [m for m in records if m["from"] == query["From"]]
-        for key, op in (("DateSent", "eq"), ("DateSent<", "lt"), ("DateSent>", "gt")):
+        for key, op in (("DateSent", "eq"), ("DateSent<", "lte"), ("DateSent>", "gte")):
             raw = query.get(key)
             if not raw:
                 continue
             try:
                 bound = parse_instant(raw)
             except ValueError:
-                continue
-            day_only = len(raw.strip()) == 10
+                raise fail(
+                    400, 20001, f"Invalid {key}: {raw}. Use YYYY-MM-DD or an ISO 8601 timestamp."
+                ) from None
 
-            def _match(m: Record, bound=bound, op=op, day_only=day_only) -> bool:
-                sent = m.get("_sent") or m.get("_created")
+            def _match(m: Record, bound: datetime = bound, op: str = op) -> bool:
+                sent = m.get("_sent")  # Unsent messages have no date_sent and never match.
                 if not sent:
                     return False
                 instant = parse_instant(sent)
-                if op == "eq":
-                    return instant.date() == bound.date() if day_only else instant == bound
-                return instant < bound if op == "lt" else instant > bound
+                if op == "eq":  # DateSent is a UTC day filter even when given a full timestamp
+                    return instant.date() == bound.date()
+                return instant <= bound if op == "lte" else instant >= bound
 
             records = [m for m in records if _match(m)]
-        records.sort(key=lambda m: m.get("_created") or "", reverse=True)
+        records = newest_first(records, "_sent", "_created")
         rendered = [render_message(m, account_sid) for m in records]
         return page_2010(
             request, "messages", rendered, f"/{API_VERSION}/Accounts/{account_sid}/Messages.json"
@@ -680,28 +835,30 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
     @app.get(base + "/{sid}.json")
     async def get_message(request: Request, account_sid: str, sid: str) -> Any:
         require_auth(request, ctx)
-        account = check_account(ctx, account_sid)
+        account = check_account(ctx, account_sid, request)
+        await tick_scheduled(ctx)
         return render_message(_message_or_404(ctx, account, sid), account_sid)
 
     @app.post(base + "/{sid}.json")
     async def update_message(request: Request, account_sid: str, sid: str) -> Any:
         require_auth(request, ctx)
-        account = check_account(ctx, account_sid)
+        account = check_account(ctx, account_sid, request)
+        await tick_scheduled(ctx)
         record = _message_or_404(ctx, account, sid)
         params, _multi = await form_params(request)
         body = param_value(params, "Body")
         if body is not None:
             if body != "":
                 raise fail(
-                    400, 21200, "The Body of a message can only be updated to an empty string (redact)."
+                    400, 20001, "The Body of a message can only be updated to an empty string (redact)."
                 )
             record["body"] = ""
         status = get_param(params, "Status")
         if status:
             if status != "canceled":
-                raise fail(400, 21200, f"Status '{status}' is not a valid update status. Use 'canceled'.")
+                raise fail(400, 20001, f"Status '{status}' is not a valid update status. Use 'canceled'.")
             if record["status"] != "scheduled":
-                raise fail(400, 21200, "Only scheduled messages can be canceled.")
+                raise fail(400, 20001, "Only scheduled messages can be canceled.")
             record["status"] = "canceled"
         touch(record, _now(ctx))
         return render_message(record, account_sid)
@@ -709,7 +866,7 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
     @app.delete(base + "/{sid}.json")
     async def delete_message(request: Request, account_sid: str, sid: str) -> Response:
         require_auth(request, ctx)
-        account = check_account(ctx, account_sid)
+        account = check_account(ctx, account_sid, request)
         _message_or_404(ctx, account, sid)
         ctx.store.collection("messages").delete(sid)
         media_store = ctx.store.collection("media")
@@ -720,10 +877,12 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
     @app.post(base + "/{sid}/Feedback.json")
     async def create_feedback(request: Request, account_sid: str, sid: str) -> Response:
         require_auth(request, ctx)
-        account = check_account(ctx, account_sid)
+        account = check_account(ctx, account_sid, request)
         _message_or_404(ctx, account, sid)
         params, _multi = await form_params(request)
         outcome = get_param(params, "Outcome") or "unconfirmed"
+        if outcome not in ("confirmed", "unconfirmed"):
+            raise fail(400, 20001, f"Invalid Outcome: {outcome}. Must be confirmed or unconfirmed.")
         now = _now(ctx)
         body = {
             "account_sid": account_sid,
@@ -739,7 +898,7 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
     @app.get(base + "/{sid}/Media.json")
     async def list_media(request: Request, account_sid: str, sid: str) -> Any:
         require_auth(request, ctx)
-        account = check_account(ctx, account_sid)
+        account = check_account(ctx, account_sid, request)
         _message_or_404(ctx, account, sid)
         records = [render_media(m) for m in ctx.store.collection("media").values() if m["parent_sid"] == sid]
         return page_2010(
@@ -749,7 +908,7 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
     @app.get(base + "/{sid}/Media/{media_sid}.json")
     async def get_media(request: Request, account_sid: str, sid: str, media_sid: str) -> Any:
         require_auth(request, ctx)
-        account = check_account(ctx, account_sid)
+        account = check_account(ctx, account_sid, request)
         _message_or_404(ctx, account, sid)
         media = ctx.store.collection("media").get(media_sid)
         if media is None or media["parent_sid"] != sid:
@@ -759,7 +918,7 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
     @app.get(base + "/{sid}/Media/{media_sid}")
     async def get_media_content(request: Request, account_sid: str, sid: str, media_sid: str) -> Response:
         require_auth(request, ctx)
-        account = check_account(ctx, account_sid)
+        account = check_account(ctx, account_sid, request)
         _message_or_404(ctx, account, sid)
         media = ctx.store.collection("media").get(media_sid)
         if media is None or media["parent_sid"] != sid:
@@ -769,7 +928,7 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
     @app.delete(base + "/{sid}/Media/{media_sid}.json")
     async def delete_media(request: Request, account_sid: str, sid: str, media_sid: str) -> Response:
         require_auth(request, ctx)
-        account = check_account(ctx, account_sid)
+        account = check_account(ctx, account_sid, request)
         record = _message_or_404(ctx, account, sid)
         media = ctx.store.collection("media").get(media_sid)
         if media is None or media["parent_sid"] != sid:
@@ -790,11 +949,16 @@ async def action_inbound_sms(ctx: ProviderContext, payload: dict[str, Any]) -> d
 
 async def action_advance_message(ctx: ProviderContext, payload: dict[str, Any]) -> dict[str, Any]:
     """Advance a message's delivery status (optionally to a named status)."""
-    sid_ = payload.get("sid") or payload.get("Sid")
+    sid_ = payload_text(payload, "sid", "Sid")
     record = ctx.store.collection("messages").get(sid_) if sid_ else None
     if record is None:
         raise fail(404, 20404, f"Message {sid_} not found.")
-    await advance_message(ctx, record, payload.get("status") or payload.get("Status"))
+    target = payload_text(payload, "status", "Status")
+    if target and target not in _ADVANCE_TARGETS:
+        raise fail(400, 20001, f"Unknown status '{target}'. Use one of {', '.join(_ADVANCE_TARGETS)}.")
+    if target and target not in _TRANSITIONS.get(record["status"], ()):
+        raise fail(400, 20001, f"A message cannot move from '{record['status']}' to '{target}'.")
+    await advance_message(ctx, record, target)
     return {"message": render_message(record)}
 
 

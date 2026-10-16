@@ -16,16 +16,19 @@ Twilio conventions implemented here (see the public API reference):
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import hmac as hmac_mod
 import math
 import re
+import uuid
+from collections.abc import Coroutine
 from dataclasses import dataclass
 from datetime import datetime
 from email.utils import format_datetime
 from typing import TYPE_CHECKING, Any
-from urllib.parse import urlencode
+from urllib.parse import parse_qsl, urlencode, urlsplit
 
 from fastapi import Request
 
@@ -70,6 +73,8 @@ MAGIC_FROM_ERRORS: dict[str, tuple[int, str]] = {
     "+15005550008": (21611, "This 'From' number has exceeded the maximum MPS for this phone number."),
 }
 MAGIC_FROM_OK = "+15005550006"
+# Twilio's published WhatsApp sandbox sender: every developer's first ``whatsapp:`` From.
+WHATSAPP_SANDBOX = "+14155238886"
 
 OPT_OUT_WORDS = {"STOP", "STOPALL", "UNSUBSCRIBE", "CANCEL", "END", "QUIT"}
 OPT_IN_WORDS = {"START", "YES", "UNSTOP"}
@@ -113,12 +118,16 @@ class AuthInfo:
     is_test: bool = False
     via_api_key: bool = False
     via_token: bool = False  # /_emulator/tokens grant presented as Bearer
+    subaccount: bool = False  # authenticated with a subaccount's own SID/token
+
+
+_AUTH_DETAIL = "Your AccountSid or AuthToken was incorrect."
 
 
 def _unauthorized() -> EmulatorError:
     return EmulatorError(
         401,
-        twilio_error_body(401, 20003, "Authenticate"),
+        twilio_error_body(401, 20003, "Authenticate", detail=_AUTH_DETAIL),
         headers={"WWW-Authenticate": 'Basic realm="Twilio API"'},
     )
 
@@ -128,8 +137,17 @@ def require_auth(request: Request, ctx: ProviderContext) -> AuthInfo:
 
     Lenient by default (any password for a known username); set
     ``EMULATORS_TWILIO_STRICT_AUTH=1`` to require the exact token/secret. A Bearer
-    grant minted via ``POST /_emulator/tokens`` is also accepted.
+    grant minted via ``POST /_emulator/tokens`` is also accepted. Subaccounts created
+    through the API authenticate with their own SID and auth token and can only act on
+    themselves (see :func:`check_account`). The result is remembered on the request so
+    ``check_account`` can enforce that scoping.
     """
+    auth = _authenticate(request, ctx)
+    request.state.twilio_auth = auth
+    return auth
+
+
+def _authenticate(request: Request, ctx: ProviderContext) -> AuthInfo:
     c = creds(ctx)
     bearer = bearer_token(request)
     if bearer:
@@ -148,12 +166,23 @@ def require_auth(request: Request, ctx: ProviderContext) -> AuthInfo:
     known: dict[str, tuple[str, bool, bool]] = {
         c["account_sid"]: (c["auth_token"], False, False),
         c["test_account_sid"]: (c["test_auth_token"], True, False),
-        c["api_key_sid"]: (c["api_key_secret"], False, True),
     }
-    # Keys created at runtime (NewKeys) authenticate for the main account too.
+    # API keys (the seeded one and any created via /Keys) authenticate for the main account for
+    # as long as they exist, so deleting a key revokes it.
     extra = ctx.store.collection("api_keys").get(user)
     if extra is not None:
+        owner = extra.get("_account") or c["account_sid"]
+        if owner != c["account_sid"]:  # a subaccount's key acts as that subaccount only
+            if strict_auth(ctx) and not hmac_mod.compare_digest(password, extra.get("secret") or ""):
+                raise _unauthorized()
+            return AuthInfo(owner, via_api_key=True, subaccount=True)
         known[user] = (extra.get("secret") or "", False, True)
+    sub = ctx.store.collection("accounts").get(user) if user.startswith("AC") else None
+    if sub is not None and user != c["account_sid"]:
+        # A subaccount authenticates as itself, with its own token.
+        if strict_auth(ctx) and not hmac_mod.compare_digest(password, sub.get("auth_token") or ""):
+            raise _unauthorized()
+        return AuthInfo(user, subaccount=True)
     if user not in known:
         raise _unauthorized()
     expected, is_test, via_key = known[user]
@@ -162,34 +191,58 @@ def require_auth(request: Request, ctx: ProviderContext) -> AuthInfo:
     return AuthInfo(c["account_sid"], is_test=is_test, via_api_key=via_key)
 
 
-def check_account(ctx: ProviderContext, path_sid: str) -> str:
+def check_account(
+    ctx: ProviderContext, path_sid: str, request: Request | None = None, *, allow_inactive: bool = False
+) -> str:
     """Validate an ``{AccountSid}`` path segment; return the canonical account SID.
 
     The test-credentials SID aliases the main account (same resources, test mode).
-    Subaccounts created via ``POST /Accounts.json`` resolve to themselves.
+    Subaccounts created via ``POST /Accounts.json`` resolve to themselves, and a
+    request authenticated *as* a subaccount may only address that subaccount (403
+    otherwise), while the main account's credentials reach every subaccount.
     """
     c = creds(ctx)
+    auth: AuthInfo | None = getattr(request.state, "twilio_auth", None) if request is not None else None
     if path_sid in (c["account_sid"], c["test_account_sid"]):
-        return c["account_sid"]
-    if ctx.store.collection("accounts").get(path_sid) is not None:
-        return path_sid
-    raise not_found(f"/{API_VERSION}/Accounts/{path_sid}.json")
+        canonical = c["account_sid"]
+    elif ctx.store.collection("accounts").get(path_sid) is not None:
+        canonical = path_sid
+    else:
+        raise not_found(f"/{API_VERSION}/Accounts/{path_sid}.json")
+    if auth is not None and auth.subaccount and canonical != auth.account_sid:
+        raise fail(403, 20003, "Permission Denied")
+    record = ctx.store.collection("accounts").get(canonical)
+    if (
+        request is not None
+        and not allow_inactive
+        and request.method not in ("GET", "HEAD")
+        and record is not None
+        and record.get("status") != "active"
+    ):
+        raise fail(403, 20005, "Account not active")
+    return canonical
 
 
 # -- errors ------------------------------------------------------------------------
 
 
-def twilio_error_body(status: int, code: int, message: str) -> dict[str, Any]:
-    return {
-        "code": code,
-        "message": message,
-        "more_info": f"https://www.twilio.com/docs/errors/{code}",
-        "status": status,
-    }
+def twilio_error_body(status: int, code: int, message: str, detail: str | None = None) -> dict[str, Any]:
+    body: dict[str, Any] = {"code": code}
+    if detail:
+        body["detail"] = detail
+    body.update(
+        {"message": message, "more_info": f"https://www.twilio.com/docs/errors/{code}", "status": status}
+    )
+    return body
 
 
-def fail(status: int, code: int, message: str) -> EmulatorError:
-    return EmulatorError(status, twilio_error_body(status, code, message))
+def fail(status: int, code: int, message: str, detail: str | None = None) -> EmulatorError:
+    return EmulatorError(status, twilio_error_body(status, code, message, detail))
+
+
+def missing_param(name: str) -> EmulatorError:
+    """Platform-level "required parameter absent" error used by the v1/v2 APIs."""
+    return fail(400, 20001, f"Missing required parameter {name} in the post body")
 
 
 def not_found(uri: str) -> EmulatorError:
@@ -197,12 +250,12 @@ def not_found(uri: str) -> EmulatorError:
 
 
 _STATUS_CODES = {
-    400: 21200,
+    400: 20001,
     401: 20003,
     403: 20003,
     404: 20404,
-    405: 21200,
-    409: 21200,
+    405: 20004,
+    409: 20001,
     429: 20429,
     500: 20500,
     502: 20500,
@@ -215,8 +268,13 @@ def error_body(status: int, code: str, message: str) -> dict[str, Any]:
     """Provider.error_body: map core status codes onto Twilio's numeric codes."""
     numeric = int(code) if code.isdigit() else _STATUS_CODES.get(status, 20500)
     if status == 401:
-        message = "Authenticate"
+        return twilio_error_body(status, numeric, "Authenticate", detail=_AUTH_DETAIL)
     return twilio_error_body(status, numeric, message)
+
+
+def request_id() -> str:
+    """``Twilio-Request-Id`` value: ``RQ`` + 32 hex (not deterministic, like the real one)."""
+    return "RQ" + uuid.uuid4().hex
 
 
 # -- dates -------------------------------------------------------------------------
@@ -347,7 +405,12 @@ def bare_number(address: str) -> str:
 
 
 def valid_e164(number: str) -> bool:
-    return bool(_E164_RE.match(number))
+    """Syntactic E.164 plus the NANP rules Twilio enforces (``+1`` + 10 digits, NPA 2-9)."""
+    if not _E164_RE.match(number):
+        return False
+    if number.startswith("+1"):
+        return bool(re.fullmatch(r"\+1[2-9]\d{9}", number))
+    return True
 
 
 def national_format(number: str) -> str:
@@ -355,7 +418,12 @@ def national_format(number: str) -> str:
     if number.startswith("+1") and len(digits) == 11:
         return f"({digits[1:4]}) {digits[4:7]}-{digits[7:]}"
     if number.startswith("+44") and len(digits) == 12:
-        return f"0{digits[2:5]} {digits[5:8]} {digits[8:]}"
+        national = digits[2:]
+        if national.startswith("20"):  # London: 020 7946 0100
+            return f"0{national[:2]} {national[2:6]} {national[6:]}"
+        if national.startswith("7"):  # Mobile: 07700 900123
+            return f"0{national[:4]} {national[4:]}"
+        return f"0{national[:3]} {national[3:6]} {national[6:]}"
     return number
 
 
@@ -486,18 +554,42 @@ async def deliver_form(
     event_type: str,
     method: str = "POST",
 ) -> dict[str, Any]:
-    """POST a signed Twilio webhook (form params) through the core dispatcher."""
+    """Send a signed Twilio webhook through the core dispatcher.
+
+    ``POST`` webhooks carry the params as a form body; ``GET`` webhooks (a number configured
+    with ``SmsMethod=GET``) carry them in the query string, and Twilio signs the full URL
+    including that query string (the validator is then called with no POST params).
+    """
+    method = (method or "POST").upper()
+    headers = {"User-Agent": "TwilioProxy/1.1", "I-Twilio-Idempotency-Token": str(uuid.uuid4())}
+    if method == "GET":
+        parts = urlsplit(url)
+        query = parse_qsl(parts.query, keep_blank_values=True) + list(params.items())
+        full_url = parts._replace(query=urlencode(query)).geturl()
+        headers["X-Twilio-Signature"] = twilio_signature(auth_token(ctx), full_url, {})
+        return await ctx.webhooks.deliver(
+            full_url,
+            b"",
+            headers=headers,
+            event_type=event_type,
+            method="GET",
+            content_type="application/x-www-form-urlencoded; charset=UTF-8",
+        )
+    headers["X-Twilio-Signature"] = twilio_signature(auth_token(ctx), url, params)
     return await ctx.webhooks.deliver(
         url,
         form_body(params),
-        headers={"X-Twilio-Signature": twilio_signature(auth_token(ctx), url, params)},
+        headers=headers,
         event_type=event_type,
         method=method,
-        content_type="application/x-www-form-urlencoded",
+        content_type="application/x-www-form-urlencoded; charset=UTF-8",
     )
 
 
 # -- paging ------------------------------------------------------------------------
+
+
+_PAGING_KEYS = {"page", "pagesize", "pagetoken"}
 
 
 def _page_args(request: Request) -> tuple[int, int]:
@@ -511,11 +603,19 @@ def _page_args(request: Request) -> tuple[int, int]:
             page = int(base64.urlsafe_b64decode(token + "=" * (-len(token) % 4)).decode())
         except (ValueError, UnicodeDecodeError):
             page = parse_int(token, page)
-    return page, page_size
+    return max(page, 0), page_size
 
 
 def _page_token(page: int) -> str:
     return base64.urlsafe_b64encode(str(page).encode()).rstrip(b"=").decode()
+
+
+def _carried_query(request: Request, extra: dict[str, str] | None = None) -> list[tuple[str, str]]:
+    """Filters from the original request, repeated on every paging link (as Twilio does)."""
+    carried = [(k, v) for k, v in request.query_params.multi_items() if k.lower() not in _PAGING_KEYS]
+    if extra:
+        carried.extend((k, v) for k, v in extra.items() if k not in {c[0] for c in carried})
+    return carried
 
 
 def page_2010(
@@ -531,11 +631,12 @@ def page_2010(
     start = page * page_size
     chunk = records[start : start + page_size]
     end = start + len(chunk) - 1 if chunk else start
+    carried = _carried_query(request, extra_query)
 
     def link(p: int) -> str:
-        query = {"PageSize": str(page_size), "Page": str(p), "PageToken": _page_token(p)}
-        if extra_query:
-            query.update(extra_query)
+        query = [*carried, ("PageSize", str(page_size)), ("Page", str(p))]
+        if p > 0:
+            query.append(("PageToken", _page_token(p)))
         return f"{uri_path}?{urlencode(query)}"
 
     return {
@@ -563,10 +664,13 @@ def page_meta(
     page, page_size = _page_args(request)
     start = page * page_size
     chunk = records[start : start + page_size]
+    carried = _carried_query(request)
 
     def link(p: int) -> str:
-        query = urlencode({"PageSize": page_size, "Page": p, "PageToken": _page_token(p)})
-        return url_for_host(request, ctx, host, f"{path}?{query}")
+        pairs: list[tuple[str, Any]] = [*carried, ("PageSize", page_size), ("Page", p)]
+        if p > 0:
+            pairs.append(("PageToken", _page_token(p)))
+        return url_for_host(request, ctx, host, f"{path}?{urlencode(pairs)}")
 
     return {
         key: chunk,
@@ -588,3 +692,56 @@ def absolute(request: Request, ctx: ProviderContext, host: str, path: str) -> st
 
 def strip_internal(record: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in record.items() if not k.startswith("_") and k != "id"}
+
+
+def valid_url(value: str) -> bool:
+    """An absolute http(s) URL, as Twilio requires for webhook and callback parameters."""
+    parts = urlsplit(value)
+    return parts.scheme in ("http", "https") and bool(parts.netloc)
+
+
+def auto_advance(ctx: ProviderContext) -> bool:
+    """``EMULATORS_TWILIO_AUTO_ADVANCE=0`` stops messages/calls moving past their first status,
+    so tests can drive each transition with the ``advance_message`` / ``advance_call`` actions."""
+    return (ctx.setting("AUTO_ADVANCE") or "1").lower() not in ("0", "false", "no", "off")
+
+
+_ORPHAN_TASKS: set[asyncio.Task[Any]] = set()
+
+
+def spawn(ctx: ProviderContext, coro: Coroutine[Any, Any, Any]) -> asyncio.Task[Any]:
+    """Run ``coro`` in the background but keep a strong reference to it.
+
+    The task joins the webhook dispatcher's task set when available, so ``hub.drain_webhooks()``
+    (and ``POST /_emulator/webhooks/flush``) also wait for delayed status progression.
+    """
+    task = asyncio.get_running_loop().create_task(coro)
+    tasks = getattr(ctx.webhooks, "_tasks", None)
+    keep = tasks if isinstance(tasks, set) else _ORPHAN_TASKS
+    keep.add(task)
+    task.add_done_callback(keep.discard)
+    return task
+
+
+def payload_text(payload: dict[str, Any], *names: str) -> str | None:
+    """First non-null value among ``names`` coerced to ``str`` (control-plane payloads are JSON,
+    so a test may send numbers or lists where text is expected)."""
+    for name in names:
+        value = payload.get(name)
+        if value is not None:
+            return value if isinstance(value, str) else str(value)
+    return None
+
+
+def newest_first(records: list[dict[str, Any]], *keys: str) -> list[dict[str, Any]]:
+    """Sort newest first by the first non-empty ISO timestamp key; ties (the emulator clock may be
+    frozen, and Twilio's resolution is one second) resolve to the most recently *created* record."""
+    stamped = [(next((r[k] for k in keys if r.get(k)), ""), i, r) for i, r in enumerate(records)]
+    return [r for _, _, r in sorted(stamped, key=lambda t: (t[0], t[1]), reverse=True)]
+
+
+def route_path(scope: dict[str, Any]) -> str:
+    """The request path as the vendor sees it: without the gateway's ``/twilio`` mount prefix."""
+    path = scope.get("path", "")
+    root = scope.get("root_path", "") or ""
+    return path[len(root) :] if root and path.startswith(root) else path

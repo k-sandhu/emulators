@@ -82,7 +82,7 @@ async def test_call_lifecycle_callbacks_and_recording(twilio: httpx.AsyncClient)
     assert fetched["price"].startswith("-0.")
 
     statuses = [c["params"]["CallStatus"] for c in receiver.of_kind("status")]
-    assert statuses == ["queued", "ringing", "in-progress", "completed"]
+    assert statuses == ["initiated", "ringing", "in-progress", "completed"]
     from twilio.request_validator import RequestValidator
 
     validator = RequestValidator(ctx.store.meta["credentials"]["auth_token"])
@@ -124,10 +124,10 @@ async def test_call_validation_and_hangup(twilio: httpx.AsyncClient) -> None:
     )
     assert created.status_code == 201, created.text
     url = f"{account_base(twilio)}/Calls/{created.json()['sid']}.json"
-    # Already completed in sync mode; hanging up again is a no-op success.
+    # Already completed in sync mode; Twilio refuses to modify a finished call (21220).
     assert (await twilio.get(url)).json()["status"] == "completed"
     r = await twilio.post(url, data={"Status": "completed"})
-    assert r.status_code == 200 and r.json()["status"] == "completed"
+    assert r.status_code == 400 and r.json()["code"] == 21220
     r = await twilio.get(f"{account_base(twilio)}/Calls/{'CA' + '0' * 32}.json")
     assert r.status_code == 404 and r.json()["code"] == 20404
 
@@ -211,7 +211,7 @@ async def test_conversations_seed_and_flow(twilio: httpx.AsyncClient) -> None:
     assert created.status_code == 201, created.text
     conv_sid = created.json()["sid"]
     dupe = await twilio.post(f"{CONVERSATIONS}/v1/Conversations", data={"UniqueName": "thread-1"})
-    assert dupe.status_code == 400
+    assert dupe.status_code == 409 and dupe.json()["code"] == 50353
     agent = await twilio.post(
         f"{CONVERSATIONS}/v1/Conversations/{conv_sid}/Participants", data={"Identity": "agent-1"}
     )

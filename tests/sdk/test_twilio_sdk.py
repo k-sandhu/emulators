@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from urllib.parse import parse_qsl
 
@@ -10,7 +10,7 @@ import httpx
 import pytest
 from fastapi import FastAPI, Request
 from fastapi.responses import Response
-from twilio.base.exceptions import TwilioRestException
+from twilio.base.exceptions import TwilioException, TwilioRestException
 from twilio.request_validator import RequestValidator
 from twilio.rest import Client
 
@@ -167,6 +167,11 @@ def test_messaging_services(client: Client) -> None:
         friendly_name="SDK service", status_callback="http://consumer.test/mg-status"
     )
     numbers = client.incoming_phone_numbers.list(phone_number=FROM)
+    # A number lives in one sender pool at a time (409 otherwise): move it out of the seeded service.
+    with pytest.raises(TwilioRestException) as taken:
+        client.messaging.v1.services(created.sid).phone_numbers.create(phone_number_sid=numbers[0].sid)
+    assert taken.value.status == 409
+    assert client.messaging.v1.services(seeded.sid).phone_numbers(numbers[0].sid).delete() is True
     link = client.messaging.v1.services(created.sid).phone_numbers.create(phone_number_sid=numbers[0].sid)
     assert link.phone_number == FROM
     renamed = client.messaging.v1.services(created.sid).update(friendly_name="SDK service v2")
@@ -282,3 +287,146 @@ def test_status_callback_signature_validates(client: Client, emulators: Emulator
     for entry in received:
         assert entry["params"]["MessageSid"] == msg.sid
         assert validator.validate("http://consumer.test/status", entry["params"], entry["sig"])
+
+
+# -- audit regressions: things a real SDK client trips on ---------------------------------------------
+
+
+def test_incoming_number_type_lists_and_partial_filter(client: Client) -> None:
+    assert [n.phone_number for n in client.incoming_phone_numbers.local.list()] == [
+        FROM,
+        "+12125550188",
+        "+14165550177",
+    ]
+    assert client.incoming_phone_numbers.toll_free.list() == []
+    assert {n.phone_number for n in client.incoming_phone_numbers.list(phone_number="+1212")} == {
+        "+12125550188"
+    }
+
+
+def test_paging_keeps_the_filters(client: Client) -> None:
+    everything = client.messages.list(to=CONTACT)
+    paged = client.messages.list(to=CONTACT, page_size=2)
+    assert {m.sid for m in paged} == {m.sid for m in everything}
+    assert len(paged) > 2 and all(m.to == CONTACT for m in paged)
+    inbound_page = client.messages.page(from_=CONTACT, page_size=1)
+    assert all(m.from_ == CONTACT for m in inbound_page.next_page())  # type: ignore[union-attr]
+
+
+def test_usage_period_subresources_and_unknown_country(client: Client) -> None:
+    today = client.usage.records.today.list()
+    assert {r.category for r in today} >= {"sms", "calls", "totalprice"}
+    assert client.usage.records.all_time.list(category="sms")[0].count == "105"
+    assert client.usage.records.daily.list(category="sms")
+    with pytest.raises(TwilioException) as unknown:
+        client.available_phone_numbers("XX").local.list()
+    assert "404" in str(unknown.value)
+
+
+def test_lookup_v1_shortcut(client: Client) -> None:
+    with pytest.warns(DeprecationWarning):
+        result = client.lookups.phone_numbers(CONTACT).fetch(type=["carrier", "caller-name"])
+    assert result.country_code == "CA" and result.national_format == "(416) 555-0141"
+    assert result.carrier["type"] == "mobile"  # type: ignore[index]
+    assert result.caller_name["caller_name"] == "CHRISTOPHER INGRAM"  # type: ignore[index]
+    with pytest.raises(TwilioRestException) as invalid, pytest.warns(DeprecationWarning):
+        client.lookups.phone_numbers("+1555").fetch()
+    assert invalid.value.status == 404
+
+
+def test_verify_resend_and_check_limits(client: Client, emulators: EmulatorHub) -> None:
+    seeded = next(s for s in client.verify.v2.services.list() if s.friendly_name == "Halcyon Client Portal")
+    verifications = client.verify.v2.services(seeded.sid).verifications
+    first = verifications.create(to=CONTACT, channel="sms")
+    for _ in range(4):
+        assert verifications.create(to=CONTACT, channel="sms").sid == first.sid
+    with pytest.raises(TwilioRestException) as limit:
+        verifications.create(to=CONTACT, channel="sms")
+    assert limit.value.status == 429 and limit.value.code == 60203
+    with pytest.raises(TwilioRestException) as invalid:
+        verifications.create(to="not-a-number", channel="sms")
+    assert invalid.value.code == 60200
+
+    checks = client.verify.v2.services(seeded.sid).verification_checks
+    for _ in range(5):
+        assert checks.create(to=CONTACT, code="000000").status == "pending"
+    with pytest.raises(TwilioRestException) as blocked:
+        checks.create(to=CONTACT, code="000000")
+    assert blocked.value.status == 429 and blocked.value.code == 60202
+    assert (
+        client.verify.v2.services(seeded.sid).verifications(first.sid).fetch().status
+        == "max_attempts_reached"
+    )
+
+
+def test_recordings_through_the_call(client: Client) -> None:
+    recording = client.recordings.list(limit=1)[0]
+    via_call = client.calls(recording.call_sid).recordings(recording.sid).fetch()
+    assert via_call.sid == recording.sid and via_call.call_sid == recording.call_sid
+    assert client.calls(recording.call_sid).recordings(recording.sid).delete() is True
+
+
+def test_scheduling_and_content_templates(client: Client, emulators: EmulatorHub) -> None:
+    seeded = next(
+        s for s in client.messaging.v1.services.list() if s.friendly_name == "Halcyon Client Notifications"
+    )
+    send_at = emulators.clock.now() + timedelta(hours=2)
+    scheduled = client.messages.create(
+        to=CONTACT,
+        messaging_service_sid=seeded.sid,
+        body="See you tomorrow",
+        schedule_type="fixed",
+        send_at=send_at,
+    )
+    assert scheduled.status == "scheduled"
+    assert client.messages(scheduled.sid).update(status="canceled").status == "canceled"
+    too_soon = emulators.clock.now() + timedelta(minutes=5)
+    with pytest.raises(TwilioRestException) as soon:
+        client.messages.create(
+            to=CONTACT, messaging_service_sid=seeded.sid, body="x", schedule_type="fixed", send_at=too_soon
+        )
+    assert soon.value.status == 400 and soon.value.code == 35114
+    templated = client.messages.create(to=CONTACT, from_=FROM, content_sid="HX" + "b" * 32)
+    assert templated.sid.startswith("SM") and templated.body == ""
+
+
+def test_subaccount_client_is_scoped(client: Client, emulators: EmulatorHub) -> None:
+    sub = client.api.accounts.create(friendly_name="SDK subaccount")
+    sub_client = Client(sub.sid, sub.auth_token)
+    assert sub_client.messages.list(limit=5) == []
+    with pytest.raises(TwilioRestException) as denied:
+        sub_client.api.accounts(_creds(emulators)["account_sid"]).fetch()
+    assert denied.value.status == 403
+    assert client.api.accounts(sub.sid).update(status="closed").status == "closed"
+    with pytest.raises(TwilioRestException) as inactive:
+        sub_client.messages.create(to=CONTACT, from_="+15005550006", body="x")
+    assert inactive.value.status == 403 and inactive.value.code == 20005
+
+
+def test_get_call_status_callbacks_are_signed_over_the_full_url(
+    client: Client, emulators: EmulatorHub
+) -> None:
+    received: list[dict[str, Any]] = []
+    receiver = FastAPI()
+
+    @receiver.get("/status")
+    async def status(request: Request) -> Response:
+        received.append({"url": str(request.url), "sig": request.headers.get("x-twilio-signature")})
+        return Response("")
+
+    emulators.webhook_transport = httpx.ASGITransport(app=receiver)
+    try:
+        client.calls.create(
+            to=CONTACT,
+            from_=FROM,
+            twiml="<Response><Say>hi</Say></Response>",
+            status_callback="http://consumer.test/status?tenant=halcyon",
+            status_callback_method="GET",
+        )
+    finally:
+        emulators.webhook_transport = None
+    assert len(received) == 1  # the default event is "completed"
+    validator = RequestValidator(_creds(emulators)["auth_token"])
+    entry = received[0]
+    assert "tenant=halcyon" in entry["url"] and "CallStatus=completed" in entry["url"]
+    assert validator.validate(entry["url"], {}, entry["sig"])

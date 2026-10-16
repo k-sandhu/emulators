@@ -70,7 +70,7 @@ def build_message(
         "sid": sid_,
         "account_sid": account_sid,
         "api_version": API_VERSION,
-        "body": body,
+        "body": body if body is not None else "",  # media-only messages carry an empty string
         "date_created": rfc2822(created),
         "date_sent": rfc2822(sent),
         "date_updated": rfc2822(created),
@@ -80,7 +80,7 @@ def build_message(
         "from": from_,
         "messaging_service_sid": messaging_service_sid,
         "num_media": str(num_media),
-        "num_segments": str(num_segments(body or "")),
+        "num_segments": str(max(num_segments(body or ""), 1 if num_media else 0)),
         "price": price,
         "price_unit": "USD",
         "status": status,
@@ -235,8 +235,8 @@ def build_number(
         "date_created": rfc2822(created),
         "date_updated": rfc2822(created),
         "emergency_address_sid": None,
-        "emergency_address_status": None,
-        "emergency_status": "unregistered",
+        "emergency_address_status": "unregistered",
+        "emergency_status": "Inactive",
         "friendly_name": friendly_name,
         "identity_sid": None,
         "origin": origin,
@@ -250,7 +250,6 @@ def build_number(
         "status_callback": None,
         "status_callback_method": "POST",
         "trunk_sid": None,
-        "type": "local",
         "uri": f"/{API_VERSION}/Accounts/{account_sid}/IncomingPhoneNumbers/{sid_}.json",
         "voice_application_sid": None,
         "voice_caller_id_lookup": False,
@@ -261,15 +260,29 @@ def build_number(
         "voice_url": None,
         "_created": isoformat_z(utc(created)),
         "_account": account_sid,
+        "_type": number_type(phone_number),
     }
 
 
+def number_type(phone_number: str) -> str:
+    """``local`` / ``toll-free`` / ``mobile``: which ``IncomingPhoneNumbers/<Type>`` list it is in."""
+    if phone_number.startswith("+1") and phone_number[2:5] in {
+        "800",
+        "833",
+        "844",
+        "855",
+        "866",
+        "877",
+        "888",
+    }:
+        return "toll-free"
+    if phone_number.startswith("+447"):
+        return "mobile"
+    return "local"
+
+
 def render_number(record: Record) -> Record:
-    # Twilio omits the create-only/method helper fields we keep for updates.
-    out = {k: v for k, v in record.items() if not k.startswith("_") and k != "id"}
-    out.pop("status_callback_method", None)
-    out.pop("voice_caller_id_lookup", None)
-    return out
+    return {k: v for k, v in record.items() if not k.startswith("_") and k != "id"}
 
 
 def available_number(phone_number: str, locality: str, region: str, country: str) -> Record:
@@ -314,6 +327,7 @@ def build_call(
         "id": sid_,
         "sid": sid_,
         "account_sid": account_sid,
+        "annotation": None,
         "answered_by": None,
         "api_version": API_VERSION,
         "caller_name": None,
@@ -436,9 +450,10 @@ def build_messaging_service(
         "scan_message_content": "inherit",
         "fallback_to_long_code": False,
         "area_code_geomatch": True,
-        "validity_period": 3600,
+        "validity_period": 14400,
         "synchronous_validation": False,
         "usecase": None,
+        "us_app_to_person_registered": False,
         "use_inbound_webhook_on_number": False,
         "_created": isoformat_z(utc(created)),
         "_account": account_sid,
@@ -455,6 +470,10 @@ def render_messaging_service(record: Record, request: Request, ctx: ProviderCont
         "phone_numbers": absolute(request, ctx, MESSAGING_HOST, f"{base}/PhoneNumbers"),
         "short_codes": absolute(request, ctx, MESSAGING_HOST, f"{base}/ShortCodes"),
         "alpha_senders": absolute(request, ctx, MESSAGING_HOST, f"{base}/AlphaSenders"),
+        "us_app_to_person": absolute(request, ctx, MESSAGING_HOST, f"{base}/Compliance/Usa2p"),
+        "us_app_to_person_usecases": absolute(
+            request, ctx, MESSAGING_HOST, f"{base}/Compliance/Usa2p/Usecases"
+        ),
         "channel_senders": absolute(request, ctx, MESSAGING_HOST, f"{base}/ChannelSenders"),
         "destination_alpha_senders": absolute(
             request, ctx, MESSAGING_HOST, f"{base}/DestinationAlphaSenders"
@@ -472,7 +491,9 @@ def render_mg_number(link: Record, number: Record, request: Request, ctx: Provid
         "phone_number": number["phone_number"],
         "country_code": "CA" if number["phone_number"].startswith(("+1416", "+1647")) else "US",
         "capabilities": sorted(
-            k.upper() if k in ("sms", "mms") else k for k, v in number["capabilities"].items() if v
+            {"sms": "SMS", "mms": "MMS", "voice": "Voice", "fax": "Fax"}[k]
+            for k, v in number["capabilities"].items()
+            if v and k in ("sms", "mms", "voice", "fax")
         ),
         "date_created": link["date_created"],
         "date_updated": link["date_updated"],
@@ -492,7 +513,7 @@ def build_verify_service(
         "account_sid": account_sid,
         "friendly_name": friendly_name,
         "code_length": 6,
-        "lookup_enabled": True,
+        "lookup_enabled": False,
         "skip_sms_to_landlines": False,
         "dtmf_input_required": False,
         "tts_name": None,

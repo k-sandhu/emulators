@@ -109,6 +109,7 @@ class WebhookDispatcher:
         content_type: str = "application/json",
         metadata: dict[str, Any] | None = None,
         sign: Callable[[bytes, int], dict[str, str]] | None = None,
+        max_attempts: int | None = None,
     ) -> dict[str, Any]:
         """Record and dispatch one delivery according to ``self.mode``.
 
@@ -131,6 +132,7 @@ class WebhookDispatcher:
             "created_at": isoformat_z(self.clock.now()),
             "delivered_at": None,
             "metadata": metadata or {},
+            "max_attempts": max_attempts or self.max_attempts,
         }
         self.deliveries.put(record)
         if self.mode == "manual":
@@ -154,6 +156,14 @@ class WebhookDispatcher:
                 flushed.append(record)
         return flushed
 
+    def spawn(self, coro: Any) -> asyncio.Task[Any]:
+        """Run provider background work (status progressions, delayed events) as a task that
+        :meth:`drain` waits for, so ``hub.drain_webhooks()`` covers it."""
+        task = asyncio.get_running_loop().create_task(coro)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+        return task
+
     async def drain(self) -> None:
         """Wait for in-flight async deliveries (used by tests and graceful shutdown)."""
         while self._tasks:
@@ -162,7 +172,8 @@ class WebhookDispatcher:
     async def _attempt_all(
         self, record: dict[str, Any], body: bytes, sign: Callable[[bytes, int], dict[str, str]] | None
     ) -> None:
-        for attempt in range(1, self.max_attempts + 1):
+        attempts = int(record.get("max_attempts") or self.max_attempts)
+        for attempt in range(1, attempts + 1):
             record["attempts"] = attempt
             headers = dict(record["headers"])
             if sign is not None:
@@ -183,7 +194,7 @@ class WebhookDispatcher:
                 record["error"] = f"HTTP {response.status_code}"
             except httpx.HTTPError as exc:
                 record["error"] = f"{type(exc).__name__}: {exc}"[:500]
-            if attempt < self.max_attempts and self.mode == "async":
+            if attempt < attempts and self.mode == "async":
                 with contextlib.suppress(asyncio.CancelledError):
                     await asyncio.sleep(min(0.25 * 2**attempt, 2.0))
         record["status"] = "failed"

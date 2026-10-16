@@ -17,6 +17,7 @@ from tests.providers.twilio.conftest import (
     VERIFY,
     account_base,
     messages_url,
+    seeded_messaging_service,
     seeded_verify_service,
 )
 
@@ -41,7 +42,7 @@ async def test_messaging_service_seed_and_meta_paging(twilio: httpx.AsyncClient)
     assert service["links"]["phone_numbers"].endswith("/PhoneNumbers")
     assert service["inbound_request_url"] is None
     assert service["use_inbound_webhook_on_number"] is False
-    assert service["validity_period"] == 3600
+    assert service["validity_period"] == 14400
 
     numbers = (await twilio.get(f"{MESSAGING}/v1/Services/{service['sid']}/PhoneNumbers")).json()
     assert numbers["meta"]["key"] == "phone_numbers"
@@ -80,6 +81,11 @@ async def test_messaging_service_crud_and_pool(twilio: httpx.AsyncClient) -> Non
         "incoming_phone_numbers"
     ]
     pn_sid = next(n["sid"] for n in numbers if n["phone_number"] == NY_NUMBER)
+    # A number belongs to one sender pool at a time: release it from the seeded service first.
+    seeded = await seeded_messaging_service(twilio)
+    assert (
+        await twilio.delete(f"{MESSAGING}/v1/Services/{seeded['sid']}/PhoneNumbers/{pn_sid}")
+    ).status_code == 204
     added = await twilio.post(
         f"{MESSAGING}/v1/Services/{service['sid']}/PhoneNumbers", data={"PhoneNumberSid": pn_sid}
     )
@@ -88,7 +94,7 @@ async def test_messaging_service_crud_and_pool(twilio: httpx.AsyncClient) -> Non
     duplicate = await twilio.post(
         f"{MESSAGING}/v1/Services/{service['sid']}/PhoneNumbers", data={"PhoneNumberSid": pn_sid}
     )
-    assert duplicate.status_code == 400
+    assert duplicate.status_code == 409 and duplicate.json()["code"] == 21710
     missing = await twilio.post(
         f"{MESSAGING}/v1/Services/{service['sid']}/PhoneNumbers", data={"PhoneNumberSid": "PN" + "0" * 32}
     )
@@ -111,7 +117,7 @@ async def test_messaging_service_crud_and_pool(twilio: httpx.AsyncClient) -> Non
     assert (await twilio.get(f"{MESSAGING}/v1/Services/{service['sid']}")).status_code == 404
 
     no_name = await twilio.post(f"{MESSAGING}/v1/Services", data={})
-    assert no_name.status_code == 400
+    assert no_name.status_code == 400 and no_name.json()["code"] == 20001
 
 
 async def test_verify_service_seed_and_crud(twilio: httpx.AsyncClient) -> None:
@@ -157,7 +163,7 @@ async def test_verify_flow_with_state_code(twilio: httpx.AsyncClient) -> None:
     assert verification["send_code_attempts"][0]["attempt_sid"].startswith("VL")
     assert ISO_RE.match(verification["date_created"])
     assert "code" not in verification  # never on the wire
-    assert verification["lookup"]["phone_number"] == CONTACT
+    assert verification["lookup"]["carrier"]["type"] == "mobile"
 
     # The code is visible through the control plane and was also sent as an SMS.
     state = (await twilio.get(f"{API}/_emulator/state/verifications")).json()
@@ -210,12 +216,16 @@ async def test_verify_cancel_and_max_attempts(twilio: httpx.AsyncClient) -> None
     assert canceled.json()["status"] == "canceled"
 
     await _start_verification(twilio, service["sid"])
-    last: httpx.Response | None = None
-    for _ in range(5):
-        last = await twilio.post(
+    for _ in range(5):  # five wrong codes are allowed and stay pending ...
+        wrong = await twilio.post(
             f"{VERIFY}/v2/Services/{service['sid']}/VerificationCheck", data={"To": CONTACT, "Code": "000000"}
         )
-    assert last is not None and last.status_code == 404 and last.json()["code"] == 20404
+        assert wrong.status_code == 200 and wrong.json()["status"] == "pending"
+    # ... the sixth attempt is refused with Twilio's 429 "Max check attempts reached" (60202).
+    last = await twilio.post(
+        f"{VERIFY}/v2/Services/{service['sid']}/VerificationCheck", data={"To": CONTACT, "Code": "000000"}
+    )
+    assert last.status_code == 429 and last.json()["code"] == 60202
     # And afterwards the verification is gone for checking purposes.
     gone = await twilio.post(
         f"{VERIFY}/v2/Services/{service['sid']}/VerificationCheck", data={"To": CONTACT, "Code": "123456"}

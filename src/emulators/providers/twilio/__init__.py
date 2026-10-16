@@ -2,15 +2,43 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+import time
+from typing import Any
 
 from fastapi import FastAPI
+from starlette.datastructures import MutableHeaders
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from emulators.core.provider import Provider, ProviderContext
 from emulators.providers.twilio.common import error_body as _error_body
+from emulators.providers.twilio.common import request_id as _request_id
+from emulators.providers.twilio.common import route_path as _route_path
+from emulators.providers.twilio.common import twilio_error_body as _twilio_error_body
 
-if TYPE_CHECKING:
-    pass
+
+class _TwilioHeaders:
+    """Adds the headers every Twilio response carries (request id, duration, concurrency)."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        started = time.perf_counter()
+
+        async def send_with_headers(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                headers = MutableHeaders(scope=message)
+                if "twilio-request-id" not in headers:
+                    headers["Twilio-Request-Id"] = _request_id()
+                headers["Twilio-Request-Duration"] = f"{time.perf_counter() - started:.3f}"
+                headers["Twilio-Concurrent-Requests"] = "1"
+                headers.setdefault("X-Home-Region", "us1")
+            await send(message)
+
+        await self.app(scope, receive, send_with_headers)
 
 
 class TwilioProvider(Provider):
@@ -46,19 +74,42 @@ class TwilioProvider(Provider):
     def error_body(self, status: int, code: str, message: str) -> Any:
         return _error_body(status, code, message)
 
+    def error_body_for(self, scope: dict[str, Any] | None, status: int, code: str, message: str) -> Any:
+        """Twilio's 404 names the requested path ("The requested resource /… was not found")."""
+        path = _route_path(scope or {})
+        if status == 404 and path and message.startswith("Resource not found"):
+            return _twilio_error_body(404, 20404, f"The requested resource {path} was not found")
+        if status == 405:
+            return _twilio_error_body(405, 20004, "Method not allowed")
+        return self.error_body(status, code, message)
+
+    def error_headers_for(self, scope: dict[str, Any] | None, status: int) -> dict[str, str]:
+        return {"Twilio-Request-Id": _request_id()}
+
     def seed(self, ctx: ProviderContext) -> None:
         from emulators.providers.twilio.seed import seed
 
         seed(ctx)
 
     def build(self, app: FastAPI, ctx: ProviderContext) -> None:
-        from emulators.providers.twilio import conversations, messages, numbers, services, voice
+        from emulators.providers.twilio import (
+            conversations,
+            empty,
+            lookup,
+            messages,
+            numbers,
+            services,
+            voice,
+        )
 
+        app.add_middleware(_TwilioHeaders)
         numbers.register(app, ctx)
         messages.register(app, ctx)
         voice.register(app, ctx)
         services.register(app, ctx)
+        lookup.register(app, ctx)
         conversations.register(app, ctx)
+        empty.register(app, ctx)
 
     def info(self, ctx: ProviderContext) -> dict[str, Any]:
         data = super().info(ctx)
