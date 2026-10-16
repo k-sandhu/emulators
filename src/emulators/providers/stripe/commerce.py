@@ -5,7 +5,8 @@ from __future__ import annotations
 import copy
 from typing import Any
 
-from emulators.providers.stripe.billing import BillingAPI
+from emulators.providers.stripe.billing import BillingAPI, period_end
+from emulators.providers.stripe.validation import timestamp
 from emulators.providers.stripe.wire import VERSION, Record, boolean, fail, integer, metadata
 
 
@@ -67,7 +68,25 @@ class CommerceAPI(BillingAPI):
             }
         if p.get("balance"):
             customer["balance"] = integer(p["balance"], "balance")
+        if p.get("payment_method"):
+            pm = self.payment_method_for(p, customer["id"])
+            pm["customer"] = customer["id"]
+            customer["_attached_payment_method"] = pm["id"]
+            if customer["invoice_settings"]["default_payment_method"] == p["payment_method"]:
+                customer["invoice_settings"]["default_payment_method"] = pm["id"]
+        self.customer_defaults(customer)
         return customer
+
+    def customer_defaults(self, customer: Record) -> None:
+        """Default payment instruments must belong to the customer being changed."""
+        pm_id = customer["invoice_settings"]["default_payment_method"]
+        if pm_id and self.payment_method(pm_id)["customer"] != customer["id"]:
+            fail(
+                "The customer does not have this payment method.", "invoice_settings[default_payment_method]"
+            )
+        source_id = customer.get("default_source")
+        if source_id and self.get("sources", source_id, "default_source")["customer"] != customer["id"]:
+            fail("The customer does not have this source.", "default_source")
 
     def make_product(self, p: Record) -> Record:
         self.required(p, "name")
@@ -118,7 +137,10 @@ class CommerceAPI(BillingAPI):
             recurring = {
                 "interval": recurring["interval"],
                 "interval_count": integer(
-                    recurring.get("interval_count", 1), "recurring[interval_count]", minimum=1
+                    recurring.get("interval_count", 1),
+                    "recurring[interval_count]",
+                    minimum=1,
+                    maximum={"day": 1095, "week": 156, "month": 36, "year": 3}[recurring["interval"]],
                 ),
                 "meter": None,
                 "trial_period_days": None,
@@ -157,13 +179,18 @@ class CommerceAPI(BillingAPI):
             if self.customer_scope:
                 fail("This API key cannot create additional customers.", status=403)
             customer = self.make_customer(p)
-            await self.emit("customer.created", customer)
             if p.get("source"):
                 await self.customer_route(customer["id"], "sources", None, "POST", {"source": p["source"]})
+            attached = customer.pop("_attached_payment_method", None)
+            if attached:
+                await self.emit("payment_method.attached", self.get("payment_methods", attached))
+            await self.emit("customer.created", customer)
             return customer
         if not record_id:
             return None
-        customer = self.get("customers", record_id)
+        customer = self.get("customers", record_id, allow_deleted=method == "GET" and not operation)
+        if method == "GET" and not operation:
+            return customer
         if operation:
             nested = {
                 "payment_methods": "payment_methods",
@@ -307,7 +334,12 @@ class CommerceAPI(BillingAPI):
                     await self.cancel_subscription(subscription)
             for pm in self.ctx.store.collection("payment_methods").where(customer=record_id):
                 pm.update(customer=None, _detached=True)
-            deleted = {"id": record_id, "object": "customer", "deleted": True}
+            deleted = {
+                "id": record_id,
+                "object": "customer",
+                "deleted": True,
+                **{k: v for k, v in customer.items() if k in {"_client_id", "_owner_customer"}},
+            }
             self.ctx.store.collection("customers").put(deleted)
             await self.emit("customer.deleted", deleted)
             return deleted
@@ -331,12 +363,7 @@ class CommerceAPI(BillingAPI):
             )
             if "balance" in p:
                 customer["balance"] = integer(p["balance"], "balance")
-            pm_id = customer["invoice_settings"]["default_payment_method"]
-            if pm_id and self.payment_method(pm_id)["customer"] != record_id:
-                fail(
-                    "The customer does not have a payment method with the ID " + pm_id + ".",
-                    "invoice_settings[default_payment_method]",
-                )
+            self.customer_defaults(customer)
             await self.emit("customer.updated", customer, previous)
             return customer
         return None
@@ -358,6 +385,10 @@ class CommerceAPI(BillingAPI):
                 else self.get("prices", item.get("price"), "line_items[price]")
             )
             quantity = integer(item.get("quantity", 1), "quantity", minimum=1)
+            if mode == "payment" and price["recurring"]:
+                fail("Recurring prices cannot be used in payment mode.", "line_items")
+            if rows and price["currency"] != rows[0]["currency"]:
+                fail("All prices must have the same currency.", "line_items")
             total += price["unit_amount"] * quantity
             rows.append(
                 {
@@ -399,7 +430,12 @@ class CommerceAPI(BillingAPI):
             customer_creation=p.get("customer_creation", "if_required"),
             customer_details=None,
             customer_email=p.get("customer_email"),
-            expires_at=integer(p.get("expires_at", self.now + 86400), "expires_at", minimum=self.now + 1800),
+            expires_at=integer(
+                p.get("expires_at", self.now + 86400),
+                "expires_at",
+                minimum=self.now + 1800,
+                maximum=self.now + 86400,
+            ),
             invoice=None,
             invoice_creation=None,
             locale=None,
@@ -515,6 +551,38 @@ class CommerceAPI(BillingAPI):
                     self.ctx.store.collection(collection).delete(record_id)
                     await self.emit("product.deleted", record)
                     return {"id": record_id, "object": "product", "deleted": True}
+                if collection == "products" and p.get("default_price"):
+                    price = self.get("prices", p["default_price"], "default_price")
+                    if price["product"] != record_id:
+                        fail("The default price must belong to this product.", "default_price")
+                if collection == "prices":
+                    for field in {
+                        "unit_amount",
+                        "unit_amount_decimal",
+                        "currency",
+                        "product",
+                        "recurring",
+                    } & p.keys():
+                        fail("Received unknown parameter: " + field, field, code="parameter_unknown")
+                    if (
+                        "tax_behavior" in p
+                        and record["tax_behavior"] != "unspecified"
+                        and p["tax_behavior"] != record["tax_behavior"]
+                    ):
+                        fail("You cannot change tax_behavior after it has been specified.", "tax_behavior")
+                    if p.get("lookup_key"):
+                        other = next(
+                            (
+                                r
+                                for r in self.ctx.store.collection("prices")
+                                if r["id"] != record_id and r["lookup_key"] == p["lookup_key"]
+                            ),
+                            None,
+                        )
+                        if other:
+                            if not boolean(p.get("transfer_lookup_key", False)):
+                                fail("Lookup key already used by another price.", "lookup_key")
+                            other["lookup_key"] = None
                 self.update(
                     record,
                     p,
@@ -531,8 +599,7 @@ class CommerceAPI(BillingAPI):
                 self.required(p, "url", "enabled_events")
                 if not isinstance(p["enabled_events"], list) or not p["enabled_events"]:
                     fail("Invalid array", "enabled_events")
-                if not str(p["url"]).startswith(("http://", "https://")):
-                    fail("Not a valid URL", "url")
+                self.webhook_parameters(p)
                 endpoint = self.new(
                     collection,
                     api_version=p.get("api_version", VERSION),
@@ -550,6 +617,7 @@ class CommerceAPI(BillingAPI):
             if method == "DELETE":
                 self.ctx.store.collection(collection).delete(record_id)
                 return {"id": record_id, "object": "webhook_endpoint", "deleted": True}
+            self.webhook_parameters(p)
             self.update(endpoint, p, {"url", "description", "enabled_events"})
             if "disabled" in p:
                 endpoint["status"] = "disabled" if boolean(p["disabled"]) else "enabled"
@@ -594,13 +662,13 @@ class CommerceAPI(BillingAPI):
                 self.required(p, "frozen_time")
                 return self.new(
                     collection,
-                    frozen_time=integer(p["frozen_time"], "frozen_time"),
+                    frozen_time=timestamp(p["frozen_time"], "frozen_time"),
                     name=p.get("name"),
                     deletes_after=self.now + 2592000,
                     status="ready",
                     status_details={},
                 )
-            if record_id and method == "DELETE":
+            if record_id and method == "DELETE" and not operation:
                 clock = self.get(collection, record_id)
                 for customer in list(self.ctx.store.collection("customers").where(test_clock=record_id)):
                     await self.customer_route(customer["id"], None, None, "DELETE", {})
@@ -608,7 +676,28 @@ class CommerceAPI(BillingAPI):
                 return {"id": record_id, "object": "test_helpers.test_clock", "deleted": True}
             if record_id and method == "POST" and operation == "advance":
                 clock = self.get(collection, record_id)
-                target = integer(p.get("frozen_time"), "frozen_time", minimum=clock["frozen_time"] + 1)
+                self.required(p, "frozen_time")
+                target = timestamp(p["frozen_time"], "frozen_time")
+                if target <= clock["frozen_time"]:
+                    fail("The frozen_time must be later than the current frozen_time.", "frozen_time")
+                bounds = []
+                for sub in self.ctx.store.collection("subscriptions").where(test_clock=record_id):
+                    if sub["status"] in {"canceled", "incomplete_expired"}:
+                        continue
+                    for item in sub["items"]["data"]:
+                        recurring = item["price"]["recurring"]
+                        once = period_end(clock["frozen_time"], recurring)
+                        bounds.append(period_end(once, recurring, anchor=clock["frozen_time"]))
+                maximum = (
+                    min(bounds)
+                    if bounds
+                    else period_end(clock["frozen_time"], {"interval": "year", "interval_count": 2})
+                )
+                if target > maximum:
+                    fail(
+                        "The frozen_time cannot be more than two subscription intervals in the future.",
+                        "frozen_time",
+                    )
                 clock["status"] = "advancing"
                 await self.emit("test_helpers.test_clock.advancing", clock)
                 await self.renew(target, record_id)
@@ -667,6 +756,20 @@ class CommerceAPI(BillingAPI):
                 await self.emit("payout.updated", payout, previous)
                 return payout
         return None
+
+    def webhook_parameters(self, p: Record) -> None:
+        from urllib.parse import urlsplit
+
+        if "enabled_events" in p and not p["enabled_events"]:
+            fail("You must specify at least one event.", "enabled_events")
+        if "url" in p:
+            try:
+                url = urlsplit(p["url"])
+                if url.scheme not in {"http", "https"} or not url.hostname or url.fragment:
+                    fail("Not a valid URL", "url")
+                _ = url.port
+            except ValueError:
+                fail("Not a valid URL", "url")
 
     def balance(self) -> Record:
         buckets: dict[str, dict[str, int]] = {"available": {}, "pending": {}}

@@ -49,17 +49,17 @@ class PaymentsAPI(BaseAPI):
                 if record["used"]:
                     fail("You cannot use a Stripe token more than once.", "card[token]")
                 record["used"] = True
-                return copy.deepcopy(record["card"]), record["_scenario"]
+                return copy.deepcopy(record["_card"]), record["_scenario"]
         else:
             self.required(data, "number", "exp_month", "exp_year")
             number = str(data["number"]).replace(" ", "").replace("-", "")
-        if not number.isdigit() or len(number) not in (15, 16, 19):
+        if not number.isascii() or not number.isdigit() or len(number) not in (15, 16, 19):
             fail("Your card number is incorrect.", "card[number]", code="incorrect_number")
         digits = [int(d) for d in number[::-1]]
         if sum(d if i % 2 == 0 else d * 2 - (9 if d * 2 > 9 else 0) for i, d in enumerate(digits)) % 10:
             fail("Your card number is incorrect.", "card[number]", code="incorrect_number")
         month = integer(data.get("exp_month", 12), "card[exp_month]", minimum=1, maximum=12)
-        year = integer(data.get("exp_year", 2030), "card[exp_year]", minimum=0)
+        year = integer(data.get("exp_year", 2030), "card[exp_year]", minimum=0, maximum=9999)
         if year < 100:
             year += 2000
         brand = "visa" if number[0] == "4" else "amex" if number[0] == "3" else "mastercard"
@@ -230,13 +230,16 @@ class PaymentsAPI(BaseAPI):
         self.check_client_secret(intent)
         if intent["status"] not in {"requires_payment_method", "requires_confirmation", "requires_action"}:
             self.invalid_state(
-                "This PaymentIntent cannot be confirmed because it has already succeeded or been canceled."
+                "This intent cannot be confirmed because it has already succeeded or been canceled.",
+                setup=setup,
             )
         pm = self.payment_method_for(p, intent["customer"])
         if pm:
+            if pm["id"] != intent["payment_method"]:
+                intent.pop("_authenticated", None)
             intent["payment_method"] = pm["id"]
         elif intent["payment_method"]:
-            pm = self.payment_method(intent["payment_method"])
+            pm = self.payment_method_for({"payment_method": intent["payment_method"]}, intent["customer"])
         if not pm:
             fail(
                 "You cannot confirm this PaymentIntent because it's missing a payment method.",
@@ -426,19 +429,23 @@ class PaymentsAPI(BaseAPI):
         previous = copy.deepcopy(intent)
         prefix = "setup_intent" if setup else "payment_intent"
         if operation == "cancel":
-            if intent["status"] not in {
+            allowed = {
                 "requires_payment_method",
                 "requires_confirmation",
                 "requires_action",
-                "requires_capture",
-                "processing",
-            }:
+            } | ({"requires_capture", "processing"} if not setup else set())
+            if intent["status"] not in allowed:
                 self.invalid_state(
-                    "You cannot cancel this PaymentIntent because it has a status of "
-                    + intent["status"]
-                    + "."
+                    "You cannot cancel this intent because it has a status of " + intent["status"] + ".",
+                    setup=setup,
                 )
-            intent.update(status="canceled", cancellation_reason=p.get("cancellation_reason"))
+            reason = p.get("cancellation_reason")
+            reasons = {None, "duplicate", "requested_by_customer", "abandoned"} | (
+                {"fraudulent"} if not setup else set()
+            )
+            if reason not in reasons:
+                fail("Invalid enum value", "cancellation_reason")
+            intent.update(status="canceled", cancellation_reason=reason, next_action=None)
             if not setup:
                 intent.update(canceled_at=self.now, amount_capturable=0)
             await self.emit(prefix + ".canceled", intent, previous)
@@ -569,6 +576,7 @@ class PaymentsAPI(BaseAPI):
     ) -> Any:
         if collection == "tokens" and method == "POST" and not record_id:
             card, scenario = self.make_card(p.get("card", {}))
+            full_card = copy.deepcopy(card)
             card = {
                 k: v
                 for k, v in card.items()
@@ -598,14 +606,25 @@ class PaymentsAPI(BaseAPI):
                 name=None,
                 tokenization_method=None,
             )
-            token = self.new("tokens", card=card, client_ip=None, type="card", used=False, _scenario=scenario)
+            token = self.new(
+                "tokens",
+                card=card,
+                client_ip=None,
+                type="card",
+                used=False,
+                _scenario=scenario,
+                _card=full_card,
+            )
             token.pop("metadata", None)
             return token
         if collection == "payment_methods":
             if method == "POST" and not record_id:
+                self.required(p, "type")
                 pm = self.create_payment_method(p)
                 await self.emit("payment_method.created", pm)
                 return pm
+            if method == "GET":
+                return None
             pm = self.payment_method(record_id) if record_id else None
             if method == "POST" and operation in {"attach", "detach"}:
                 previous = copy.deepcopy(pm)
@@ -632,12 +651,21 @@ class PaymentsAPI(BaseAPI):
                 self.update(pm, p, {"billing_details", "allow_redisplay"})
                 if "card" in p:
                     for key in {"exp_month", "exp_year"} & p["card"].keys():
-                        pm["card"][key] = integer(p["card"][key], f"card[{key}]", minimum=1)
+                        pm["card"][key] = integer(
+                            p["card"][key],
+                            f"card[{key}]",
+                            minimum=1,
+                            maximum=12 if key == "exp_month" else 9999,
+                        )
                 await self.emit("payment_method.updated", pm)
                 return pm
         if collection in {"payment_intents", "setup_intents"}:
             setup = collection == "setup_intents"
             if method == "POST" and not record_id:
+                if boolean(p.get("confirm", False)) and not (
+                    p.get("payment_method") or p.get("payment_method_data")
+                ):
+                    fail("You cannot confirm this intent without a payment method.", "payment_method")
                 intent = self.create_intent(p, setup=setup)
                 await self.emit(("setup_intent" if setup else "payment_intent") + ".created", intent)
                 if boolean(p.get("confirm", False)):
@@ -654,13 +682,26 @@ class PaymentsAPI(BaseAPI):
                     if intent["status"] in {"canceled", "succeeded"} and any(
                         key in p for key in {"amount", "payment_method", "customer"}
                     ):
-                        self.invalid_state("This PaymentIntent can no longer be updated.")
+                        self.invalid_state("This intent can no longer be updated.", setup=setup)
                     self.update(intent, p, {"description", "receipt_email", "setup_future_usage", "shipping"})
                     if "amount" in p and not setup:
-                        intent["amount"] = integer(p["amount"], "amount", minimum=1)
+                        intent["amount"] = integer(p["amount"], "amount", minimum=1, maximum=99999999)
+                    if "customer" in p:
+                        customer = p["customer"] or None
+                        if customer:
+                            self.get("customers", customer, "customer")
+                        elif self.customer_scope:
+                            fail("A customer is required for this API key.", "customer", status=403)
+                        if intent["payment_method"] and "payment_method" not in p:
+                            self.payment_method_for({"payment_method": intent["payment_method"]}, customer)
+                        intent["customer"] = customer
                     if "payment_method" in p:
-                        intent["payment_method"] = self.payment_method_for(p, intent["customer"])["id"]
-                        intent["status"] = "requires_confirmation"
+                        pm = self.payment_method_for(p, intent["customer"])
+                        intent["payment_method"] = pm["id"] if pm else None
+                        intent["status"] = "requires_confirmation" if pm else "requires_payment_method"
+                        intent["next_action"] = None
+                        intent.pop("_authenticated", None)
+                    intent["last_setup_error" if setup else "last_payment_error"] = None
                     return intent
         if collection == "refunds" and method == "POST" and not record_id:
             return await self.create_refund(p)

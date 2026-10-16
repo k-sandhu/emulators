@@ -17,6 +17,7 @@ def seed(api: CommerceAPI) -> None:
     prices: dict[str, Record] = {}
     customers: dict[str, Record] = {}
     methods: dict[str, Record] = {}
+    api.now = min(int(customer.created.timestamp()) for customer in ctx.world.card_customers) - 86400
     for world_product in ctx.world.products:
         product = api.make_product(
             {
@@ -171,7 +172,7 @@ def seed(api: CommerceAPI) -> None:
         end_anchor = anchor - 30 * 86400 if final_status == "canceled" else anchor
         iterations = 0
         while start <= end_anchor and iterations < 100:
-            end = period_end(start, price["recurring"])
+            end = period_end(start, price["recurring"], anchor=subscription["billing_cycle_anchor"])
             item.update(current_period_start=start, current_period_end=end)
             api.now = start
             latest = end > end_anchor
@@ -214,7 +215,7 @@ def seed(api: CommerceAPI) -> None:
 
     paid_charges = [c for c in ctx.store.collection("charges") if c["paid"]]
     for charge in paid_charges[-2:]:
-        api.now = min(anchor - 2 * 86400, charge["created"] + 86400)
+        api.now = max(charge["created"], min(anchor - 2 * 86400, charge["created"] + 86400))
         amount = min(10000, charge["amount_captured"])
         refund = api.new(
             "refunds",
@@ -236,7 +237,7 @@ def seed(api: CommerceAPI) -> None:
         charge.update(amount_refunded=amount, refunded=amount == charge["amount_captured"])
         charge["refunds"]["data"].append(copy.deepcopy(refund))
     if paid_charges:
-        api.now = anchor - 3 * 86400
+        api.now = max(anchor - 3 * 86400, paid_charges[-1]["created"])
         api.make_dispute(paid_charges[-1])
     for week in range(8, 0, -1):
         api.now = anchor - week * 7 * 86400

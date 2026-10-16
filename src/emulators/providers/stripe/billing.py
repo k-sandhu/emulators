@@ -10,10 +10,11 @@ from typing import Any
 
 from emulators.core.errors import EmulatorError
 from emulators.providers.stripe.payments import PaymentsAPI
+from emulators.providers.stripe.validation import timestamp
 from emulators.providers.stripe.wire import Record, boolean, fail, integer, metadata
 
 
-def period_end(start: int, recurring: Record) -> int:
+def period_end(start: int, recurring: Record, *, anchor: int | None = None) -> int:
     dt = datetime.fromtimestamp(start, UTC)
     count = int(recurring.get("interval_count", 1))
     interval = recurring["interval"]
@@ -21,9 +22,12 @@ def period_end(start: int, recurring: Record) -> int:
         return start + count * (86400 if interval == "day" else 604800)
     months = count * (12 if interval == "year" else 1)
     year, month0 = divmod(dt.year * 12 + dt.month - 1 + months, 12)
+    if year > 9999:
+        fail("The recurring period exceeds the supported timestamp range.", "recurring")
+    day = datetime.fromtimestamp(anchor, UTC).day if anchor is not None else dt.day
     return int(
         dt.replace(
-            year=year, month=month0 + 1, day=min(dt.day, calendar.monthrange(year, month0 + 1)[1])
+            year=year, month=month0 + 1, day=min(day, calendar.monthrange(year, month0 + 1)[1])
         ).timestamp()
     )
 
@@ -35,6 +39,8 @@ class BillingAPI(PaymentsAPI):
         self.customer_time(customer)
         if customer.get("deleted"):
             fail("Cannot create an invoice for a deleted customer.", "customer")
+        if p.get("default_payment_method"):
+            self.payment_method_for({"payment_method": p["default_payment_method"]}, customer["id"])
         invoice = self.new(
             "invoices",
             account_country=self.ctx.world.org.address.country_code,
@@ -67,7 +73,7 @@ class BillingAPI(PaymentsAPI):
             default_tax_rates=[],
             description=p.get("description"),
             discounts=[],
-            due_date=integer(p["due_date"], "due_date") if p.get("due_date") else None,
+            due_date=timestamp(p["due_date"], "due_date") if p.get("due_date") else None,
             ending_balance=None,
             footer=p.get("footer"),
             from_invoice=None,
@@ -123,7 +129,9 @@ class BillingAPI(PaymentsAPI):
             _line_ids=[],
         )
         if p.get("days_until_due"):
-            invoice["due_date"] = self.now + integer(p["days_until_due"], "days_until_due", minimum=0) * 86400
+            invoice["due_date"] = timestamp(
+                self.now + integer(p["days_until_due"], "days_until_due", minimum=0) * 86400, "days_until_due"
+            )
         if invoice["collection_method"] not in {"charge_automatically", "send_invoice"}:
             fail("Invalid enum value", "collection_method")
         if invoice["collection_method"] == "send_invoice" and not invoice["due_date"]:
@@ -163,6 +171,8 @@ class BillingAPI(PaymentsAPI):
         if p.get("pending_invoice_items_behavior", "exclude") == "include":
             for item in self.ctx.store.collection("invoiceitems"):
                 if item["customer"] == customer["id"] and item["invoice"] is None:
+                    if item["currency"] != invoice["currency"]:
+                        continue
                     item["invoice"] = invoice["id"]
                     line = self.add_line(
                         invoice,
@@ -492,12 +502,17 @@ class BillingAPI(PaymentsAPI):
             test_clock=customer.get("test_clock"),
             transfer_data=None,
             trial_end=trial_end,
-            trial_settings=p.get(
-                "trial_settings", {"end_behavior": {"missing_payment_method": "create_invoice"}}
-            ),
+            trial_settings=p.get("trial_settings", {}),
             trial_start=self.now if trial else None,
         )
         metadata(subscription, p)
+        subscription["trial_settings"] = {
+            "end_behavior": {
+                "missing_payment_method": p.get("trial_settings", {})
+                .get("end_behavior", {})
+                .get("missing_payment_method", "create_invoice")
+            }
+        }
         items = [self.make_subscription_item(subscription, i) for i in p["items"]]
         subscription["currency"] = items[0]["price"]["currency"]
         if any(item["price"]["currency"] != subscription["currency"] for item in items):
@@ -516,6 +531,8 @@ class BillingAPI(PaymentsAPI):
         price = self.get("prices", p["price"], "items[price]")
         if not price["recurring"] or not price["active"]:
             fail("The price specified is not a recurring price.", "items[price]")
+        if "items" in subscription and price["currency"] != subscription["currency"]:
+            fail("All prices must have the same currency.", "price")
         start = subscription.get("trial_end") or self.now
         return self.new(
             "subscription_items",
@@ -557,7 +574,10 @@ class BillingAPI(PaymentsAPI):
             try:
                 await self.pay_invoice(invoice, {})
             except EmulatorError as exc:
-                if p.get("payment_behavior") == "error_if_incomplete":
+                if p.get("payment_behavior") == "error_if_incomplete" or (
+                    exc.status != 402
+                    and exc.body.get("error", {}).get("code") != "invoice_no_payment_method_types"
+                ):
                     raise exc
         if (invoice["status"] == "paid" and subscription["status"] != "trialing") or invoice[
             "collection_method"
@@ -615,7 +635,9 @@ class BillingAPI(PaymentsAPI):
                 for item in items:
                     if item["current_period_end"] <= end:
                         item["current_period_start"] = end
-                        item["current_period_end"] = period_end(end, item["price"]["recurring"])
+                        item["current_period_end"] = period_end(
+                            end, item["price"]["recurring"], anchor=subscription["billing_cycle_anchor"]
+                        )
                 if subscription["status"] == "trialing":
                     subscription["status"] = "active"
                 invoice = self.make_invoice(
@@ -723,6 +745,8 @@ class BillingAPI(PaymentsAPI):
             if record_id and method in {"POST", "DELETE"}:
                 subscription = self.get(collection, record_id)
                 if method == "DELETE":
+                    if operation:
+                        fail("Unrecognized request URL.", status=404)
                     return await self.cancel_subscription(subscription)
                 previous = copy.deepcopy(subscription)
                 if operation == "resume":
@@ -742,6 +766,10 @@ class BillingAPI(PaymentsAPI):
                         p,
                         {"cancel_at_period_end", "default_payment_method", "description", "pause_collection"},
                     )
+                    if p.get("default_payment_method"):
+                        self.payment_method_for(
+                            {"payment_method": p["default_payment_method"]}, subscription["customer"]
+                        )
                     if "cancel_at" in p:
                         subscription["cancel_at"] = (
                             integer(p["cancel_at"], "cancel_at") if p["cancel_at"] else None
@@ -758,10 +786,7 @@ class BillingAPI(PaymentsAPI):
                                 if "quantity" in item_params:
                                     item["quantity"] = integer(item_params["quantity"], "quantity", minimum=0)
                                 if "price" in item_params:
-                                    price = self.get("prices", item_params["price"])
-                                    if not price["recurring"]:
-                                        fail("The price must be recurring.", "price")
-                                    item["price"] = copy.deepcopy(price)
+                                    self.change_item_price(subscription, item, item_params)
                         else:
                             subscription["items"]["data"].append(
                                 self.make_subscription_item(subscription, item_params)
@@ -773,7 +798,7 @@ class BillingAPI(PaymentsAPI):
                         await self.prorate(subscription, previous, p)
                 await self.emit("customer.subscription.updated", subscription, previous)
                 return subscription
-        if collection == "subscription_items" and method in {"POST", "DELETE"}:
+        if collection == "subscription_items" and method in {"POST", "DELETE"} and not operation:
             if not record_id:
                 self.required(p, "subscription")
                 subscription = self.get("subscriptions", p["subscription"])
@@ -792,16 +817,15 @@ class BillingAPI(PaymentsAPI):
                 if "quantity" in p:
                     item["quantity"] = integer(p["quantity"], "quantity", minimum=0)
                 if "price" in p:
-                    price = self.get("prices", p["price"])
-                    if not price["recurring"]:
-                        fail("The price must be recurring.", "price")
-                    item["price"] = copy.deepcopy(price)
+                    self.change_item_price(subscription, item, p)
                 metadata(item, p)
             subscription["items"]["total_count"] = len(subscription["items"]["data"])
             await self.emit("customer.subscription.updated", subscription)
             return item
         if collection == "invoices":
-            if record_id in {"upcoming", "create_preview"}:
+            if record_id in {"upcoming", "create_preview"} and not operation:
+                if method != ("GET" if record_id == "upcoming" else "POST"):
+                    fail("Unrecognized request URL.", status=404)
                 snapshot = self.ctx.store.snapshot()
                 try:
                     subscription = (
@@ -876,6 +900,10 @@ class BillingAPI(PaymentsAPI):
                             )
                         return invoice
                     if not operation:
+                        if p.get("default_payment_method"):
+                            self.payment_method_for(
+                                {"payment_method": p["default_payment_method"]}, invoice["customer"]
+                            )
                         self.update(
                             invoice,
                             p,
@@ -883,7 +911,7 @@ class BillingAPI(PaymentsAPI):
                         )
                         await self.emit("invoice.updated", invoice)
                         return invoice
-        if collection == "invoiceitems" and method in {"POST", "DELETE"}:
+        if collection == "invoiceitems" and method in {"POST", "DELETE"} and not operation:
             if record_id:
                 item = self.get(collection, record_id)
                 if item["invoice"] and self.get("invoices", item["invoice"])["status"] != "draft":
@@ -903,8 +931,7 @@ class BillingAPI(PaymentsAPI):
                     await self.emit("invoiceitem.deleted", item)
                     return {"id": record_id, "object": "invoiceitem", "deleted": True}
                 self.update(item, p, {"description"})
-                if "amount" in p:
-                    item["amount"] = integer(p["amount"], "amount")
+                self.invoice_item_values(item, p)
                 if item["invoice"]:
                     invoice = self.get("invoices", item["invoice"])
                     for line_id in invoice["_line_ids"]:
@@ -915,27 +942,23 @@ class BillingAPI(PaymentsAPI):
                                 amount=item["amount"],
                                 subtotal=item["amount"],
                                 description=item["description"],
+                                quantity=item["quantity"],
+                                pricing=copy.deepcopy(item["pricing"]),
+                                period=copy.deepcopy(item["period"]),
                             )
                     self.recalculate(invoice)
                 await self.emit("invoiceitem.updated", item)
                 return item
             self.required(p, "customer")
             self.get("customers", p["customer"], "customer")
-            pricing = p.get("pricing", {})
-            price_id = p.get("price") or pricing.get("price")
-            price = self.get("prices", price_id, "price") if price_id else None
-            quantity = integer(p.get("quantity", 1), "quantity", minimum=1)
-            if price:
-                amount, currency = price["unit_amount"] * quantity, price["currency"]
-            else:
-                self.required(p, "currency")
-                amount = integer(
-                    p.get("amount", integer(p.get("unit_amount", 0), "unit_amount") * quantity), "amount"
-                )
-                currency = p["currency"]
+            values: Record = {"quantity": 1, "period": {"start": self.now, "end": self.now}, "pricing": None}
+            self.invoice_item_values(values, p, create=True)
+            amount, currency, quantity = values["amount"], values["currency"], values["quantity"]
             invoice = self.get("invoices", p["invoice"], "invoice") if p.get("invoice") else None
             if invoice and (invoice["status"] != "draft" or invoice["customer"] != p["customer"]):
                 fail("The invoice is not an editable draft for this customer.", "invoice")
+            if invoice and invoice["currency"] != currency:
+                fail("The currency must match the invoice currency.", "currency")
             item = self.new(
                 "invoiceitems",
                 amount=amount,
@@ -946,32 +969,88 @@ class BillingAPI(PaymentsAPI):
                 discountable=True,
                 discounts=[],
                 invoice=invoice["id"] if invoice else None,
-                period=p.get("period", {"start": self.now, "end": self.now}),
-                pricing={
-                    "type": "price_details",
-                    "price_details": {"price": price["id"], "product": price["product"]},
-                    "unit_amount_decimal": str(price["unit_amount"]),
-                }
-                if price
-                else None,
+                period=values["period"],
+                pricing=values["pricing"],
                 proration=False,
                 quantity=quantity,
                 subscription=p.get("subscription"),
                 tax_rates=[],
                 test_clock=None,
-                unit_amount=amount // quantity,
+                unit_amount=values["unit_amount"],
             )
             metadata(item, p)
             if invoice:
-                self.add_line(
+                line = self.add_line(
                     invoice,
                     amount,
                     currency,
                     description=item["description"],
-                    price=price,
+                    price=self.get("prices", values["pricing"]["price_details"]["price"])
+                    if values["pricing"]
+                    else None,
                     quantity=quantity,
                     invoice_item=item["id"],
                 )
+                line["period"] = copy.deepcopy(item["period"])
+                self.recalculate(invoice)
             await self.emit("invoiceitem.created", item)
             return item
         return None
+
+    def invoice_item_values(self, item: Record, p: Record, *, create: bool = False) -> None:
+        """Keep amounts, quantities and line periods consistent after every supported edit."""
+        quantity = integer(p.get("quantity", item["quantity"]), "quantity", minimum=0)
+        price_id = p.get("price") or p.get("pricing", {}).get("price")
+        price = self.get("prices", price_id, "price") if price_id else None
+        if p.get("price_data"):
+            price = self.make_price(p["price_data"])
+        if price:
+            item.update(
+                currency=price["currency"],
+                unit_amount=price["unit_amount"],
+                pricing={
+                    "type": "price_details",
+                    "price_details": {"price": price["id"], "product": price["product"]},
+                    "unit_amount_decimal": str(price["unit_amount"]),
+                },
+            )
+        elif create:
+            self.required(p, "currency")
+            if not any(key in p for key in {"amount", "unit_amount", "unit_amount_decimal"}):
+                self.required(p, "amount")
+            item["currency"] = p["currency"]
+        if "unit_amount" in p or "unit_amount_decimal" in p:
+            item["unit_amount"] = integer(p.get("unit_amount", p.get("unit_amount_decimal")), "unit_amount")
+            item["pricing"] = None
+        if "amount" in p:
+            item["amount"] = integer(p["amount"], "amount")
+            item["unit_amount"] = item["amount"] // max(1, quantity)
+            item["pricing"] = None
+        elif price or "quantity" in p or "unit_amount" in p or "unit_amount_decimal" in p:
+            item["amount"] = item["unit_amount"] * quantity
+        item["quantity"] = quantity
+        if "period" in p:
+            item["period"] = {
+                **item["period"],
+                **{k: timestamp(v, f"period[{k}]") for k, v in p["period"].items() if k in {"start", "end"}},
+            }
+            if item["period"]["start"] > item["period"]["end"]:
+                fail("The period end must be after or equal to its start.", "period[end]")
+
+    def change_item_price(self, subscription: Record, item: Record, p: Record) -> None:
+        price = self.get("prices", p["price"], "price")
+        if not price["recurring"] or not price["active"]:
+            fail("The price must be an active recurring price.", "price")
+        if price["currency"] != subscription["currency"]:
+            fail("All prices must have the same currency.", "price")
+        item["price"] = copy.deepcopy(price)
+        item["plan"].update(
+            id=price["id"],
+            active=price["active"],
+            amount=price["unit_amount"],
+            currency=price["currency"],
+            product=price["product"],
+            interval=price["recurring"]["interval"],
+            interval_count=price["recurring"]["interval_count"],
+        )
+        item["quantity"] = integer(p.get("quantity", 1), "quantity", minimum=0)

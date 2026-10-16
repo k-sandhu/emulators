@@ -64,11 +64,18 @@ class StripeMiddleware:
                 if "x-www-form-urlencoded" in request.headers.get("content-type", "")
                 else body.hex()
             )
-        except Exception:
-            parsed = body.hex()
+            query = decode(scope.get("query_string", b""))
+        except (EmulatorError, UnicodeDecodeError) as exc:
+            error = (
+                exc.body
+                if isinstance(exc, EmulatorError)
+                else {"error": {"type": "invalid_request_error", "message": "Invalid UTF-8 in request body."}}
+            )
+            await JSONResponse(error, status_code=400)(scope, receive, headers_send)
+            return
         fingerprint = hashlib.sha256(
             json.dumps(
-                ["/v1/" + scope["path"].split("/v1/", 1)[-1], decode(scope.get("query_string", b"")), parsed],
+                ["/v1/" + scope["path"].split("/v1/", 1)[-1], query, parsed],
                 sort_keys=True,
             ).encode()
         ).hexdigest()

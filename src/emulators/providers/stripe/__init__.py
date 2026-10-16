@@ -7,14 +7,14 @@ from datetime import timedelta
 from typing import Any
 
 from fastapi import FastAPI, Request
-from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
+from starlette.responses import HTMLResponse, JSONResponse, Response
 
-from emulators.core.auth import OAuthError, basic_credentials
 from emulators.core.errors import EmulatorError
 from emulators.core.middleware import FaultRule
 from emulators.core.provider import Provider, ProviderContext
 from emulators.providers.stripe.api import StripeAPI, checkout_page, parameters
 from emulators.providers.stripe.middleware import StripeMiddleware
+from emulators.providers.stripe.oauth import register_oauth
 from emulators.providers.stripe.seed import seed
 from emulators.providers.stripe.wire import PUBLIC_KEY, SECRET_KEY, VERSION, Record, fail, integer
 
@@ -57,13 +57,17 @@ class StripeProvider(Provider):
             }
         }
 
-    def fault_response(self, rule: FaultRule) -> tuple[int, dict[str, str], bytes]:
-        status, headers, body = super().fault_response(rule)
+    def fault_response(
+        self, rule: FaultRule, scope: dict[str, Any] | None = None
+    ) -> tuple[int, dict[str, str], bytes]:
+        status, headers, body = super().fault_response(rule, scope)
         from emulators.core.ids import stable_hash
 
         headers.update(
             {"Request-Id": "req_" + stable_hash(rule.id, rule.hits, length=24), "Stripe-Version": VERSION}
         )
+        if scope:
+            headers["Stripe-Version"] = Request(scope).headers.get("stripe-version", VERSION)
         return status, headers, body
 
     def build(self, app: FastAPI, ctx: ProviderContext) -> None:
@@ -122,110 +126,7 @@ class StripeProvider(Provider):
                 "<!doctype html><html><head><title>Customer portal</title></head><body><h1>Halcyon billing portal</h1></body></html>"
             )
 
-        @app.get("/oauth/authorize")
-        async def authorize(request: Request) -> Response:
-            from emulators.core.auth import redirect_with_params
-
-            p = dict(request.query_params)
-            if not p.get("client_id") or not p.get("redirect_uri"):
-                fail("Missing client_id or redirect_uri.")
-            ctx.tokens.authenticate_client(p["client_id"], None, require_secret=False)
-            grant = ctx.tokens.issue_code(
-                client_id=p["client_id"],
-                user_id=ctx.world.org.stripe_account_id,
-                scopes=[p.get("scope", "read_write")],
-                redirect_uri=p["redirect_uri"],
-            )
-            return RedirectResponse(
-                redirect_with_params(p["redirect_uri"], {"code": grant.token, "state": p.get("state")}),
-                status_code=302,
-            )
-
-        @app.post("/oauth/token")
-        async def oauth_token(request: Request) -> Response:
-            p = await parameters(request)
-            client_id, secret = basic_credentials(request) or (
-                p.get("client_id"),
-                p.get("client_secret"),
-            )
-            try:
-                if client_id and client_id.startswith("sk_test_"):
-                    secret, client_id = client_id, None
-                code_grant = ctx.tokens.get(p.get("code"), "code")
-                client_id = client_id or (code_grant.client_id if code_grant else "emulator-client")
-                if secret and not secret.startswith("sk_test_"):
-                    raise OAuthError("invalid_client", "Invalid API key.", 401)
-                if not ctx.tokens.lenient_clients and secret != SECRET_KEY:
-                    raise OAuthError("invalid_client", "Invalid API key.", 401)
-                if p.get("grant_type") == "authorization_code":
-                    grant = ctx.tokens.redeem_code(
-                        p.get("code"),
-                        client_id=client_id,
-                        redirect_uri=p.get("redirect_uri"),
-                        code_verifier=None,
-                    )
-                elif p.get("grant_type") == "refresh_token":
-                    grant = ctx.tokens.resolve(p.get("refresh_token"), "refresh")
-                    if not grant:
-                        raise OAuthError("invalid_grant", "Invalid refresh token.")
-                else:
-                    raise OAuthError(
-                        "unsupported_grant_type", "Only authorization_code and refresh_token are supported."
-                    )
-            except OAuthError as exc:
-                return JSONResponse(
-                    {"error": exc.error, "error_description": exc.description}, status_code=exc.status
-                )
-            access = ctx.tokens.issue_access(
-                client_id=grant.client_id,
-                user_id=None,
-                app_only=True,
-                scopes=[],
-                prefix="sk_test_",
-                ttl=timedelta(hours=1),
-                extra={
-                    "stripe_scope": grant.extra.get(
-                        "stripe_scope", grant.scopes[0] if grant.scopes else "read_write"
-                    )
-                },
-            )
-            refresh = ctx.tokens.issue_refresh(
-                client_id=grant.client_id,
-                user_id=None,
-                app_only=True,
-                scopes=[],
-                extra={
-                    "stripe_scope": grant.extra.get(
-                        "stripe_scope", grant.scopes[0] if grant.scopes else "read_write"
-                    )
-                },
-            )
-            return JSONResponse(
-                {
-                    "access_token": access.token,
-                    "livemode": False,
-                    "refresh_token": refresh.token,
-                    "token_type": "bearer",
-                    "stripe_publishable_key": PUBLIC_KEY,
-                    "stripe_user_id": ctx.world.org.stripe_account_id,
-                    "scope": grant.extra.get(
-                        "stripe_scope", grant.scopes[0] if grant.scopes else "read_write"
-                    ),
-                }
-            )
-
-        @app.post("/oauth/deauthorize")
-        async def deauthorize(request: Request) -> Record:
-            p = await parameters(request)
-            api = StripeAPI(ctx, request, p)
-            api.authorize("account", "write")
-            api.required(p, "client_id", "stripe_user_id")
-            if p.get("stripe_user_id") != ctx.world.org.stripe_account_id:
-                fail("No such account.", "stripe_user_id")
-            for grant in ctx.store.collection("_grants"):
-                if grant["client_id"] == p["client_id"]:
-                    ctx.tokens.revoke(grant["id"])
-            return {"stripe_user_id": ctx.world.org.stripe_account_id}
+        register_oauth(app, ctx)
 
 
 async def complete_3ds(ctx: ProviderContext, payload: Record) -> Record:
@@ -286,7 +187,9 @@ async def complete_checkout(ctx: ProviderContext, payload: Record) -> Record:
 
 async def advance_time(ctx: ProviderContext, payload: Record) -> Record:
     """Advance the hub clock and process renewals for subscriptions without a test clock."""
-    seconds = integer(payload.get("seconds", 0), "seconds", minimum=0)
+    seconds = integer(
+        payload.get("seconds", 0), "seconds", minimum=0, maximum=253402300799 - ctx.clock.timestamp()
+    )
     ctx.clock.advance(timedelta(seconds=seconds))
     api = StripeAPI(ctx)
     renewed = await api.renew(ctx.clock.timestamp())

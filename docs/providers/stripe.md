@@ -29,20 +29,23 @@ and cached in the shared content-addressed blob store.
 
 | Credential | Value |
 | --- | --- |
-| Secret key | `sk_test_51HalcyonAdvisoryEmulator000000000000` |
-| Publishable key | `pk_test_51HalcyonAdvisoryEmulator000000000000` |
+| Secret key | Read `credentials.secret_key` from `GET /_emulator/info` |
+| Publishable key | Read `credentials.publishable_key` from `GET /_emulator/info` |
 | Account | `acct_1278FC417A4145FE` |
 | Successful test card | `4242424242424242`, future expiration, any three-digit CVC |
 
 Send `Authorization: Bearer <key>` or HTTP Basic with the key as username and an
 empty password. With the hub's default `lenient_clients=True`, arbitrary
 `sk_test_` and `rk_test_` keys access the seeded account. Strict mode accepts the
-documented secret key. Live-mode keys are rejected with a Stripe-shaped 401.
+secret key returned by the info endpoint. Live-mode keys are rejected with a Stripe-shaped 401.
 
 Publishable keys can create tokens and card PaymentMethods. They can retrieve or
 confirm a PaymentIntent or SetupIntent when its matching `client_secret` is
 supplied. Merchant resources require a secret key. `Stripe-Account` can select the
 seeded account; other account IDs are denied.
+Publishable keys cannot list intents, modify or attach existing PaymentMethods,
+or expand merchant resources such as customers and charges. Expanding references
+with a scoped control-plane token requires read permission on the referenced collection.
 
 `POST /_emulator/tokens` also works. App-only tokens access the merchant account.
 Delegated tokens for active Finance employees (`p025`–`p030`) or world admins
@@ -56,12 +59,16 @@ prefix or their idempotency key was previously cached. These delegated grants
 are a control-plane testing convenience; Stripe's ordinary secret keys remain
 account-scoped.
 
-Connect's headless OAuth flow supports `/oauth/authorize` with `client_id`,
-`redirect_uri`, `scope=read_only|read_write`, and `state`, followed by a form POST
+Connect's headless OAuth flow supports `/oauth/authorize` with `response_type=code`,
+`client_id`, `redirect_uri`, `scope=read_only|read_write` (default `read_only`), and `state`, followed by a form POST
 to `/oauth/token` with `grant_type=authorization_code` and the returned `code`.
-Refresh grants and `/oauth/deauthorize` are available; deauthorization revokes
-the client's local access/refresh grants. Read-only access tokens
-cannot mutate merchant resources.
+Token exchanges require the platform secret key through HTTP Basic, Bearer auth,
+or `client_secret`. Authorization codes expire after five minutes. Registered
+redirect URIs are enforced; omitting the URI selects the first registered URI.
+Refresh grants can request equal or reduced scope and revoke older access tokens
+with the same scope. Refresh tokens remain reusable. Reusing a redeemed code
+revokes the application's local connection. `/oauth/deauthorize` revokes the
+client's local access/refresh grants. Read-only access tokens cannot mutate merchant resources.
 
 ## Wire conventions
 
@@ -69,6 +76,9 @@ POST bodies use `application/x-www-form-urlencoded`, except file uploads, which
 use multipart. Bracket forms support dictionaries, indexed arrays, `[]` arrays,
 and metadata keys containing digits. Metadata merges on update; an empty value
 removes one key, and `metadata=` clears the map.
+Malformed scalar/hash/array combinations, non-string expansions, invalid UTF-8,
+oversized integers, invalid booleans, and supported enum violations return 400.
+File downloads use UTF-8 encoded content-disposition filenames.
 
 List responses are Stripe `list` objects with `data`, `has_more`, and `url`.
 They default to 10 records, allow 1–100, sort newest first, and support
@@ -215,10 +225,20 @@ resume. `cancel_at_period_end` stops the next renewal.
 
 Quantity/price changes on subscription updates support `proration_behavior=none`,
 `create_prorations` (pending adjustment), and `always_invoice` (immediate invoice).
+Changing an item's price updates its embedded price and plan and resets quantity
+to one unless quantity is supplied. Cross-currency subscription items are rejected.
 Credit balances are consumed at invoice finalization. Renewals include pending
 invoice items. Month/year boundaries use calendar dates rather than fixed
 30/365-day arithmetic. Confirming an invoice's PaymentIntent directly also pays
 the invoice and activates its incomplete subscription.
+
+Invoice item quantity and period updates propagate to invoice lines and totals;
+period timestamps are integers. Price lookup keys remain unique, including atomic
+transfers through `transfer_lookup_key=true`. Prices reject immutable amount,
+currency, product, and recurring updates; a specified tax behavior cannot change.
+Customer creation can attach a PaymentMethod and select it as the invoice default.
+Payment confirmation rechecks attachment and ownership, even if the method changed
+after intent creation. Deleted customers retain tombstones in payment history.
 
 ## Seeded data
 
@@ -231,6 +251,8 @@ contacts, catalog descriptions, and one-off card payments originate in `ctx.worl
 History includes one invoice per subscription period since its world start date.
 No binaries are rendered during seeding; a fresh provider typically seeds in less
 than one second.
+Catalog records predate subscription history, and seeded refunds and disputes
+never predate their charges.
 
 | Record | Example |
 | --- | --- |
@@ -258,6 +280,7 @@ Creation returns a `whsec_...` secret. `enabled_events[]=*` receives all emitted
 events. Disabled endpoints do not receive events. Events contain an immutable
 `data.object` snapshot, applicable `previous_attributes`, `api_version`,
 `request.id`, `request.idempotency_key`, and `pending_webhooks`.
+Event snapshots retain their creation-time API version when retrieved with a different version.
 
 Deliveries use `ctx.webhooks.deliver` and the hub's sync/async/manual behavior,
 retry policy, and delivery journal. The signer runs for each attempt, reading
@@ -286,6 +309,9 @@ and clock lifecycle operations. Idempotent replays emit no new events.
 
 Test clocks advance their own attached customers without moving the shared hub
 clock. Use `POST /v1/test_helpers/test_clocks/{id}/advance` for those subscriptions.
+Advance targets cannot exceed two intervals of the shortest subscription, or two
+years when there are no subscriptions. Month-end billing retains the original
+anchor day after shorter months.
 `advance_time` also expires overdue Checkout sessions and settles pending payouts
 whose arrival date has passed.
 
@@ -305,7 +331,7 @@ whose arrival date has passed.
 - Clock processing is synchronous and explicit. There is no background billing
   scheduler, automatic invoice finalization timer, full retry/dunning schedule,
   `unpaid` transition policy, or delayed asynchronous payment settlement. Test
-  clock advance limits and customer-count restrictions are not enforced.
+  clock customer-count restrictions are not enforced.
 - Basic OAuth exchanges work locally. Deauthorization revokes local grants but
   does not model Connect platform membership removal. Multi-account
   data isolation is limited to rejecting account IDs other than Halcyon's.
@@ -316,9 +342,10 @@ whose arrival date has passed.
   creation, and file creation events are additionally exposed for local mutation
   tracing. The hub's generic retry schedule differs from Stripe's production
   retry schedule; event API version is the triggering request version.
-- Injected faults are shaped by the provider and carry Stripe headers, but the
-  core fault callback has no request argument, so their `Stripe-Version` header
-  uses the default rather than echoing a custom request version.
+- Hosted Checkout accepts minimal fixture sessions without enforcing every hosted
+  URL requirement. Checkout completion still creates a customer in payment mode
+  even when the real API would keep a guest checkout. SetupIntent 3DS completion
+  does not yet have a dedicated control-plane action.
 
 ## Verification and references
 
@@ -337,25 +364,22 @@ webhook configuration, multipart uploads, events, balance, and test clocks throu
 `emulator_intercept`. HTTP tests also verify official SDK webhook signatures,
 retries, permission denials, prefix routing, real PDF bytes, and accounting effects.
 
-The focused suites pass: **73 HTTP tests and 9 official SDK tests**. Ruff check and
-format checks cover only the provider and its tests, respecting ownership of the
-shared working tree.
+The focused suites pass: **118 HTTP tests, 12 official SDK tests, and 10 end-to-end
+tests**. Ruff check and format checks cover only the provider and its tests,
+respecting ownership of the shared working tree. The adversarial HTTP suite exercises
+malformed writes across resource areas, failed-validation atomicity, scoped and
+publishable-key denials, OAuth lifecycle, deleted records, Unicode uploads, and
+billing consistency. A separate 281-request in-process fuzz pass completed without
+server exceptions after the fixes.
 
-A repository-wide run during concurrent provider development recorded **746 passed,
-5 failed, 25 errors, and 2 skipped**. Its blockers were outside Stripe's allowed
-edit paths: Box route initialization raised `UnboundLocalError` for `content`,
-Dropbox was being edited and raised a syntax error, Zoom's acceptance flow returned
-404, and a Microsoft notification test received five notifications instead of three.
-The shared Stripe acceptance test's receiver returned 422 because its function-local
-`Request` import and deferred annotation were interpreted as a required query
-parameter. The provider recorded those failed deliveries correctly; the dedicated
-HTTP and SDK receiver tests use a module-level annotation and verify delivery and
-signatures successfully. A fresh temporary directory was used for that full run
-to avoid the machine's locked default pytest temp directory. These cross-provider
-and acceptance-fixture fixes belong to the coordinator.
 
 Reference contracts: [PaymentIntents](https://docs.stripe.com/api/payment_intents/confirm),
 [modern invoices](https://docs.stripe.com/api/invoices/object?api-version=2025-09-30.clover),
 [subscriptions](https://docs.stripe.com/api/subscriptions/object?api-version=2025-09-30.clover),
 [idempotency](https://docs.stripe.com/api/idempotent_requests), and
 [webhook signatures](https://docs.stripe.com/webhooks/signature).
+Audit references also include [Connect OAuth](https://docs.stripe.com/connect/oauth-reference),
+[price updates](https://docs.stripe.com/api/prices/update),
+[subscription item updates](https://docs.stripe.com/api/subscription_items/update),
+[invoice item updates](https://docs.stripe.com/api/invoiceitems/update), and
+[test clock advance limits](https://docs.stripe.com/api/test_clocks/advance).

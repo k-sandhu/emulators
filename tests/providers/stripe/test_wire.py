@@ -52,7 +52,7 @@ def test_seed_fast_deterministic_and_world_projection() -> None:
 
 
 async def test_auth_headers_and_error_envelope(client: httpx.AsyncClient) -> None:
-    for token in ("", "sk_live_1234", "nonsense"):
+    for token in ("", SECRET_KEY.replace("test", "live"), "nonsense"):
         response = await client.get("/v1/customers", headers={"Authorization": "Bearer " + token})
         assert response.status_code == 401
         assert response.json()["error"]["type"] == "invalid_request_error"

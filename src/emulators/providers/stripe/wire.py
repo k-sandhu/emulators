@@ -36,7 +36,12 @@ def fail(
 def integer(value: Any, param: str, *, minimum: int | None = None, maximum: int | None = None) -> int:
     if isinstance(value, bool) or not re.fullmatch(r"-?\d+", str(value)):
         fail(f"Invalid integer: {value}", param)
-    number = int(value)
+    try:
+        number = int(value)
+    except ValueError:
+        fail("Invalid integer: value is too large.", param)
+    if number < -(2**63) or number > 2**63 - 1:
+        fail("Invalid integer: value is outside the supported range.", param)
     if minimum is not None and number < minimum:
         fail(f"This value must be greater than or equal to {minimum}.", param)
     if maximum is not None and number > maximum:
@@ -56,7 +61,7 @@ def boolean(value: Any) -> bool:
 def decode(data: str | bytes | Iterable[tuple[str, str]]) -> Record:
     """Decode nested Stripe forms without conflating indexed arrays with dictionaries."""
     pairs = (
-        parse_qsl(data.decode() if isinstance(data, bytes) else data, keep_blank_values=True)
+        parse_qsl(data.decode() if isinstance(data, bytes) else data, keep_blank_values=True, errors="strict")
         if isinstance(data, (str, bytes))
         else data
     )
@@ -96,6 +101,8 @@ def decode(data: str | bytes | Iterable[tuple[str, str]]) -> Record:
                     node = node[slot]
             elif isinstance(node, dict):
                 if last:
+                    if isinstance(node.get(part), (dict, list)):
+                        fail(f"Conflicting parameters for {key}.", key)
                     node[part] = value
                 else:
                     if part not in node:

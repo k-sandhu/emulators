@@ -144,6 +144,7 @@ async def test_oauth_connect_roundtrip(client: httpx.AsyncClient) -> None:
     response = await client.get(
         "https://connect.stripe.com/oauth/authorize",
         params={
+            "response_type": "code",
             "client_id": "ca_test",
             "redirect_uri": "https://halcyonadvisory.example/oauth",
             "scope": "read_write",

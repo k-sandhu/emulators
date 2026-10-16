@@ -7,12 +7,14 @@ from datetime import UTC, datetime
 from email import policy
 from email.parser import BytesParser
 from typing import Any
+from urllib.parse import quote
 
 from fastapi import Request
 from starlette.responses import HTMLResponse, Response
 
 from emulators.providers.stripe.commerce import CommerceAPI
 from emulators.providers.stripe.common import RESOURCES
+from emulators.providers.stripe.validation import validate_parameters
 from emulators.providers.stripe.wire import Record, clean, decode, fail
 from emulators.world.documents import make_pdf
 
@@ -35,14 +37,14 @@ class StripeAPI(CommerceAPI):
         record_id = parts.pop(0) if parts else None
         operation = parts.pop(0) if parts else None
         child_id = parts.pop(0) if parts else None
-        if parts:
+        if parts or (child_id and collection != "customers"):
             fail("Unrecognized request URL.", status=404)
         self.authorize(collection, "read" if method == "GET" else "write")
         p = self.params
         record = self.ctx.store.collection(collection).get(record_id) if record_id else None
         customer_id = p.get("customer") or (record.get("customer") if record else None)
         if customer_id:
-            self.customer_time(self.get("customers", customer_id, "customer"))
+            self.customer_time(self.get("customers", customer_id, "customer", allow_deleted=True))
         if collection == "balance" and method == "GET" and not record_id:
             return self.balance()
         if collection == "account" and method == "GET" and not record_id:
@@ -86,7 +88,10 @@ class StripeAPI(CommerceAPI):
                 return Response(
                     self.ctx.store.blobs.get(file["_blob"]),
                     media_type=file["_mime"],
-                    headers={"Content-Disposition": f'attachment; filename="{file["filename"]}"'},
+                    headers={
+                        "Content-Disposition": "attachment; filename*=UTF-8''"
+                        + quote(file["filename"], safe="")
+                    },
                 )
         if method == "GET" and collection in READABLE and not operation:
             if record_id:
@@ -117,10 +122,16 @@ class StripeAPI(CommerceAPI):
         filename, mime = "upload", "application/octet-stream"
         for part in message.iter_parts():
             name = part.get_param("name", header="content-disposition")
+            payload = part.get_payload(decode=True)
+            if name in {"purpose", "file"} and not isinstance(payload, bytes):
+                fail("Invalid multipart field.", name)
             if name == "purpose":
-                purpose = part.get_payload(decode=True).decode()
+                try:
+                    purpose = payload.decode("utf-8")
+                except UnicodeDecodeError:
+                    fail("Invalid UTF-8 in multipart field.", "purpose")
             elif name == "file":
-                content = part.get_payload(decode=True)
+                content = payload
                 filename = (
                     (part.get_filename() or "upload").replace('"', "").replace("\r", "").replace("\n", "")
                 )
@@ -135,6 +146,8 @@ class StripeAPI(CommerceAPI):
             fail("Invalid file purpose.", "purpose")
         if content is None:
             fail("Missing required param: file.", "file", code="parameter_missing")
+        if not content:
+            fail("The uploaded file is empty.", "file")
         file = self.new(
             "files",
             expires_at=None,
@@ -160,7 +173,12 @@ class StripeAPI(CommerceAPI):
             return [self.view(v) for v in value]
         if not isinstance(value, dict):
             return copy.deepcopy(value)
-        result = {k: self.view(v) for k, v in value.items() if not k.startswith("_")}
+        # Event payloads retain their creation-time API version even when retrieved with another version.
+        result = (
+            clean(value)
+            if value.get("object") == "event"
+            else {k: self.view(v) for k, v in value.items() if not k.startswith("_")}
+        )
         version = (
             self.request.headers.get("stripe-version", "2025-09-30.clover")
             if self.request
@@ -241,7 +259,11 @@ class StripeAPI(CommerceAPI):
                 (c for prefix, c in PREFIX_COLLECTION.items() if value.startswith(prefix)), None
             )
             if collection:
-                value = self.view(self.get(collection, value))
+                if self.publishable and collection != "payment_methods":
+                    fail("You cannot expand this property using a publishable API key.", "expand")
+                if not self.publishable:
+                    self.authorize(collection, "read")
+                value = self.view(self.get(collection, value, allow_deleted=collection == "customers"))
                 node[key] = value
         self._expand_at(value, rest)
 
@@ -272,6 +294,7 @@ async def parameters(request: Request) -> Record:
     if request.method == "POST":
         content_type = request.headers.get("content-type", "")
         if "multipart/form-data" in content_type:
+            validate_parameters(result)
             return result
         body = await request.body()
         if body:
@@ -283,42 +306,7 @@ async def parameters(request: Request) -> Record:
                 result.update(decode(body))
             except UnicodeDecodeError:
                 fail("Invalid UTF-8 in request body.")
-    for key in {
-        "items",
-        "line_items",
-        "expand",
-        "payment_method_types",
-        "enabled_events",
-        "preferred_locales",
-        "images",
-        "lookup_keys",
-        "types",
-    } & result.keys():
-        if not isinstance(result[key], list):
-            fail("Invalid array", key)
-    for key in {
-        "metadata",
-        "address",
-        "shipping",
-        "invoice_settings",
-        "billing_details",
-        "card",
-        "recurring",
-        "product_data",
-        "price_data",
-        "payment_method_data",
-        "automatic_payment_methods",
-        "evidence",
-        "trial_settings",
-        "subscription_details",
-    } & result.keys():
-        if not isinstance(result[key], dict) and not (
-            result[key] == "" and key in {"metadata", "address", "shipping"}
-        ):
-            fail("Invalid hash", key)
-    for key in {"items", "line_items"} & result.keys():
-        if any(not isinstance(item, dict) for item in result[key]):
-            fail("Invalid hash", key)
+    validate_parameters(result)
     return result
 
 

@@ -102,10 +102,20 @@ class BaseAPI:
             fail("Expired API Key provided.", status=401)
         elif key.startswith("pk_test_") and (self.ctx.tokens.lenient_clients or key == PUBLIC_KEY):
             self.publishable = True
-            allowed = self.request.method == "POST" and collection in {"tokens", "payment_methods"}
+            path = self.request.url.path.split("/v1/", 1)[-1].strip("/").split("/")
+            allowed = (
+                self.request.method == "POST"
+                and len(path) == 1
+                and collection in {"tokens", "payment_methods"}
+            )
             allowed |= (
                 collection in {"payment_intents", "setup_intents"}
-                and (self.request.method == "GET" or self.request.url.path.endswith("/confirm"))
+                and len(path) >= 2
+                and path[1].startswith("pi_" if collection == "payment_intents" else "seti_")
+                and (
+                    (self.request.method == "GET" and len(path) == 2)
+                    or (self.request.method == "POST" and len(path) == 3 and path[2] == "confirm")
+                )
                 and bool(self.params.get("client_secret"))
             )
             if not allowed:
@@ -184,9 +194,15 @@ class BaseAPI:
         if clock:
             self.now = clock["frozen_time"]
 
-    def get(self, collection: str, record_id: Any, param: str = "id") -> Record:
+    def get(
+        self, collection: str, record_id: Any, param: str = "id", *, allow_deleted: bool = False
+    ) -> Record:
         record = self.ctx.store.collection(collection).get(record_id)
-        if record is None or not self.visible(collection, record):
+        if (
+            record is None
+            or (record.get("deleted") and not allow_deleted)
+            or not self.visible(collection, record)
+        ):
             _, obj = RESOURCES.get(collection, ("", collection.rstrip("s")))
             fail(
                 f"No such {obj.replace('_', ' ')}: '{record_id}'",
@@ -200,8 +216,6 @@ class BaseAPI:
                     else "req_emulator"
                 ),
             )
-        if record.get("deleted"):
-            return record
         return record
 
     def new(self, collection: str, **fields: Any) -> Record:
@@ -325,6 +339,8 @@ class BaseAPI:
         if not isinstance(expansions, list):
             fail("Invalid array", "expand")
         for path in expansions:
+            if not isinstance(path, str):
+                fail("Invalid string", "expand")
             parts = path.split(".")
             if len(parts) > 4:
                 fail("You cannot expand more than 4 levels of a property.", "expand")
@@ -410,12 +426,13 @@ class BaseAPI:
     def check_client_secret(self, record: Record) -> None:
         if self.publishable and self.params.get("client_secret") != record.get("client_secret"):
             fail(
-                "The client_secret provided does not match the client_secret associated with the PaymentIntent.",
+                "The client_secret provided does not match the client_secret associated with the "
+                + ("SetupIntent." if record["object"] == "setup_intent" else "PaymentIntent."),
                 "client_secret",
             )
 
-    def invalid_state(self, message: str) -> None:
-        fail(message, code="payment_intent_unexpected_state")
+    def invalid_state(self, message: str, *, setup: bool = False) -> None:
+        fail(message, code="setup_intent_unexpected_state" if setup else "payment_intent_unexpected_state")
 
 
 def copy_record(record: Record) -> Record:

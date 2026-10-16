@@ -85,7 +85,7 @@ def test_sdk_exception_mapping() -> None:
         stripe.Customer.retrieve("cus_missing")
     assert missing.value.http_status == 404 and missing.value.code == "resource_missing"
     with pytest.raises(stripe.AuthenticationError):
-        stripe.Customer.list(api_key="sk_live_invalid")
+        stripe.Customer.list(api_key=SECRET_KEY.replace("test", "live"))
 
 
 def test_setup_and_payment_method_attach_detach() -> None:
@@ -216,3 +216,62 @@ def test_connect_oauth_read_only_and_refresh(emulators: EmulatorHub) -> None:
     stripe.OAuth.deauthorize(client_id="ca_sdk", stripe_user_id=ctx.world.org.stripe_account_id)
     with pytest.raises(stripe.AuthenticationError):
         stripe.Customer.list(api_key=refreshed.access_token)
+
+
+def test_publishable_key_restrictions_and_token_card_shape() -> None:
+    credentials = httpx.get("https://api.stripe.com/_emulator/info").json()["credentials"]
+    public_key = credentials["publishable_key"]
+    with pytest.raises(stripe.PermissionError):
+        stripe.PaymentIntent.list(api_key=public_key, client_secret="arbitrary")
+    pm = stripe.PaymentMethod.create(type="card", card={"token": "tok_visa"}, api_key=public_key)
+    with pytest.raises(stripe.PermissionError):
+        stripe.PaymentMethod.modify(pm.id, billing_details={"name": "Denied"}, api_key=public_key)
+    token = stripe.Token.create(card={"number": "4242424242424242", "exp_month": 12, "exp_year": 2030})
+    method = stripe.PaymentMethod.create(type="card", card={"token": token.id})
+    assert method.card.networks.available == ["visa"]
+    assert method.card.checks.address_line1_check is None
+
+
+def test_intent_customer_update_unset_and_invoice_quantity() -> None:
+    customer = stripe.Customer.create(email="audit@halcyonadvisory.example")
+    intent = stripe.PaymentIntent.create(amount=500, currency="usd", payment_method="pm_card_visa")
+    updated = stripe.PaymentIntent.modify(intent.id, customer=customer.id, payment_method="")
+    assert updated.customer == customer.id and updated.payment_method is None
+    assert updated.status == "requires_payment_method"
+    invoice = stripe.Invoice.create(customer=customer.id)
+    item = stripe.InvoiceItem.create(
+        customer=customer.id,
+        invoice=invoice.id,
+        currency="usd",
+        unit_amount_decimal="200",
+        quantity=2,
+        period={"start": 1700000000, "end": 1700001000},
+    )
+    assert stripe.InvoiceItem.modify(item.id, quantity=3).amount == 600
+    line = stripe.Invoice.list_lines(invoice.id).data[0]
+    assert line.quantity == 3 and line.period.start == 1700000000
+
+
+def test_oauth_refresh_invalidates_old_access_and_reused_code_revokes_connection(
+    emulators: EmulatorHub,
+) -> None:
+    ctx = emulators.context("stripe")
+    code = ctx.tokens.issue_code(
+        client_id="ca_audit_sdk",
+        user_id=ctx.world.org.stripe_account_id,
+        scopes=["read_only"],
+        redirect_uri="https://halcyonadvisory.example/oauth",
+    )
+    connection = stripe.OAuth.token(
+        grant_type="authorization_code", code=code.token, client_secret=SECRET_KEY
+    )
+    fresh = stripe.OAuth.token(
+        grant_type="refresh_token", refresh_token=connection.refresh_token, client_secret=SECRET_KEY
+    )
+    with pytest.raises(stripe.AuthenticationError):
+        stripe.Customer.list(api_key=connection.access_token)
+    assert stripe.Customer.list(api_key=fresh.access_token, limit=1).data
+    with pytest.raises(stripe.oauth_error.InvalidGrantError):
+        stripe.OAuth.token(grant_type="authorization_code", code=code.token, client_secret=SECRET_KEY)
+    with pytest.raises(stripe.AuthenticationError):
+        stripe.Customer.list(api_key=fresh.access_token)
