@@ -273,8 +273,11 @@ def decode_raw(body: dict[str, Any]) -> bytes:
 
 
 def addresses(record: dict[str, Any]) -> list[str]:
-    return [
-        email.lower()
-        for _, email in getaddresses([record.get("_to", ""), record.get("_cc", ""), record.get("_bcc", "")])
-        if email
-    ]
+    # Parse each non-empty header on its own: newer Pythons' strict getaddresses() rejects the
+    # whole list when an empty Cc/Bcc is joined in, which would hide valid To recipients.
+    found: list[str] = []
+    for field in ("_to", "_cc", "_bcc"):
+        value = str(record.get(field) or "").strip()
+        if value:
+            found += [email.lower() for _, email in getaddresses([value]) if email]
+    return found

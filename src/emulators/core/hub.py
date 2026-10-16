@@ -19,6 +19,7 @@ import os
 import pkgutil
 import threading
 from collections.abc import Iterable
+from datetime import timedelta
 from typing import Any
 
 import httpx
@@ -82,7 +83,9 @@ class EmulatorHub:
             parse_instant(os.environ["EMULATORS_CLOCK"]) if os.environ.get("EMULATORS_CLOCK") else None
         )
         anchor_text = anchor or os.environ.get("EMULATORS_ANCHOR")
-        anchor_dt = parse_instant(anchor_text) if anchor_text else self.clock.now()
+        # Unpinned: anchor on the day that ended at least 10 hours ago, so "today's" seeded
+        # activity (stamped up to anchor + 9h) is always in the past for a live clock.
+        anchor_dt = parse_instant(anchor_text) if anchor_text else self.clock.now() - timedelta(hours=10)
         self.world = build_world(self.seed, anchor_dt)
         self.webhook_mode = webhook_mode or os.environ.get("EMULATORS_WEBHOOK_MODE", "async")
         self.webhook_transport = webhook_transport

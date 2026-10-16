@@ -936,6 +936,12 @@ class _Builder:
                 minutes=rng.randint(0, 59),
             )
             created = created.replace(hour=13 + rng.randint(0, 8))
+            hire = self.p(owner).hire_date
+            if hire is not None:
+                # Nobody authors files before they joined (no extra RNG draws: other values stay put).
+                earliest = datetime.combine(hire, time(15, 0), tzinfo=UTC) + timedelta(days=7)
+                if created < earliest:
+                    created = min(earliest, self.anchor - timedelta(days=1, hours=6))
             modified = min(
                 created + timedelta(days=rng.randint(0, 30), hours=rng.randint(0, 6)),
                 self.anchor + timedelta(hours=9),
