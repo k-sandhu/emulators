@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 import secrets
-from datetime import UTC, datetime, timedelta
+from datetime import timedelta
 from typing import Any
 from urllib.parse import parse_qs, urlencode
 
@@ -38,7 +38,7 @@ SCOPES = ["com.intuit.quickbooks.accounting", "openid", "profile", "email", "pho
 
 def _access_token() -> str:
     head = "eyJlbmMiOiJBMTI4Q0JDLUhTMjU2IiwiYWxnIjoiZGlyIn0"
-    return f"{head}..{secrets.token_urlsafe(90)}.{secrets.token_urlsafe(40)}"[:220]
+    return f"{head}..{secrets.token_urlsafe(16)}.{secrets.token_urlsafe(90)}.{secrets.token_urlsafe(16)}"
 
 
 def _refresh_token() -> str:
@@ -76,38 +76,48 @@ def issue_tokens(
     user: dict[str, Any],
     scopes: list[str],
     previous_refresh: str | None = None,
+    expires_in: int = 3600,
+    nonce: str | None = None,
 ) -> dict[str, Any]:
     access = ctx.tokens.issue_access(
         client_id=client_id,
         user_id=str(user["id"]),
-        scopes=scopes or list(SCOPES),
-        ttl=timedelta(seconds=3600),
+        scopes=scopes,
+        ttl=timedelta(seconds=expires_in),
         token=_access_token(),
         extra={"realm_id": realm(ctx)},
     )
     refresh = ctx.tokens.issue_refresh(
         client_id=client_id,
         user_id=str(user["id"]),
-        scopes=scopes or list(SCOPES),
+        scopes=scopes,
         ttl=timedelta(seconds=8726400),
         token=_refresh_token(),
         extra={"realm_id": realm(ctx), "previous": previous_refresh},
     )
+    if previous_refresh:
+        previous = ctx.tokens.get(previous_refresh, "refresh")
+        if previous is not None:
+            previous.expires_at = min(
+                previous.expires_at or ctx.clock.now() + timedelta(days=1),
+                ctx.clock.now() + timedelta(days=1),
+            )
+            ctx.store.collection("_grants").put(previous.to_record())
     body: dict[str, Any] = {
         "token_type": "bearer",
         "access_token": access.token,
-        "expires_in": 3600,
+        "expires_in": expires_in,
         "refresh_token": refresh.token,
         "x_refresh_token_expires_in": 8726400,
     }
     if "openid" in (scopes or []):
-        body["id_token"] = _id_token(ctx, client_id=client_id, user=user)
+        body["id_token"] = _id_token(ctx, client_id=client_id, user=user, nonce=nonce)
     return body
 
 
-def _id_token(ctx: ProviderContext, *, client_id: str, user: dict[str, Any]) -> str:
+def _id_token(ctx: ProviderContext, *, client_id: str, user: dict[str, Any], nonce: str | None = None) -> str:
     person = person_for(ctx, user)
-    now = datetime.now(UTC)
+    now = ctx.clock.now()
     claims = {
         "iss": ISSUER,
         "aud": [client_id],
@@ -120,6 +130,8 @@ def _id_token(ctx: ProviderContext, *, client_id: str, user: dict[str, Any]) -> 
         "family_name": person.last_name,
         "realmid": realm(ctx),
     }
+    if nonce is not None:
+        claims["nonce"] = nonce
     return ctx.signing_key.sign(claims, headers={"kid": ctx.signing_key.kid})
 
 
@@ -130,7 +142,7 @@ async def _form(request: Request) -> dict[str, str]:
         try:
             data = json.loads(raw)
             return {str(k): str(v) for k, v in data.items()} if isinstance(data, dict) else {}
-        except json.JSONDecodeError:
+        except (ValueError, UnicodeDecodeError):
             return {}
     parsed = parse_qs(raw.decode("utf-8", errors="replace"), keep_blank_values=True)
     return {k: v[0] for k, v in parsed.items()}
@@ -187,13 +199,17 @@ def register_identity(app: FastAPI, ctx: ProviderContext, provider: Any) -> None
             return JSONResponse(
                 {"error": "invalid_token", "error_description": "Access token is invalid or expired"},
                 status_code=401,
-                headers={"WWW-Authenticate": 'Bearer [REDACTED]"invalid_token"'},
+                headers={"WWW-Authenticate": 'Bearer error="invalid_token"'},
             )
-        user = find_user(ctx, grant.user_id) or default_user(ctx)
+        if "openid" not in grant.scopes:
+            return _oauth_error("insufficient_scope", 403)
+        user = find_user(ctx, grant.user_id)
+        if user is None or not user.get("active"):
+            return _oauth_error("invalid_token", 401)
         person = person_for(ctx, user)
         office = ctx.world.office(person.office_id) if person.office_id else None
         address = office.address if office else ctx.world.org.address
-        return {
+        result = {
             "sub": user["sub"],
             "email": person.email,
             "emailVerified": True,
@@ -209,6 +225,17 @@ def register_identity(app: FastAPI, ctx: ProviderContext, provider: Any) -> None
                 "country": address.country,
             },
         }
+        scope_fields = {
+            "email": ("email", "emailVerified"),
+            "profile": ("givenName", "familyName"),
+            "phone": ("phoneNumber", "phoneNumberVerified"),
+            "address": ("address",),
+        }
+        for scope, fields in scope_fields.items():
+            if scope not in grant.scopes:
+                for field in fields:
+                    result.pop(field, None)
+        return result
 
     @app.get("/connect/oauth2")
     async def authorize(request: Request) -> Response:
@@ -218,6 +245,8 @@ def register_identity(app: FastAPI, ctx: ProviderContext, provider: Any) -> None
         state = params.get("state")
         scope_text = params.get("scope") or " ".join(SCOPES)
         scopes = [s for s in scope_text.replace(",", " ").split() if s]
+        if any(scope not in SCOPES for scope in scopes):
+            return _oauth_error("invalid_scope")
         if params.get("response_type", "code") != "code":
             if redirect_uri:
                 return RedirectResponse(
@@ -230,12 +259,16 @@ def register_identity(app: FastAPI, ctx: ProviderContext, provider: Any) -> None
         if not redirect_uri:
             return HTMLResponse("<h1>Intuit (emulator)</h1><p>redirect_uri is required.</p>", status_code=400)
         try:
-            ctx.tokens.authenticate_client(client_id, None, require_secret=False)
+            client = ctx.tokens.authenticate_client(client_id, None, require_secret=False)
         except OAuthError as exc:
             return RedirectResponse(
                 redirect_with_params(redirect_uri, {"error": exc.error, "state": state}), status_code=302
             )
+        if not ctx.tokens.lenient_clients and redirect_uri not in client.get("redirect_uris", []):
+            return _oauth_error("invalid_request")
         user = find_user(ctx, params.get("login_hint"))
+        if user is not None and not user.get("active"):
+            return _oauth_error("access_denied", 403)
         if user is None:
             base = (
                 str(request.url).split("?")[0]
@@ -265,6 +298,9 @@ def register_identity(app: FastAPI, ctx: ProviderContext, provider: Any) -> None
             user_id=str(user["id"]),
             scopes=scopes,
             redirect_uri=redirect_uri,
+            code_challenge=params.get("code_challenge"),
+            code_challenge_method=params.get("code_challenge_method"),
+            nonce=params.get("nonce"),
             extra={"realm_id": realm(ctx)},
         )
         return RedirectResponse(
@@ -286,6 +322,9 @@ def register_identity(app: FastAPI, ctx: ProviderContext, provider: Any) -> None
         assert client_id
         grant_type = form.get("grant_type")
         if grant_type == "authorization_code":
+            pending = ctx.tokens.resolve(form.get("code"), "code")
+            if pending and pending.redirect_uri != form.get("redirect_uri"):
+                return _oauth_error("invalid_grant")
             try:
                 code = ctx.tokens.redeem_code(
                     form.get("code"),
@@ -295,17 +334,21 @@ def register_identity(app: FastAPI, ctx: ProviderContext, provider: Any) -> None
                 )
             except OAuthError as exc:
                 return _oauth_error(exc.error, exc.status)
-            user = find_user(ctx, code.user_id) or default_user(ctx)
+            user = find_user(ctx, code.user_id)
+            if user is None or not user.get("active"):
+                return _oauth_error("invalid_grant")
             return JSONResponse(
-                issue_tokens(ctx, client_id=client_id, user=user, scopes=code.scopes),
-                headers={"Cache-Control": "no-store"},
+                issue_tokens(ctx, client_id=client_id, user=user, scopes=code.scopes, nonce=code.nonce),
+                headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
             )
         if grant_type == "refresh_token":
             presented = form.get("refresh_token") or ""
-            grant = _resolve_refresh(ctx, presented)
+            grant = _resolve_refresh(ctx, presented, client_id)
             if grant is None:
                 return _oauth_error("invalid_grant")
-            user = find_user(ctx, grant.user_id) or default_user(ctx)
+            user = find_user(ctx, grant.user_id)
+            if user is None or not user.get("active"):
+                return _oauth_error("invalid_grant")
             return JSONResponse(
                 issue_tokens(
                     ctx,
@@ -314,7 +357,7 @@ def register_identity(app: FastAPI, ctx: ProviderContext, provider: Any) -> None
                     scopes=grant.scopes,
                     previous_refresh=presented,
                 ),
-                headers={"Cache-Control": "no-store"},
+                headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
             )
         if grant_type == "client_credentials":
             return _oauth_error("unsupported_grant_type")
@@ -336,11 +379,15 @@ def register_identity(app: FastAPI, ctx: ProviderContext, provider: Any) -> None
         if token_value:
             record = ctx.store.collection("_grants").get(token_value)
             if record is not None:
+                if record.get("client_id") != client_id:
+                    return _oauth_error("invalid_grant")
                 user_id = record.get("user_id")
                 ctx.tokens.revoke(token_value)
                 # revoking a refresh token disconnects the app for that user
                 if record.get("kind") == "refresh" and user_id:
-                    ctx.tokens.revoke_user(str(user_id))
+                    for associated in ctx.store.collection("_grants"):
+                        if associated.get("client_id") == client_id and associated.get("user_id") == user_id:
+                            ctx.tokens.revoke(str(associated["id"]))
         return Response(status_code=200)
 
     @app.get("/api/v1/user/current")
@@ -348,7 +395,9 @@ def register_identity(app: FastAPI, ctx: ProviderContext, provider: Any) -> None
         grant = ctx.tokens.resolve(bearer_token(request))
         if grant is None:
             raise EmulatorError(401, {"error": "invalid_token"})
-        user = find_user(ctx, grant.user_id) or default_user(ctx)
+        user = find_user(ctx, grant.user_id)
+        if user is None or not user.get("active"):
+            raise EmulatorError(401, {"error": "invalid_token"})
         person = person_for(ctx, user)
         return {
             "firstName": person.first_name,
@@ -361,14 +410,14 @@ def register_identity(app: FastAPI, ctx: ProviderContext, provider: Any) -> None
     _ = stable_hash
 
 
-def _resolve_refresh(ctx: ProviderContext, presented: str) -> Any:
+def _resolve_refresh(ctx: ProviderContext, presented: str, client_id: str) -> Any:
     """Intuit keeps the just-rotated refresh token valid until its successor is used.
 
     Rotation leaves the predecessor grant live; the first time the successor is
     presented, the predecessor is revoked.
     """
     grant = ctx.tokens.resolve(presented, "refresh")
-    if grant is None:
+    if grant is None or grant.client_id != client_id:
         return None
     previous = (grant.extra or {}).get("previous")
     if previous and str(previous) != presented:

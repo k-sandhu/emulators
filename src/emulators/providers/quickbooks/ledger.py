@@ -85,6 +85,7 @@ def postings(ctx: ProviderContext) -> list[dict[str, Any]]:
                 "txn_id": str(txn.get("Id", "")),
                 "doc_number": txn.get("DocNumber", ""),
                 "memo": txn.get("PrivateNote") or "",
+                "department": ref_value(txn.get("DepartmentRef")),
                 **dims,
             }
         )
@@ -280,12 +281,15 @@ def refresh_computed(ctx: ProviderContext) -> None:
     # sub-account rollup
     for account in accounts:
         parent_id = ref_value(account.get("ParentRef"))
-        if parent_id and accounts.get(parent_id):
+        seen = {str(account["Id"])}
+        while parent_id and parent_id not in seen and accounts.get(parent_id):
+            seen.add(parent_id)
             parent = accounts.get(parent_id)
             assert parent is not None
             parent["CurrentBalanceWithSubAccounts"] = money(
                 parent.get("CurrentBalanceWithSubAccounts", 0.0) + account.get("CurrentBalance", 0.0)
             )
+            parent_id = ref_value(parent.get("ParentRef"))
 
     # Invoice balances from linked payments / credit memos
     paid_by_invoice: dict[str, float] = {}
@@ -306,10 +310,8 @@ def refresh_computed(ctx: ProviderContext) -> None:
         if inv.get("_voided"):
             inv["Balance"] = 0.0
             continue
-        paid = paid_by_invoice.get(str(inv["Id"]))
-        if paid is not None:
-            inv["Balance"] = money(max(money(inv.get("TotalAmt")) - paid, 0.0))
-        # else keep stored Balance (seeded / explicitly set)
+        paid = paid_by_invoice.get(str(inv["Id"]), 0.0)
+        inv["Balance"] = money(max(money(inv.get("TotalAmt")) - paid - money(inv.get("Deposit")), 0.0))
 
     paid_by_bill: dict[str, float] = {}
     for bp in _records(ctx, "BillPayment"):
@@ -325,9 +327,8 @@ def refresh_computed(ctx: ProviderContext) -> None:
             if bill.get("_voided"):
                 bill["Balance"] = 0.0
             continue
-        paid = paid_by_bill.get(str(bill["Id"]))
-        if paid is not None:
-            bill["Balance"] = money(max(money(bill.get("TotalAmt")) - paid, 0.0))
+        paid = paid_by_bill.get(str(bill["Id"]), 0.0)
+        bill["Balance"] = money(max(money(bill.get("TotalAmt")) - paid, 0.0))
 
     customers = ctx.store.collection("Customer")
     own: dict[str, float] = {}
@@ -343,7 +344,7 @@ def refresh_computed(ctx: ProviderContext) -> None:
             continue
         cust = ref_value(cm.get("CustomerRef"))
         if cust:
-            own[cust] = money(own.get(cust, 0.0) - money(cm.get("Balance") or cm.get("TotalAmt")))
+            own[cust] = money(own.get(cust, 0.0) - money(cm.get("Balance", cm.get("TotalAmt"))))
     for pay in _records(ctx, "Payment"):
         if pay.get("_voided"):
             continue
@@ -355,10 +356,13 @@ def refresh_computed(ctx: ProviderContext) -> None:
         cust["BalanceWithJobs"] = cust["Balance"]
     for cust in customers:
         parent_id = ref_value(cust.get("ParentRef"))
-        if parent_id and customers.get(parent_id):
+        seen = {str(cust["Id"])}
+        while parent_id and parent_id not in seen and customers.get(parent_id):
+            seen.add(parent_id)
             parent = customers.get(parent_id)
             assert parent is not None
             parent["BalanceWithJobs"] = money(parent.get("BalanceWithJobs", 0.0) + cust.get("Balance", 0.0))
+            parent_id = ref_value(parent.get("ParentRef"))
 
     vendor_open: dict[str, float] = {}
     for bill in ctx.store.collection("Bill"):

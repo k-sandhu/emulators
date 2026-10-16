@@ -21,7 +21,7 @@ from emulators.providers.quickbooks.common import BY_LOWER, NAME_LIST, fail, mon
 
 _TOKEN_RE = re.compile(
     r"""
-    (?P<STRING>'(?:[^']|'')*')
+    (?P<STRING>'(?:\\.|[^'\\]|'')*')
   | (?P<NUMBER>-?\d+(?:\.\d+)?)
   | (?P<OP><=|>=|!=|<>|=|<|>)
   | (?P<LPAREN>\()
@@ -116,8 +116,10 @@ class _Parser:
     def literal(self) -> Any:
         kind, value = self.next()
         if kind == "STRING":
-            return value[1:-1].replace("''", "'").replace("\\'", "'")
+            return re.sub(r"\\(.)", r"\1", value[1:-1].replace("''", "'"))
         if kind == "NUMBER":
+            if len(value) > 100:
+                _error(self.ctx, "numeric literal is out of range")
             return float(value) if "." in value else int(value)
         if kind == "IDENT" and value.lower() in ("true", "false"):
             return value.lower() == "true"
@@ -140,8 +142,10 @@ class _Parser:
 
 
 def parse_query(ctx: ProviderContext, text: str) -> ParsedQuery:
-    if not text or not text.strip():
+    if not isinstance(text, str) or not text.strip():
         _error(ctx, "empty query")
+    if len(text) > 65536:
+        _error(ctx, "query is too long")
     parser = _Parser(ctx, text.strip())
     parser.expect_keyword("SELECT")
     fields: list[str] | None = None
@@ -194,13 +198,19 @@ def parse_query(ctx: ProviderContext, text: str) -> ParsedQuery:
             break
     while parser.peek() is not None:
         if parser.eat_keyword("STARTPOSITION"):
-            parsed.start = int(parser.expect("NUMBER"))
+            number = parser.expect("NUMBER")
+            if not number.isdecimal() or len(number) > 9 or int(number) < 1:
+                _error(ctx, "STARTPOSITION must be a positive integer")
+            parsed.start = int(number)
         elif parser.eat_keyword("MAXRESULTS"):
-            parsed.max_results = int(parser.expect("NUMBER"))
+            number = parser.expect("NUMBER")
+            if not number.isdecimal() or len(number) > 9 or int(number) < 1:
+                _error(ctx, "MAXRESULTS must be a positive integer")
+            parsed.max_results = int(number)
         else:
             _error(ctx, f"unexpected token {parser.peek()[1]!r}")  # type: ignore[index]
-    if parsed.start < 1:
-        parsed.start = 1
+    if fields is not None:
+        _error(ctx, "projections are not supported; use SELECT *")
     parsed.max_results = max(1, min(parsed.max_results, 1000))
     return parsed
 
@@ -285,6 +295,18 @@ def _matches(record: dict[str, Any], cond: Condition) -> bool:
 def run_query(ctx: ProviderContext, text: str) -> dict[str, Any]:
     """Execute a query and return the ``QueryResponse`` body fragment."""
     parsed = parse_query(ctx, text)
+    known = {
+        key.lower()
+        for record in ctx.store.collection(parsed.entity)
+        for key in record
+        if not key.startswith("_")
+    }
+    known |= {"id", "synctoken", "metadata", "active", "txnDate".lower(), "docnumber", "privatenote", "line"}
+    for name in [c.field for c in parsed.conditions] + [name for name, _ in parsed.order_by]:
+        if name.split(".")[0].lower() not in known:
+            fail(
+                ctx, 400, "Invalid query", f"QueryValidationError: property '{name}' is not queryable", "4001"
+            )
     records = [r for r in ctx.store.collection(parsed.entity) if not r.get("_deleted")]
     if parsed.entity in NAME_LIST and not any(c.field.lower() == "active" for c in parsed.conditions):
         records = [r for r in records if r.get("Active", True) is not False]
@@ -295,9 +317,16 @@ def run_query(ctx: ProviderContext, text: str) -> dict[str, Any]:
     total = len(records)
     for field_name, desc in reversed(parsed.order_by):
 
-        def keyfn(r: dict[str, Any], f: str = field_name) -> tuple[int, str]:
+        def keyfn(r: dict[str, Any], f: str = field_name) -> tuple[int, Any]:
             value = field_value(r, f)
-            return (0, "") if value is None else (1, str(value))
+            if value is None:
+                return (0, "")
+            if isinstance(value, (int, float)):
+                return (1, value)
+            instant = parse_time(value)
+            if instant is not None and "T" in str(value):
+                return (2, instant.timestamp())
+            return (3, str(value).casefold())
 
         records.sort(key=keyfn, reverse=desc)
     start = parsed.start

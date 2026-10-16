@@ -5,18 +5,19 @@ from __future__ import annotations
 import json
 from datetime import timedelta
 from typing import Any
+from urllib.parse import urlsplit
+from uuid import uuid4
 
 from fastapi import FastAPI
 
 from emulators.core.middleware import FaultRule
 from emulators.core.provider import Provider, ProviderContext
 from emulators.providers.quickbooks.api import emit_webhooks, register_api
-from emulators.providers.quickbooks.common import fault_body, realm
+from emulators.providers.quickbooks.common import ENTITIES, fail, realm
 from emulators.providers.quickbooks.identity import (
     CLIENT_ID,
     CLIENT_SECRET,
     SCOPES,
-    default_user,
     find_user,
     issue_tokens,
     register_identity,
@@ -94,7 +95,7 @@ class QuickBooksProvider(Provider):
 
     def fault_response(self, rule: FaultRule) -> tuple[int, dict[str, str], bytes]:
         status = rule.status or 500
-        headers = {"content-type": "application/json", **rule.headers}
+        headers = {"content-type": "application/json", "intuit_tid": uuid4().hex, **rule.headers}
         if rule.body is not None:
             body = rule.body if isinstance(rule.body, (bytes, str)) else json.dumps(rule.body)
             return status, headers, body.encode() if isinstance(body, str) else body
@@ -114,7 +115,21 @@ class QuickBooksProvider(Provider):
             }
             headers.setdefault("Retry-After", "2")
             return status, headers, json.dumps(body).encode()
-        return super().fault_response(rule)
+        status, generated_headers, body_bytes = super().fault_response(rule)
+        return status, {"intuit_tid": headers["intuit_tid"], **generated_headers}, body_bytes
+
+    def error_body_for(self, scope: dict[str, Any] | None, status: int, code: str, message: str) -> Any:
+        body = self.error_body(status, code, message)
+        timestamp = (scope or {}).get("state", {}).get("quickbooks_time")
+        if timestamp and "Fault" in body:
+            body["time"] = timestamp
+        return body
+
+    def error_headers_for(self, scope: dict[str, Any] | None, status: int) -> dict[str, str]:
+        headers = {"intuit_tid": uuid4().hex}
+        if status == 401:
+            headers["WWW-Authenticate"] = 'Bearer realm="Intuit"'
+        return headers
 
     def info(self, ctx: ProviderContext) -> dict[str, Any]:
         info = super().info(ctx)
@@ -133,8 +148,12 @@ def mint_token(ctx: ProviderContext, payload: dict[str, Any]) -> dict[str, Any]:
     App-only tokens act for the company (full access); delegated tokens inherit
     the user's role (Finance/partners/admins write, others read-only).
     """
-    scopes = list(payload.get("scopes") or SCOPES)
-    expires_in = int(payload.get("expires_in", 3600))
+    scopes = payload.get("scopes", SCOPES)
+    if not isinstance(scopes, list) or any(not isinstance(scope, str) for scope in scopes):
+        fail(ctx, 400, "Invalid scopes", "scopes must be an array of strings.", "2030")
+    expires_in = payload.get("expires_in", 3600)
+    if isinstance(expires_in, bool) or not isinstance(expires_in, int) or abs(expires_in) > 2**31 - 1:
+        fail(ctx, 400, "Invalid expiry", "expires_in must be an integer in the supported range.", "2030")
     if payload.get("app_only") or not payload.get("user"):
         grant = ctx.tokens.issue_access(
             client_id=str(payload.get("client_id") or CLIENT_ID),
@@ -150,12 +169,15 @@ def mint_token(ctx: ProviderContext, payload: dict[str, Any]) -> dict[str, Any]:
             "expires_in": expires_in,
             "realm_id": realm(ctx),
         }
-    user = find_user(ctx, str(payload.get("user"))) or default_user(ctx)
+    user = find_user(ctx, str(payload.get("user")))
+    if user is None:
+        fail(ctx, 400, "Invalid user", "No such QuickBooks user.", "6000")
     tokens = issue_tokens(
         ctx,
         client_id=str(payload.get("client_id") or CLIENT_ID),
         user=user,
         scopes=scopes,
+        expires_in=expires_in,
     )
     tokens["realm_id"] = realm(ctx)
     tokens["user"] = {"id": user["id"], "email": user["email"], "role": user["role"]}
@@ -165,8 +187,18 @@ def mint_token(ctx: ProviderContext, payload: dict[str, Any]) -> dict[str, Any]:
 def configure_webhook(ctx: ProviderContext, payload: dict[str, Any]) -> dict[str, Any]:
     """Register a QBO webhook endpoint: ``{url, verifier_token, entities?}``."""
     url = payload.get("url")
-    if not url:
-        return {"error": "url is required"}
+    try:
+        parsed = urlsplit(url) if isinstance(url, str) else None
+    except ValueError:
+        parsed = None
+    if parsed is None or parsed.scheme not in ("http", "https") or not parsed.netloc:
+        fail(ctx, 400, "Invalid webhook URL", "An absolute HTTP or HTTPS URL is required.", "2030")
+    entities = payload.get("entities")
+    if entities is not None and (
+        not isinstance(entities, list)
+        or any(not isinstance(entity, str) or entity not in ENTITIES for entity in entities)
+    ):
+        fail(ctx, 400, "Invalid webhook entities", "entities must be an array of entity names.", "2030")
     record = {
         "id": str(url),
         "url": str(url),
@@ -188,5 +220,3 @@ async def simulate_merge(ctx: ProviderContext, payload: dict[str, Any]) -> dict[
 PROVIDER = QuickBooksProvider()
 
 __all__ = ["PROVIDER", "QuickBooksProvider"]
-
-_ = fault_body

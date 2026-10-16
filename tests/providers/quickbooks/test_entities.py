@@ -222,7 +222,7 @@ async def test_void_and_delete_invoice(qb) -> None:
         json={"Id": invoice2["Id"], "SyncToken": invoice2["SyncToken"]},
     )
     assert r.status_code == 200, r.text
-    assert r.json()["Invoice"] == {"Id": invoice2["Id"], "status": "Deleted"}
+    assert r.json()["Invoice"] == {"Id": invoice2["Id"], "status": "Deleted", "domain": "QBO"}
     r = await client.get(f"{API}/invoice/{invoice2['Id']}", headers=h)
     assert r.status_code == 400  # deleted invoices read as Object Not Found
 

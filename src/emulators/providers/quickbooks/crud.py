@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import copy
 import re
-from datetime import timedelta
+from datetime import date, timedelta
 from typing import Any
 
 from emulators.core.clock import utc
@@ -29,6 +29,7 @@ from emulators.providers.quickbooks.common import (
     touch,
 )
 from emulators.providers.quickbooks.ledger import refresh_computed
+from emulators.providers.quickbooks.validation import validate_business, validate_shape
 
 REF_TARGETS: dict[str, str] = {
     "CustomerRef": "Customer",
@@ -87,7 +88,7 @@ def _walk_refs(value: Any) -> list[tuple[str, dict[str, Any]]]:
 def validate_refs(ctx: ProviderContext, entity: str, payload: dict[str, Any]) -> None:
     for field_name, ref in _walk_refs(payload):
         value = str(ref.get("value", ""))
-        if value in SKIP_REF_VALUES:
+        if field_name == "CurrencyRef" or (field_name == "TaxCodeRef" and value in {"NON", "TAX"}):
             continue
         target_entity = entity if field_name == "ParentRef" else REF_TARGETS.get(field_name)
         if target_entity is None:
@@ -127,10 +128,17 @@ def check_unique_name(
     value = payload.get(field_name)
     if not value:
         return
-    for record in collection(ctx, entity):
+    entities = (
+        ("Customer", "Vendor", "Employee") if entity in ("Customer", "Vendor", "Employee") else (entity,)
+    )
+    for record in [r for name in entities for r in collection(ctx, name)]:
         if record.get("_deleted"):
             continue
-        if exclude_id and str(record.get("Id")) == str(exclude_id):
+        if exclude_id and record is collection(ctx, entity).get(exclude_id):
+            continue
+        if entity in ("Account", "Class", "Department", "Item") and ref_value(
+            record.get("ParentRef")
+        ) != ref_value(payload.get("ParentRef")):
             continue
         if str(record.get(field_name, "")).lower() == str(value).lower():
             fail(
@@ -165,6 +173,9 @@ def compute_totals(ctx: ProviderContext, entity: str, record: dict[str, Any]) ->
         for idx, line in enumerate(lines, start=1):
             if line.get("DetailType") == "SalesItemLineDetail":
                 detail = line.setdefault("SalesItemLineDetail", {})
+                item = collection(ctx, "Item").get(ref_value(detail.get("ItemRef")))
+                detail.setdefault("Qty", 1)
+                detail.setdefault("UnitPrice", (item or {}).get("UnitPrice", 0))
                 qty = detail.get("Qty", 1)
                 unit = detail.get("UnitPrice", 0)
                 if line.get("Amount") is None:
@@ -183,9 +194,19 @@ def compute_totals(ctx: ProviderContext, entity: str, record: dict[str, Any]) ->
                             "Amount": line_tax,
                             "DetailType": "TaxLineDetail",
                             "TaxLineDetail": {
-                                "TaxRateRef": {"value": str(detail.get("TaxCodeRef", {}).get("value", ""))}
-                                if isinstance(detail.get("TaxCodeRef"), dict)
-                                else {},
+                                "TaxRateRef": copy.deepcopy(
+                                    (
+                                        (
+                                            collection(ctx, "TaxCode").get(
+                                                ref_value(detail.get("TaxCodeRef"))
+                                            )
+                                            or {}
+                                        ).get("SalesTaxRateList")
+                                        or {}
+                                    )
+                                    .get("TaxRateDetail", [{}])[0]
+                                    .get("TaxRateRef", {})
+                                ),
                                 "PercentBased": True,
                                 "TaxPercent": rate,
                                 "NetAmountTaxable": amount,
@@ -296,6 +317,11 @@ def apply_defaults(ctx: ProviderContext, entity: str, record: dict[str, Any]) ->
         record.setdefault("Active", True)
     if entity in TRANSACTIONS or entity == "Attachable":
         record.setdefault("TxnDate", today)
+    if entity == "Payment":
+        record.setdefault("Line", [])
+        record.setdefault(
+            "DepositToAccountRef", {"value": str(ctx.store.meta["system_accounts"]["undeposited"])}
+        )
     if entity == "Invoice":
         record.setdefault("EmailStatus", "NotSet")
         record.setdefault("PrintStatus", "NotSet")
@@ -313,9 +339,12 @@ def apply_defaults(ctx: ProviderContext, entity: str, record: dict[str, Any]) ->
             )
             term = collection(ctx, "Term").get(term_id or "")
             if term is not None:
-                days = int(term.get("DueDays") or days)
-            txn_date = utc(ctx.clock.now()).date()
-            record["DueDate"] = (txn_date + timedelta(days=days)).isoformat()
+                days = int(term.get("DueDays", days))
+            txn_date = date.fromisoformat(record["TxnDate"])
+            try:
+                record["DueDate"] = (txn_date + timedelta(days=days)).isoformat()
+            except OverflowError:
+                fail(ctx, 400, "Business Validation Error", "DueDate is outside the supported range.", "6000")
         cust = collection(ctx, "Customer").get(ref_value(record.get("CustomerRef")) or "")
         if cust is not None:
             email = (cust.get("PrimaryEmailAddr") or {}).get("Address")
@@ -411,8 +440,7 @@ def rebuild_linked(ctx: ProviderContext) -> None:
     for inv in invoices:
         if inv.get("_deleted"):
             continue
-        if linked_by_invoice.get(str(inv.get("Id"))):
-            inv["LinkedTxn"] = linked_by_invoice[str(inv.get("Id"))]
+        inv["LinkedTxn"] = linked_by_invoice.get(str(inv.get("Id")), [])
     linked_by_bill: dict[str, list[dict[str, Any]]] = {}
     for bp in collection(ctx, "BillPayment"):
         if bp.get("_deleted") or bp.get("_voided"):
@@ -426,26 +454,60 @@ def rebuild_linked(ctx: ProviderContext) -> None:
     for bill in collection(ctx, "Bill"):
         if bill.get("_deleted"):
             continue
-        if linked_by_bill.get(str(bill.get("Id"))):
-            bill["LinkedTxn"] = linked_by_bill[str(bill.get("Id"))]
+        bill["LinkedTxn"] = linked_by_bill.get(str(bill.get("Id")), [])
+
+
+def refresh_hierarchy(
+    ctx: ProviderContext, entity: str, record: dict[str, Any], seen: set[str]
+) -> tuple[str, int]:
+    own = str(record.get("DisplayName" if entity == "Customer" else "Name") or "")
+    parent = collection(ctx, entity).get(ref_value(record.get("ParentRef")))
+    if parent is None or str(parent["Id"]) in seen:
+        name, level = own, 0
+    else:
+        parent_name, parent_level = refresh_hierarchy(ctx, entity, parent, seen | {str(parent["Id"])})
+        name, level = f"{parent_name}:{own}", parent_level + 1
+        record["ParentRef"]["name"] = parent_name
+    record["FullyQualifiedName"] = name
+    if entity == "Customer":
+        record["Job"], record["Level"] = parent is not None, level
+    return name, level
 
 
 def after_change(ctx: ProviderContext) -> None:
+    for entity in ("Account", "Customer", "Class", "Department", "Item"):
+        for record in collection(ctx, entity):
+            refresh_hierarchy(ctx, entity, record, {str(record["Id"])})
+    previous = {
+        (entity, r["Id"]): (r.get("Balance"), copy.deepcopy(r.get("LinkedTxn")))
+        for entity in ("Invoice", "Bill")
+        for r in collection(ctx, entity)
+        if not r.get("_deleted")
+    }
     rebuild_linked(ctx)
     refresh_computed(ctx)
+    for (entity, record_id), before in previous.items():
+        record = collection(ctx, entity).get(record_id)
+        assert record is not None
+        if before != (record.get("Balance"), record.get("LinkedTxn")):
+            touch(ctx, record)
+            record.pop("_pdf_blob", None)
 
 
 def create_entity(
     ctx: ProviderContext, entity: str, payload: dict[str, Any]
 ) -> tuple[dict[str, Any], list[Event]]:
     if not isinstance(payload, dict):
-        fail(ctx, 400, "Invalid JSON", "Request body must be a JSON object.", "2030")
+        fail(ctx, 400, "Invalid JSON", "Request body must be a JSON object.", "2010")
     record = copy.deepcopy(payload)
+    validate_shape(ctx, record)
     record.pop("Id", None)
+    record.pop("MetaData", None)
     check_required(ctx, entity, record)
     validate_refs(ctx, entity, record)
     check_unique_name(ctx, entity, record)
     apply_defaults(ctx, entity, record)
+    validate_business(ctx, entity, record)
     if entity in ("Invoice", "Estimate", "SalesReceipt", "CreditMemo", "Bill") and not record.get(
         "DocNumber"
     ):
@@ -469,6 +531,7 @@ def update_entity(
     operation: str | None = None,
     include: str | None = None,
 ) -> tuple[dict[str, Any], list[Event]]:
+    validate_shape(ctx, payload)
     if operation == "delete":
         return delete_entity(ctx, entity, payload)
     if operation == "void" or (operation == "update" and include == "void"):
@@ -503,29 +566,38 @@ def update_entity(
             f"Your SyncToken {supplied_token} does not match the current SyncToken {existing.get('SyncToken')}.",
             "5010",
         )
+    payload = copy.deepcopy(payload)
     validate_refs(ctx, entity, payload)
-    check_unique_name(ctx, entity, payload, exclude_id=str(record_id))
     sparse = bool(payload.get("sparse"))
     if sparse:
+        record = copy.deepcopy(existing)
         for key, value in payload.items():
-            if key in ("Id", "SyncToken"):
+            if key in ("Id", "SyncToken", "MetaData"):
                 continue
-            existing[key] = copy.deepcopy(value)
-        record = existing
+            record[key] = copy.deepcopy(value)
     else:
         preserved = {k: v for k, v in existing.items() if k.startswith("_")}
         created = (existing.get("MetaData") or {}).get("CreateTime")
         record = copy.deepcopy(payload)
         record.update(preserved)
         record["Id"] = str(record_id)
-        record.setdefault("MetaData", {})
+        record["MetaData"] = copy.deepcopy(existing.get("MetaData", {}))
         if created:
             record["MetaData"]["CreateTime"] = created
         apply_defaults(ctx, entity, record)
-        collection(ctx, entity).put_as(str(record_id), record)
+    check_required(ctx, entity, record)
+    check_unique_name(ctx, entity, record, exclude_id=str(record_id))
+    validate_business(ctx, entity, record)
+    if "Line" in payload and "TxnTaxDetail" not in payload:
+        record.pop("TxnTaxDetail", None)
+    if any(k in payload for k in ("Name", "DisplayName", "ParentRef")):
+        record.pop("FullyQualifiedName", None)
+    record.pop("_pdf_blob", None)
     compute_totals(ctx, entity, record)
     apply_defaults(ctx, entity, record)
     touch(ctx, record)
+    record["sparse"] = False
+    collection(ctx, entity).put_as(str(record_id), record)
     after_change(ctx)
     return record, [(entity, str(record_id), "Update")]
 
@@ -533,18 +605,24 @@ def update_entity(
 def delete_entity(
     ctx: ProviderContext, entity: str, payload: dict[str, Any]
 ) -> tuple[dict[str, Any], list[Event]]:
+    validate_shape(ctx, payload)
+    if entity in NAME_LIST or entity in ("CompanyInfo", "Preferences"):
+        fail(
+            ctx,
+            400,
+            "Operation not supported",
+            "Name lists must be deactivated with Active=false; singletons cannot be deleted.",
+            "500",
+        )
     record_id = payload.get("Id")
     if record_id is None:
         fail(ctx, 400, "Required param missing", "Id is required for delete.", "2020", element="Id")
     existing = get_record(ctx, entity, str(record_id))
     supplied = payload.get("SyncToken")
-    if supplied is not None and str(supplied) != str(existing.get("SyncToken", "0")):
+    if supplied is None or str(supplied) != str(existing.get("SyncToken", "0")):
         fail(ctx, 400, "Stale Object Error", "Stale Object Error : SyncToken does not match.", "5010")
-    if entity in NAME_LIST:
-        existing["Active"] = False
-        touch(ctx, existing)
-        after_change(ctx)
-        return existing, [(entity, str(record_id), "Update")]
+    if entity == "Invoice":
+        unlink_invoice(ctx, str(record_id))
     existing["_deleted"] = True
     existing["status"] = "Deleted"
     touch(ctx, existing)
@@ -555,30 +633,62 @@ def delete_entity(
 def void_entity(
     ctx: ProviderContext, entity: str, payload: dict[str, Any]
 ) -> tuple[dict[str, Any], list[Event]]:
-    if entity not in VOIDABLE and entity not in ("Bill", "JournalEntry"):
+    validate_shape(ctx, payload)
+    if entity not in VOIDABLE:
         fail(ctx, 400, "Operation not supported", f"Void is not supported for {entity}.", "6000")
     record_id = payload.get("Id")
     if record_id is None:
         fail(ctx, 400, "Required param missing", "Id is required for void.", "2020", element="Id")
     existing = get_record(ctx, entity, str(record_id))
     supplied = payload.get("SyncToken")
-    if supplied is not None and str(supplied) != str(existing.get("SyncToken", "0")):
+    if supplied is None or str(supplied) != str(existing.get("SyncToken", "0")):
         fail(ctx, 400, "Stale Object Error", "Stale Object Error : SyncToken does not match.", "5010")
     existing["_voided"] = True
+    if entity == "Invoice":
+        unlink_invoice(ctx, str(record_id))
     for key in ("TotalAmt", "Balance", "UnappliedAmt"):
         if key in existing:
             existing[key] = 0.0
     for line in existing.get("Line") or []:
         if "Amount" in line:
             line["Amount"] = 0.0
+        detail = line.get("SalesItemLineDetail") or {}
+        if "Qty" in detail:
+            detail["Qty"] = 0.0
+        if "UnitPrice" in detail:
+            detail["UnitPrice"] = 0.0
     if isinstance(existing.get("TxnTaxDetail"), dict):
         existing["TxnTaxDetail"]["TotalTax"] = 0.0
+        for line in existing["TxnTaxDetail"].get("TaxLine") or []:
+            line["Amount"] = 0.0
+            if "TaxLineDetail" in line:
+                line["TaxLineDetail"]["NetAmountTaxable"] = 0.0
     note = str(existing.get("PrivateNote") or "")
     existing["PrivateNote"] = ("Voided " + note).strip()
-    existing["status"] = "Voided"
+    existing.pop("_pdf_blob", None)
     touch(ctx, existing)
     after_change(ctx)
     return existing, [(entity, str(record_id), "Void")]
+
+
+def unlink_invoice(ctx: ProviderContext, record_id: str) -> None:
+    """A removed invoice releases its allocations as unapplied customer credit."""
+    for payment in collection(ctx, "Payment"):
+        if payment.get("_deleted") or payment.get("_voided"):
+            continue
+        lines = payment.get("Line") or []
+        kept = [
+            line
+            for line in lines
+            if not any(
+                link.get("TxnType") == "Invoice" and link.get("TxnId") == record_id
+                for link in line.get("LinkedTxn") or []
+            )
+        ]
+        if len(kept) != len(lines):
+            payment["Line"] = kept
+            compute_totals(ctx, "Payment", payment)
+            touch(ctx, payment)
 
 
 def public_record(record: dict[str, Any]) -> dict[str, Any]:

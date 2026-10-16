@@ -7,7 +7,7 @@ from typing import Any
 
 from emulators.core.ids import stable_hash
 from emulators.core.provider import ProviderContext
-from emulators.providers.quickbooks.common import date_time, money
+from emulators.providers.quickbooks.common import date_time, money, parse_time, qbo_time
 from emulators.providers.quickbooks.ledger import refresh_computed
 from emulators.world.model import Address, World
 
@@ -36,6 +36,10 @@ def _ref(record_id: str, name: str) -> dict[str, Any]:
 def _put(ctx: ProviderContext, entity: str, record: dict[str, Any]) -> dict[str, Any]:
     record.setdefault("domain", "QBO")
     record.setdefault("sparse", False)
+    for field, timestamp in record.get("MetaData", {}).items():
+        instant = parse_time(timestamp)
+        if instant is not None and instant > ctx.world.anchor:
+            record["MetaData"][field] = qbo_time(ctx.world.anchor)
     ctx.store.collection(entity).put_as(str(record["Id"]), record)
     return record
 
@@ -114,7 +118,7 @@ def seed(ctx: ProviderContext) -> None:
             "PrimaryPhone": {"FreeFormNumber": org.phone},
             "CompanyStartDate": org.founded.isoformat(),
             "FiscalYearStartMonth": "January",
-            "Country": org.address.country,
+            "Country": org.address.country_code,
             "Email": {"Address": f"billing@{org.domain}"},
             "WebAddr": {"URI": org.website},
             "SupportedLanguages": "en",
@@ -614,6 +618,9 @@ def seed(ctx: ProviderContext) -> None:
         job_by_engagement[engagement.id] = record
     maps["job_by_engagement"] = {k: v["Id"] for k, v in job_by_engagement.items()}
 
+    preferences = ctx.store.collection("Preferences").get("1")
+    assert preferences is not None
+    preferences["SalesFormsPrefs"]["DefaultTerms"] = _ref(term_by_days[30]["Id"], term_by_days[30]["Name"])
     _seed_transactions(ctx, locals())
     refresh_computed(ctx)
 
@@ -659,8 +666,8 @@ def _seed_transactions(ctx: ProviderContext, env: dict[str, Any]) -> None:
             item = item_by_world[line.item_id]
             detail: dict[str, Any] = {
                 "ItemRef": _ref(item["Id"], item["Name"]),
-                "Qty": line.quantity,
-                "UnitPrice": line.rate,
+                "Qty": 0.0 if voided else line.quantity,
+                "UnitPrice": 0.0 if voided else line.rate,
                 "TaxCodeRef": _ref(taxcode["Id"], taxcode["Name"]),
                 "ServiceDate": invoice.issue_date.isoformat(),
             }
@@ -737,7 +744,6 @@ def _seed_transactions(ctx: ProviderContext, env: dict[str, Any]) -> None:
         if voided:
             record["_voided"] = True
             record["PrivateNote"] = "Voided"
-            record["status"] = "Voided"
         invoice_by_world[invoice.id] = _put(ctx, "Invoice", record)
     maps["invoice_by_world"] = {k: v["Id"] for k, v in invoice_by_world.items()}
 

@@ -6,6 +6,7 @@ import base64
 import json
 from urllib.parse import parse_qs, urlparse
 
+from emulators.providers.quickbooks.identity import CLIENT_ID, CLIENT_SECRET
 from tests.providers.quickbooks.conftest import API, REALM, mint_user
 
 FINANCE = "victoria.hale@halcyonadvisory.example"  # CFO, full access
@@ -35,7 +36,7 @@ async def test_authorize_code_exchange_refresh_and_userinfo(qb_client) -> None:
     r = await qb_client.get(
         "https://appcenter.intuit.com/connect/oauth2",
         params={
-            "client_id": "AB0Emu1atorQuickBooksC1ientId000001",
+            "client_id": CLIENT_ID,
             "response_type": "code",
             "scope": "com.intuit.quickbooks.accounting openid profile email phone address",
             "redirect_uri": "https://localhost/callback",
@@ -52,7 +53,7 @@ async def test_authorize_code_exchange_refresh_and_userinfo(qb_client) -> None:
 
     r = await qb_client.post(
         "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer",
-        headers=basic("AB0Emu1atorQuickBooksC1ientId000001", "emu1ator-quickbooks-secret"),
+        headers=basic(CLIENT_ID, CLIENT_SECRET),
         data={
             "grant_type": "authorization_code",
             "code": code,
@@ -86,7 +87,7 @@ async def test_authorize_code_exchange_refresh_and_userinfo(qb_client) -> None:
     # code is single-use
     r = await qb_client.post(
         "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer",
-        headers=basic("AB0Emu1atorQuickBooksC1ientId000001", "emu1ator-quickbooks-secret"),
+        headers=basic(CLIENT_ID, CLIENT_SECRET),
         data={"grant_type": "authorization_code", "code": code, "redirect_uri": "https://localhost/callback"},
     )
     assert r.status_code == 400
@@ -96,7 +97,7 @@ async def test_authorize_code_exchange_refresh_and_userinfo(qb_client) -> None:
     old_refresh = tokens["refresh_token"]
     r = await qb_client.post(
         "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer",
-        headers=basic("cid", "secret"),
+        headers=basic(CLIENT_ID, CLIENT_SECRET),
         data={"grant_type": "refresh_token", "refresh_token": old_refresh},
     )
     assert r.status_code == 200, r.text
@@ -104,19 +105,19 @@ async def test_authorize_code_exchange_refresh_and_userinfo(qb_client) -> None:
     assert new_refresh != old_refresh
     r = await qb_client.post(
         "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer",
-        headers=basic("cid", "secret"),
+        headers=basic(CLIENT_ID, CLIENT_SECRET),
         data={"grant_type": "refresh_token", "refresh_token": old_refresh},
     )
     assert r.status_code == 200, r.text  # grace period: previous token accepted
     r = await qb_client.post(
         "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer",
-        headers=basic("cid", "secret"),
+        headers=basic(CLIENT_ID, CLIENT_SECRET),
         data={"grant_type": "refresh_token", "refresh_token": new_refresh},
     )
     assert r.status_code == 200, r.text
     r = await qb_client.post(
         "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer",
-        headers=basic("cid", "secret"),
+        headers=basic(CLIENT_ID, CLIENT_SECRET),
         data={"grant_type": "refresh_token", "refresh_token": old_refresh},
     )
     assert r.status_code == 400  # successor used -> predecessor dead
@@ -145,7 +146,7 @@ async def test_revoke(qb_client) -> None:
     assert r.status_code == 200
     r = await qb_client.post(
         "https://oauth.platform.intuit.com/oauth2/v1/tokens/revoke",
-        headers={**basic("cid", "secret"), "Content-Type": "application/json"},
+        headers={**basic(CLIENT_ID, CLIENT_SECRET), "Content-Type": "application/json"},
         content=json.dumps({"token": token}),
     )
     assert r.status_code == 200

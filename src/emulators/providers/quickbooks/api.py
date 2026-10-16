@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 from datetime import timedelta
+from email import policy
+from email.parser import BytesParser
 from typing import Any
 
 from fastapi import FastAPI, Request
@@ -89,14 +91,15 @@ async def emit_webhooks(ctx: ProviderContext, events: list[crud.Event]) -> None:
         }
         for entity, record_id, operation in events
     ]
-    body = json.dumps(
-        {"eventNotifications": [{"realmId": realm(ctx), "dataChangeEvent": {"entities": entities}}]},
-        separators=(",", ":"),
-    ).encode()
     for config in configs:
         wanted = config.get("entities")
-        if wanted and not any(e["name"] in wanted for e in entities):
+        selected = [e for e in entities if not wanted or e["name"] in wanted]
+        if not selected:
             continue
+        body = json.dumps(
+            {"eventNotifications": [{"realmId": realm(ctx), "dataChangeEvent": {"entities": selected}}]},
+            separators=(",", ":"),
+        ).encode()
         token = str(config.get("verifier_token") or "")
 
         def sign(payload: bytes, _attempt: int, tok: str = token) -> dict[str, str]:
@@ -117,16 +120,16 @@ def _webhook_time(ctx: ProviderContext) -> str:
     return instant.strftime("%Y-%m-%dT%H:%M:%S.") + f"{instant.microsecond // 1000:03d}Z"
 
 
-async def _json_body(request: Request) -> dict[str, Any]:
+async def _json_body(ctx: ProviderContext, request: Request) -> dict[str, Any]:
     raw = await request.body()
     if not raw:
-        return {}
+        fail(ctx, 400, "Invalid JSON", "Request body must be a JSON object.", "2010")
     try:
         data = json.loads(raw)
-    except json.JSONDecodeError:
-        raise EmulatorError(400, {"Fault": {"Error": [], "type": "ValidationFault"}}) from None
+    except (ValueError, UnicodeDecodeError, RecursionError):
+        fail(ctx, 400, "Invalid JSON", "Cannot parse the JSON request body.", "2010")
     if not isinstance(data, dict):
-        return {}
+        fail(ctx, 400, "Invalid JSON", "Request body must be a JSON object.", "2010")
     return data
 
 
@@ -136,6 +139,13 @@ def _entity_from_path(segment: str) -> str | None:
 
 def register_api(app: FastAPI, ctx: ProviderContext) -> None:
     base = "/v3/company/{realm_id}"
+
+    @app.middleware("http")
+    async def response_headers(request: Request, call_next: Any) -> Response:
+        request.scope.setdefault("state", {})["quickbooks_time"] = now_text(ctx)
+        response = await call_next(request)
+        response.headers.setdefault("intuit_tid", ctx.ids.hex(32))
+        return response
 
     @app.get(f"{base}/companyinfo/{{company_id}}")
     async def get_company_info(request: Request, realm_id: str, company_id: str) -> Response:
@@ -158,13 +168,8 @@ def register_api(app: FastAPI, ctx: ProviderContext) -> None:
     @app.post(f"{base}/preferences")
     async def update_preferences(request: Request, realm_id: str) -> Response:
         check_write(ctx, request, realm_id)
-        payload = await _json_body(request)
-        record = next(iter(ctx.store.collection("Preferences")), None)
-        assert record is not None
-        for key, value in payload.items():
-            if key not in ("Id", "SyncToken"):
-                record[key] = value
-        touch(ctx, record)
+        payload = await _json_body(ctx, request)
+        record, _ = crud.update_entity(ctx, "Preferences", payload)
         return respond(ctx, request, wrap(ctx, "Preferences", record))
 
     @app.get(f"{base}/reports/{{report_name}}")
@@ -195,8 +200,8 @@ def register_api(app: FastAPI, ctx: ProviderContext) -> None:
 
     @app.post(f"{base}/batch")
     async def batch(request: Request, realm_id: str) -> Response:
-        check_write(ctx, request, realm_id)
-        payload = await _json_body(request)
+        check_read(ctx, request, realm_id)
+        payload = await _json_body(ctx, request)
         items = payload.get("BatchItemRequest")
         if not isinstance(items, list) or not items:
             fail(
@@ -208,40 +213,41 @@ def register_api(app: FastAPI, ctx: ProviderContext) -> None:
         responses: list[dict[str, Any]] = []
         all_events: list[crud.Event] = []
         for item in items:
-            bid = str(item.get("bId", ""))
+            bid = str(item.get("bId", "")) if isinstance(item, dict) else ""
             entry: dict[str, Any] = {"bId": bid}
             try:
-                if item.get("Query"):
+                if not isinstance(item, dict):
+                    fail(ctx, 400, "Invalid batch item", "Each batch item must be an object.", "2010")
+                if "Query" in item:
                     refresh_computed(ctx)
-                    entry["QueryResponse"] = run_query(ctx, str(item["Query"]))
+                    entry["QueryResponse"] = run_query(ctx, item["Query"])
                 else:
-                    next(
-                        (
-                            k
-                            for k in item
-                            if k in BY_LOWER.values() or k in BY_PATH.values() or k in _entity_keys(item)
-                        ),
-                        None,
-                    )
+                    check_write(ctx, request, realm_id)
                     # entity key is the canonical name, e.g. "Invoice"
                     canonical = next((k for k in item if _entity_from_path(k) is not None), None)
                     if canonical is None:
-                        raise ValueError("no entity payload")
+                        fail(ctx, 400, "Invalid batch item", "An entity payload is required.", "2020")
                     entity_name = _entity_from_path(canonical)
                     assert entity_name is not None
                     operation = str(item.get("operation") or "create").lower()
                     body_payload = item[canonical]
-                    if operation == "create" and not body_payload.get("Id"):
+                    if not isinstance(body_payload, dict):
+                        fail(ctx, 400, "Invalid JSON", "Entity payload must be an object.", "2010")
+                    if operation == "create":
                         record, events = crud.create_entity(ctx, entity_name, body_payload)
                     elif operation == "delete":
                         record, events = crud.delete_entity(ctx, entity_name, body_payload)
                     elif operation == "void":
                         record, events = crud.void_entity(ctx, entity_name, body_payload)
-                    else:
+                    elif operation == "update":
+                        if not body_payload.get("Id"):
+                            fail(ctx, 400, "Required param missing", "Id is required for update.", "2020")
                         record, events = crud.update_entity(ctx, entity_name, body_payload)
+                    else:
+                        fail(ctx, 400, "Invalid operation", "Unsupported batch operation.", "6000")
                     all_events.extend(events)
                     if record.get("_deleted"):
-                        entry[entity_name] = {"Id": record.get("Id"), "status": "Deleted"}
+                        entry[entity_name] = {"Id": record.get("Id"), "status": "Deleted", "domain": "QBO"}
                     else:
                         entry[entity_name] = public(record)
             except EmulatorError as exc:
@@ -251,8 +257,6 @@ def register_api(app: FastAPI, ctx: ProviderContext) -> None:
                     else fault_body(ctx, "Error", str(exc.body), "6000")
                 )
                 entry["Fault"] = body.get("Fault") or body.get("fault") or body
-            except Exception as exc:
-                entry["Fault"] = fault_body(ctx, "Internal error", str(exc), "10000")["Fault"]
             responses.append(entry)
         await emit_webhooks(ctx, all_events)
         return respond(ctx, request, {"BatchItemResponse": responses, "time": now_text(ctx)})
@@ -264,11 +268,15 @@ def register_api(app: FastAPI, ctx: ProviderContext) -> None:
         entity_names = [
             e.strip() for e in (request.query_params.get("entities") or "").split(",") if e.strip()
         ]
+        if not entity_names:
+            fail(ctx, 400, "Required param missing", "entities is required.", "2020")
         since_text = request.query_params.get("changedSince")
         since = parse_time(since_text) if since_text else None
         if since is None:
             fail(ctx, 400, "Invalid changedSince", "changedSince must be an ISO-8601 timestamp.", "6000")
         assert since is not None
+        if utc(since) > utc(ctx.clock.now()):
+            fail(ctx, 400, "Invalid changedSince", "changedSince must not be in the future.", "6000")
         if utc(ctx.clock.now()) - utc(since) > timedelta(days=30):
             fail(
                 ctx,
@@ -280,8 +288,15 @@ def register_api(app: FastAPI, ctx: ProviderContext) -> None:
         query_responses: list[dict[str, Any]] = []
         for raw_name in entity_names:
             entity = _entity_from_path(raw_name)
-            if entity is None:
-                continue
+            if entity is None or entity in (
+                "TimeActivity",
+                "TaxCode",
+                "TaxRate",
+                "Attachable",
+                "CompanyInfo",
+                "Preferences",
+            ):
+                fail(ctx, 400, "Invalid entity", f"CDC is not supported for {raw_name}.", "6000")
             changed: list[Any] = []
             deleted: list[dict[str, Any]] = []
             for record in ctx.store.collection(entity):
@@ -312,7 +327,7 @@ def register_api(app: FastAPI, ctx: ProviderContext) -> None:
     async def upload(request: Request, realm_id: str) -> Response:
         check_write(ctx, request, realm_id)
         raw = await request.body()
-        meta = _multipart_metadata(raw)
+        meta = _multipart_metadata(ctx, raw, request.headers.get("content-type", ""))
         record, events = crud.create_entity(ctx, "Attachable", meta)
         await emit_webhooks(ctx, events)
         return respond(
@@ -355,6 +370,9 @@ def register_api(app: FastAPI, ctx: ProviderContext) -> None:
         assert entity is not None
         record = crud.get_record(ctx, entity, record_id)
         send_to = request.query_params.get("sendTo")
+        recipient = send_to or (record.get("BillEmail") or {}).get("Address")
+        if not recipient or "@" not in recipient or any(c in recipient for c in "\r\n"):
+            fail(ctx, 400, "Business Validation Error", "A valid email recipient is required.", "6000")
         if send_to:
             record["BillEmail"] = {"Address": send_to}
         record["EmailStatus"] = "EmailSent"
@@ -390,8 +408,14 @@ def register_api(app: FastAPI, ctx: ProviderContext) -> None:
         if entity is None:
             not_found(ctx, segment)
         assert entity is not None
-        payload = await _json_body(request)
+        payload = await _json_body(ctx, request)
         operation = (request.query_params.get("operation") or "").lower() or None
+        if operation not in (None, "create", "update", "delete", "void"):
+            fail(ctx, 400, "Invalid operation", "Unsupported operation.", "6000")
+        if operation == "update" and not payload.get("Id"):
+            fail(ctx, 400, "Required param missing", "Id is required for update.", "2020")
+        if entity in ("CompanyInfo", "Preferences") and not payload.get("Id"):
+            fail(ctx, 400, "Required param missing", "Id is required for singleton updates.", "2020")
         include = (request.query_params.get("include") or "").lower() or None
         if payload.get("Id") or operation in ("delete", "void"):
             record, events = crud.update_entity(ctx, entity, payload, operation=operation, include=include)
@@ -399,7 +423,10 @@ def register_api(app: FastAPI, ctx: ProviderContext) -> None:
             record, events = crud.create_entity(ctx, entity, payload)
         await emit_webhooks(ctx, events)
         if record.get("_deleted"):
-            body = {entity: {"Id": record.get("Id"), "status": "Deleted"}, "time": now_text(ctx)}
+            body = {
+                entity: {"Id": record.get("Id"), "status": "Deleted", "domain": "QBO"},
+                "time": now_text(ctx),
+            }
             return respond(ctx, request, body)
         body = wrap(ctx, entity, record)
         if entity == "Invoice" and include and "invoicelink" in include:
@@ -411,18 +438,24 @@ def _entity_keys(item: dict[str, Any]) -> list[str]:
     return [k for k in item if k not in ("bId", "operation", "Query")]
 
 
-def _multipart_metadata(raw: bytes) -> dict[str, Any]:
-    text = raw.decode("utf-8", errors="replace")
-    start = text.find("{")
-    end = text.rfind("}")
-    if start >= 0 and end > start:
-        try:
-            data = json.loads(text[start : end + 1])
-            if isinstance(data, dict):
-                return data
-        except json.JSONDecodeError:
-            pass
-    return {"FileName": "attachment", "ContentType": "application/octet-stream"}
+def _multipart_metadata(ctx: ProviderContext, raw: bytes, content_type: str) -> dict[str, Any]:
+    if not content_type.lower().startswith("multipart/form-data"):
+        fail(ctx, 400, "Invalid upload", "Upload requires multipart/form-data.", "2010")
+    message = BytesParser(policy=policy.default).parsebytes(
+        f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n".encode() + raw
+    )
+    if message.is_multipart():
+        for part in message.iter_parts():
+            if part.get_content_type() != "application/json":
+                continue
+            try:
+                data = json.loads(part.get_payload(decode=True) or b"")
+            except (ValueError, UnicodeDecodeError, RecursionError):
+                fail(ctx, 400, "Invalid JSON", "Cannot parse attachment metadata.", "2010")
+            if not isinstance(data, dict):
+                fail(ctx, 400, "Invalid JSON", "Attachment metadata must be an object.", "2010")
+            return data
+    fail(ctx, 400, "Invalid upload", "A JSON metadata part is required.", "2020")
 
 
 def _render_pdf(ctx: ProviderContext, entity: str, record: dict[str, Any]) -> bytes:

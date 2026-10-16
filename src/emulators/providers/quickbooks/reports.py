@@ -36,6 +36,9 @@ def _period(ctx: ProviderContext, params: dict[str, str]) -> tuple[date, date, s
     macro_l = macro.lower()
     start = parse_date(params.get("start_date"))
     end = parse_date(params.get("end_date"))
+    for key in ("start_date", "end_date", "report_date"):
+        if key in params and (len(params[key]) != 10 or parse_date(params[key]) is None):
+            fail(ctx, 400, "Invalid date", f"{key} must be a YYYY-MM-DD date.", "6000")
     if start and end:
         pass
     elif macro_l in _MACRO_FISCAL_YTD or macro_l in ("this year-to-date", "year-to-date", "ytd"):
@@ -57,6 +60,14 @@ def _period(ctx: ProviderContext, params: dict[str, str]) -> tuple[date, date, s
     else:
         start = start or date(today.year, 1, 1)
         end = end or today
+    if start > end or (end - start).days > 36600:
+        fail(
+            ctx,
+            400,
+            "Invalid report period",
+            "Report period must be ordered and span at most 100 years.",
+            "6000",
+        )
     return start, end, start.isoformat(), end.isoformat()
 
 
@@ -135,15 +146,42 @@ def _cash_adjusted_postings(ctx: ProviderContext, params: dict[str, str]) -> lis
     all_postings = postings(ctx)
     if params.get("accounting_method", "").lower() != "cash":
         return all_postings
-    kept: list[dict[str, Any]] = []
+    kept = [p for p in all_postings if p["txn_type"] not in ("Invoice", "Bill", "CreditMemo")]
+    by_source: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
     for posting in all_postings:
-        if posting["txn_type"] in ("Invoice", "Bill", "CreditMemo"):
-            continue
-        if posting["txn_type"] == "Payment":
-            # bank debit stays as cash received; the AR credit becomes income credit timing marker
-            kept.append(posting)
-        else:
-            kept.append(posting)
+        by_source[(posting["txn_type"], posting["txn_id"])].append(posting)
+    for payment_type, source_type, classification in (
+        ("Payment", "Invoice", "Revenue"),
+        ("BillPayment", "Bill", "Expense"),
+    ):
+        for payment in ctx.store.collection(payment_type):
+            if payment.get("_deleted") or payment.get("_voided"):
+                continue
+            for line in payment.get("Line") or []:
+                for linked in line.get("LinkedTxn") or []:
+                    if linked.get("TxnType") != source_type:
+                        continue
+                    source = ctx.store.collection(source_type).get(linked.get("TxnId"))
+                    if (
+                        not source
+                        or source.get("_deleted")
+                        or source.get("_voided")
+                        or not source.get("TotalAmt")
+                    ):
+                        continue
+                    ratio = money(line.get("Amount")) / money(source["TotalAmt"])
+                    for posting in by_source[(source_type, str(source["Id"]))]:
+                        account = ctx.store.collection("Account").get(posting["account_id"])
+                        if (account or {}).get("Classification") == classification:
+                            kept.append(
+                                {
+                                    **posting,
+                                    "amount": money(posting["amount"] * ratio),
+                                    "date": parse_date(payment.get("TxnDate")),
+                                    "txn_type": payment_type,
+                                    "txn_id": str(payment["Id"]),
+                                }
+                            )
     return kept
 
 
@@ -184,6 +222,8 @@ def _dims_for(
         cursor = date(start.year, start.month, 1)
         while cursor <= end:
             dims.append(cursor.strftime("%b %Y"))
+            if cursor.year == end.year and cursor.month == end.month:
+                break
             cursor = date(
                 cursor.year + (1 if cursor.month == 12 else 0),
                 1 if cursor.month == 12 else cursor.month + 1,
@@ -195,6 +235,8 @@ def _dims_for(
         cursor = date(start.year, ((start.month - 1) // 3) * 3 + 1, 1)
         while cursor <= end:
             dims.append(f"Q{(cursor.month - 1) // 3 + 1} {cursor.year}")
+            if cursor.year == end.year and (cursor.month - 1) // 3 == (end.month - 1) // 3:
+                break
             month = cursor.month + 3
             cursor = date(cursor.year + (month - 1) // 12, ((month - 1) % 12) + 1, 1)
         return [*dims, "Total"]
@@ -226,11 +268,15 @@ def build_report(ctx: ProviderContext, name: str, params: dict[str, str]) -> dic
 
 
 def _filtered(ctx: ProviderContext, params: dict[str, str], posting: dict[str, Any]) -> bool:
-    if params.get("customer") and str(posting.get("customer") or "") != params["customer"]:
-        return False
-    if params.get("vendor") and str(posting.get("vendor") or "") != params["vendor"]:
-        return False
-    return not (params.get("class") and str(posting.get("class_id") or "") != params["class"])
+    return all(
+        not params.get(param) or str(posting.get(field) or "") in params[param].split(",")
+        for param, field in (
+            ("customer", "customer"),
+            ("vendor", "vendor"),
+            ("class", "class_id"),
+            ("department", "department"),
+        )
+    )
 
 
 def _profit_and_loss(
@@ -251,7 +297,6 @@ def _profit_and_loss(
     accounts = ctx.store.collection("Account")
     # amounts[account_id][dim] in display convention (income/expense positive)
     amounts: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
-    cash = params.get("accounting_method", "").lower() == "cash"
     for posting in all_postings:
         if not (start <= posting["date"] <= end):
             continue
@@ -263,22 +308,7 @@ def _profit_and_loss(
             value = -posting["amount"]
         elif classification == "Expense":
             value = posting["amount"]
-            if cash and posting["txn_type"] == "BillPayment":
-                continue
         else:
-            if (
-                cash
-                and posting["txn_type"] == "Payment"
-                and account.get("AccountSubType") == "AccountsReceivable"
-            ):
-                # recognise cash income against a primary income account
-                income = next((a for a in accounts if a.get("Name") == "Professional Fees - Audit"), None)
-                if income is None:
-                    continue
-                value = -posting["amount"]
-                dim = _dimension_key(ctx, summarize, posting)
-                amounts[str(income["Id"])][dim] += value
-                amounts[str(income["Id"])]["Total"] += value if dim != "Total" else 0
             continue
         dim = _dimension_key(ctx, summarize, posting)
         amounts[posting["account_id"]][dim] += value
@@ -306,7 +336,8 @@ def _profit_and_loss(
     expense_rows, expense_totals = rows_for("Expense", ("Expense",))
     other_expense_rows, other_expense_totals = rows_for("Expense", ("Other Expense", "Cost of Goods Sold"))
     total_expenses = [money(a + b) for a, b in zip(expense_totals, other_expense_totals, strict=True)]
-    net = [money(a - b) for a, b in zip(income_totals, total_expenses, strict=True)]
+    net = [money(a - b) for a, b in zip(income_totals, expense_totals, strict=True)]
+    net_income = [money(a - b) for a, b in zip(income_totals, total_expenses, strict=True)]
 
     sections: list[dict[str, Any]] = []
     if income_rows:
@@ -333,7 +364,6 @@ def _profit_and_loss(
             )
         )
     # NetOperatingIncome already nets all expenses incl other; recompute net income line
-    net_income = net
     sections.append(
         {
             "ColData": _coldata(
@@ -465,6 +495,7 @@ def _aging_bucket(due: date | None, as_of: date) -> str:
 
 
 def _aged(ctx: ProviderContext, params: dict[str, str], *, receivables: bool, detail: bool) -> dict[str, Any]:
+    _period(ctx, params)
     today = ctx.clock.now().date()
     as_of = parse_date(params.get("report_date") or params.get("end_date")) or today
     start_s = as_of.isoformat()
@@ -474,7 +505,37 @@ def _aged(ctx: ProviderContext, params: dict[str, str], *, receivables: bool, de
     per_party: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
     per_txn: list[dict[str, Any]] = []
     rows: list[dict[str, Any]] = []
-    for txn in ctx.store.collection(entity):
+    eligible = [
+        txn
+        for txn in ctx.store.collection(entity)
+        if not txn.get("_deleted")
+        and not txn.get("_voided")
+        and (parse_date(txn.get("TxnDate")) or today) <= as_of
+        and (
+            not params.get("customer" if receivables else "vendor")
+            or ref_value(txn.get(name_field)) in params["customer" if receivables else "vendor"].split(",")
+        )
+    ]
+    paid: dict[str, float] = defaultdict(float)
+    for payment in ctx.store.collection("Payment" if receivables else "BillPayment"):
+        if (
+            payment.get("_deleted")
+            or payment.get("_voided")
+            or (parse_date(payment.get("TxnDate")) or today) > as_of
+        ):
+            continue
+        for line in payment.get("Line") or []:
+            for link in line.get("LinkedTxn") or []:
+                if link.get("TxnType") == entity:
+                    paid[str(link.get("TxnId"))] += money(line.get("Amount"))
+    eligible = [
+        {
+            **txn,
+            "Balance": money(money(txn.get("TotalAmt")) - paid[str(txn["Id"])] - money(txn.get("Deposit"))),
+        }
+        for txn in eligible
+    ]
+    for txn in eligible:
         if txn.get("_deleted") or txn.get("_voided") or money(txn.get("Balance")) <= 0:
             continue
         txn_date = parse_date(txn.get("TxnDate"))
@@ -511,7 +572,7 @@ def _aged(ctx: ProviderContext, params: dict[str, str], *, receivables: bool, de
     if detail:
         # rebuild detail rows with per-transaction amounts
         per_txn = []
-        for txn in ctx.store.collection(entity):
+        for txn in eligible:
             if txn.get("_deleted") or txn.get("_voided") or money(txn.get("Balance")) <= 0:
                 continue
             bucket = _aging_bucket(parse_date(txn.get("DueDate")), as_of)
@@ -579,7 +640,7 @@ def _general_ledger(ctx: ProviderContext, params: dict[str, str]) -> dict[str, A
     account_filter = params.get("account")
     by_account: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for posting in postings(ctx):
-        if start <= posting["date"] <= end:
+        if start <= posting["date"] <= end and _filtered(ctx, params, posting):
             by_account[posting["account_id"]].append(posting)
     sections: list[dict[str, Any]] = []
     for account in sorted(accounts, key=lambda a: (a.get("AcctNum") or "", a.get("Name") or "")):
@@ -589,7 +650,9 @@ def _general_ledger(ctx: ProviderContext, params: dict[str, str]) -> dict[str, A
         entries = by_account.get(aid) or []
         if not entries and not account_filter:
             continue
-        opening = account_balances(ctx, end=start - timedelta(days=1)).get(aid, 0.0)
+        opening = (
+            account_balances(ctx, end=start - timedelta(days=1)).get(aid, 0.0) if start > date.min else 0.0
+        )
         running = opening
         rows: list[dict[str, Any]] = [
             {
@@ -636,7 +699,7 @@ def _transaction_list(ctx: ProviderContext, params: dict[str, str]) -> dict[str,
     start, end, start_s, end_s = _period(ctx, params)
     rows: list[dict[str, Any]] = []
     for posting in sorted(postings(ctx), key=lambda p: p["date"]):
-        if not (start <= posting["date"] <= end):
+        if not (start <= posting["date"] <= end) or not _filtered(ctx, params, posting):
             continue
         account = ctx.store.collection("Account").get(posting["account_id"])
         rows.append(

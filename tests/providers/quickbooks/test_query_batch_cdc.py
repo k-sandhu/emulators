@@ -36,9 +36,8 @@ async def test_query_operators_and_pagination(qb) -> None:
     assert page1["startPosition"] == 1 and page1["maxResults"] == 2
     assert {c["Id"] for c in page1["Customer"]}.isdisjoint({c["Id"] for c in page2["Customer"]})
 
-    r = await q(client, h, "SELECT DisplayName, Balance FROM Customer MAXRESULTS 2")
-    row = r.json()["QueryResponse"]["Customer"][0]
-    assert set(row) <= {"Id", "SyncToken", "DisplayName", "Balance"}
+    r = await q(client, h, "SELECT DisplayName, Balance FROM Customer MAXRESULTS 2", expect=400)
+    assert r.json()["Fault"]["Error"][0]["code"] == "4000"
 
     r = await q(client, h, "SELECT * FROM Customer WHERE DisplayName = 'No Such Company'")
     assert r.json()["QueryResponse"] == {}

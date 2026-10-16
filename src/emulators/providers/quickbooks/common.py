@@ -24,6 +24,17 @@ from emulators.core.provider import ProviderContext, external_base
 
 PACIFIC = timezone(timedelta(hours=-7))
 
+
+def _pacific(instant: datetime) -> timezone:
+    """US DST rules since 2007, without depending on a Windows timezone database."""
+    year = instant.year
+    march = datetime(year, 3, 8, 10, tzinfo=UTC)
+    start = march + timedelta(days=(6 - march.weekday()) % 7)
+    november = datetime(year, 11, 1, 9, tzinfo=UTC)
+    end = november + timedelta(days=(6 - november.weekday()) % 7)
+    return PACIFIC if start <= instant < end else timezone(timedelta(hours=-8))
+
+
 # canonical entity name -> path segment (all lower case, as QBO uses them)
 ENTITIES: dict[str, str] = {
     "Account": "account",
@@ -103,20 +114,20 @@ UNIQUE_NAME: dict[str, str] = {
 REQUIRED: dict[str, list[str]] = {
     "Account": ["Name", "AccountType"],
     "Bill": ["VendorRef", "Line"],
-    "BillPayment": ["VendorRef", "Line"],
+    "BillPayment": ["VendorRef", "Line", "TotalAmt", "PayType"],
     "Class": ["Name"],
     "CreditMemo": ["CustomerRef", "Line"],
     "Customer": ["DisplayName"],
     "Department": ["Name"],
-    "Deposit": ["Line"],
+    "Deposit": ["Line", "DepositToAccountRef"],
     "Employee": ["GivenName", "FamilyName"],
     "Estimate": ["CustomerRef", "Line"],
     "Invoice": ["CustomerRef", "Line"],
     "Item": ["Name", "Type"],
     "JournalEntry": ["Line"],
-    "Payment": ["CustomerRef"],
+    "Payment": ["CustomerRef", "TotalAmt"],
     "PaymentMethod": ["Name"],
-    "Purchase": ["AccountRef", "Line"],
+    "Purchase": ["AccountRef", "Line", "PaymentType"],
     "SalesReceipt": ["CustomerRef", "Line"],
     "TaxAgency": ["DisplayName"],
     "TaxCode": ["Name"],
@@ -133,8 +144,10 @@ def realm(ctx: ProviderContext) -> str:
 
 def qbo_time(instant: datetime) -> str:
     """``2026-10-16T07:12:45.123-07:00`` — QBO's timestamp format."""
-    local = utc(instant).astimezone(PACIFIC)
-    return local.strftime("%Y-%m-%dT%H:%M:%S.") + f"{local.microsecond // 1000:03d}-07:00"
+    instant = utc(instant)
+    local = instant.astimezone(_pacific(instant))
+    offset = local.strftime("%z")
+    return local.strftime("%Y-%m-%dT%H:%M:%S.") + f"{local.microsecond // 1000:03d}{offset[:3]}:{offset[3:]}"
 
 
 def now_text(ctx: ProviderContext) -> str:
@@ -222,7 +235,7 @@ def fail(
     raise EmulatorError(
         status,
         fault_body(ctx, message, detail, code, fault_type=fault_type, element=element),
-        headers=headers or {},
+        headers={"intuit_tid": ctx.ids.hex(32), **(headers or {})},
     )
 
 
@@ -255,7 +268,7 @@ def auth_failure(ctx: ProviderContext, detail: str = "Token expired") -> NoRetur
         401,
         body,
         headers={
-            "WWW-Authenticate": 'Bearer [REDACTED]"Intuit"',
+            "WWW-Authenticate": 'Bearer realm="Intuit"',
             "intuit_tid": ctx.ids.hex(32),
         },
     )
@@ -273,6 +286,15 @@ def require_actor(ctx: ProviderContext, request: Request, realm_id: str) -> Gran
             auth_failure(ctx, "Token expired: access token has expired")
         auth_failure(ctx, "AuthenticationFailed: invalid or missing access token")
     assert grant is not None
+    if "com.intuit.quickbooks.accounting" not in grant.scopes:
+        fail(
+            ctx,
+            403,
+            "Authorization Failure",
+            "Accounting scope is required.",
+            "120",
+            fault_type="AuthenticationFault",
+        )
     token_realm = (grant.extra or {}).get("realm_id")
     if token_realm and str(token_realm) != str(realm_id):
         auth_failure(ctx, "Token is not valid for this company (realm mismatch)")
@@ -287,9 +309,9 @@ def require_actor(ctx: ProviderContext, request: Request, realm_id: str) -> Gran
             fault_type="AuthenticationFault",
         )
     # Delegated tokens for departed employees lose access, like a revoked user.
-    if not grant.app_only and grant.user_id:
-        emp = ctx.store.collection("_users").get(grant.user_id)
-        if emp is not None and not emp.get("active", True):
+    if not grant.app_only:
+        emp = user_for_grant(ctx, grant)
+        if emp is None or not emp.get("active", True):
             auth_failure(ctx, "User is inactive")
     return grant
 
@@ -311,12 +333,7 @@ def user_for_grant(ctx: ProviderContext, grant: Grant) -> dict[str, Any] | None:
 
 
 def wants_json(request: Request) -> bool:
-    # QBO defaults to XML in production; leniently only an explicit XML Accept,
-    # without JSON, gets XML (httpx's default Accept is */*).
-    accept = request.headers.get("accept", "")
-    wants_xml = "application/xml" in accept or "text/xml" in accept
-    wants_json_type = "application/json" in accept or "text/json" in accept
-    return wants_json_type or not wants_xml
+    return "application/json" in request.headers.get("accept", "").lower()
 
 
 def wrap(ctx: ProviderContext, entity: str, record: dict[str, Any]) -> dict[str, Any]:
@@ -333,8 +350,24 @@ def respond(ctx: ProviderContext, request: Request, body: dict[str, Any], status
 def _xml_value(tag: str, value: Any) -> str:
     tag = re.sub(r"[^A-Za-z0-9_.-]", "_", tag)
     if isinstance(value, dict):
-        inner = "".join(_xml_value(k, v) for k, v in value.items())
-        return f"<{tag}>{inner}</{tag}>"
+        attr_keys = {"domain", "sparse", "status"} if tag in ENTITIES else set()
+        if tag.endswith("Ref"):
+            attr_keys |= {"name", "type"}
+            attrs = "".join(
+                f' {k}="{xml_escape(str(v), {chr(34): "&quot;"})}"'
+                for k, v in value.items()
+                if k in attr_keys
+            )
+            return f"<{tag}{attrs}>{xml_escape(str(value.get('value', '')))}</{tag}>"
+        if tag == "QueryResponse":
+            attr_keys |= {"startPosition", "maxResults", "totalCount"}
+        attrs = "".join(
+            f' {k}="{xml_escape(str(v).lower() if isinstance(v, bool) else str(v))}"'
+            for k, v in value.items()
+            if k in attr_keys
+        )
+        inner = "".join(_xml_value(k, v) for k, v in value.items() if k not in attr_keys)
+        return f"<{tag}{attrs}>{inner}</{tag}>"
     if isinstance(value, list):
         return "".join(_xml_value(tag, v) for v in value)
     if value is None:

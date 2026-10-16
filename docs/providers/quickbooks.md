@@ -28,8 +28,7 @@ gateway) works for every endpoint as well.
 | Field | Value |
 | --- | --- |
 | Realm / company id | `9341569385067351` |
-| Client id | `AB0Emu1atorQuickBooksC1ientId000001` |
-| Client secret | `emu1ator-quickbooks-secret` |
+| Client id and secret | Read `credentials.client_id` and `credentials.client_secret` from `GET /_emulator/info` on a provider host (or `/quickbooks/_emulator/info` on the gateway) |
 | Redirect URI | anything (lenient); `https://localhost/callback` is pre-registered |
 | Scopes | `com.intuit.quickbooks.accounting openid profile email phone address` |
 | Company admin (full read/write) | `victoria.hale@halcyonadvisory.example` (CFO) — any partner, Finance & Operations or IT admin employee also has full access |
@@ -47,22 +46,28 @@ unless the hub opts into strict clients.
 2. `POST https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer` with Basic
    client auth and form body. `grant_type=authorization_code` and
    `grant_type=refresh_token` return:
-   `{"token_type": "bearer", "access_token": "eyJlbmMiOiJBMTI4Q0JDLUhTMjU2IiwiYWxnIjoiZGlyIn0..…",
-   "expires_in": 3600, "refresh_token": "AB11…", "x_refresh_token_expires_in": 8726400}`,
+   `token_type: "bearer"`, an opaque access token with five JWE-shaped segments,
+   `expires_in: 3600`, an opaque refresh token, and `x_refresh_token_expires_in: 8726400`,
    plus a signed RS256 `id_token` when `openid` was requested (validatable
    against `GET https://oauth.platform.intuit.com/op/v1/jwks`, issuer
    `https://oauth.platform.intuit.com/op/v1`). Errors are `{"error": "invalid_grant"}`.
    Refresh tokens **rotate**; the previous token keeps working until its
-   successor is used once, mirroring Intuit's ~24h grace.
+   successor is used once, with a maximum 24-hour grace period. Refresh and revoke
+   require the client that owns the token, including with lenient client registration.
 3. `POST /oauth2/v1/tokens/revoke` (also `/v2/oauth2/tokens/revoke` on the
    developer host) revokes an access or refresh token; revoking a refresh token
-   disconnects that user entirely.
+   disconnects that user for the owning app, preserving other apps' grants.
 4. `GET /v1/openid_connect/userinfo` (production and sandbox hosts) returns
    `{sub, email, emailVerified, givenName, familyName, phoneNumber, address}`.
+   OpenID is required and individual profile fields follow the granted scopes.
 
 Shortcut: `POST /_emulator/tokens` with `{"user": "<pNNN|email>"}` mints a
 QBO-shaped access+refresh pair (and returns `realm_id`); `{"app_only": true}`
-mints a company-level full-access token. API calls need
+mints a company-level full-access token. This shortcut is an emulator facility;
+Intuit does not offer an Accounting API client-credentials flow. Explicit empty
+scopes stay empty; all Accounting API routes require `com.intuit.quickbooks.accounting`.
+Unknown delegated identities are rejected and `expires_in` applies to delegated
+and app tokens. API calls need
 `Authorization: Bearer <access_token>`. Missing/invalid/expired tokens give the
 real 401 shape `{"fault": {"error": [{"message": "message=AuthenticationFailed;
 errorCode=003200; statusCode=401", "code": "3200", ...}], "type":
@@ -72,21 +77,24 @@ against a different realm in the path gives 401; an unknown realm gives 403.
 ## API conventions
 
 - Base path `/v3/company/{realmId}/...`. JSON when `Accept: application/json`;
-  an explicit `Accept: application/xml` gets
+  omitting a JSON Accept header (including `Accept: */*`) gets
   `<IntuitResponse xmlns="http://schema.intuit.com/finance/v3" time="...">`
-  XML for reads/queries/CRUD responses.
+  XML for reads/queries/CRUD responses. Entity attributes (`domain`, `sparse`),
+  reference text/attributes and query pagination attributes use QBO's XML shape.
 - Every JSON response wraps the entity: `{"Invoice": {...}, "time":
   "2026-10-16T07:12:45.123-07:00"}` and carries an `intuit_tid` header.
 - `minorversion` query param accepted for 1–75 (other values → 400).
 - Faults: `{"Fault": {"Error": [{"Message", "Detail", "code", "element"}],
   "type": "ValidationFault"}, "time"}`. Codes used: 610 Object Not Found,
-  5010 Stale Object Error, 6240 Duplicate Name Exists Error, 2020 required
+  5010 Stale Object Error, 6240 Duplicate Name Exists Error, 2010 invalid properties/JSON, 2020 required
   field, 6000 business validation, 4000 query parse, 110 authorization,
   3001 ThrottleExceeded (429 via fault injection).
 - Entities carry numeric-string `Id` (per-entity sequence), `SyncToken`
   (increments on every update; stale token → 5010), `MetaData {CreateTime,
-  LastUpdatedTime}` in `-07:00` offset, `domain: "QBO"`, `sparse: false`;
+  LastUpdatedTime}` in Pacific offset (`-07:00` summer, `-08:00` winter), `domain: "QBO"`, `sparse: false`;
   refs are `{"value": "12", "name": "..."}`.
+- Malformed JSON, invalid nested types, non-finite/oversized numbers and internal
+  properties return populated QBO faults. Failed updates leave records unchanged.
 
 ## Endpoints
 
@@ -102,28 +110,41 @@ All under `https://sandbox-quickbooks.api.intuit.com/v3/company/9341569385067351
 | POST | `/invoice/{id}/send?sendTo=` | Sets `EmailStatus: EmailSent`, `DeliveryInfo` (also estimate/salesreceipt/creditmemo) |
 | GET | `/invoice/{id}/pdf`, `/estimate/{id}/pdf`, `/salesreceipt/{id}/pdf`, `/creditmemo/{id}/pdf` | Real PDF bytes, lazily rendered and cached |
 | GET / POST | `/query` | QBO SQL below. POST body is the raw query (`application/text`), GET uses `?query=` |
-| POST | `/batch` | ≤30 `BatchItemRequest` items; create/update/delete/void/query; per-item `Fault` on failure |
+| POST | `/batch` | ≤30 `BatchItemRequest` items; create/update/delete/void/query; per-item `Fault` on failure. Read-only users may query, with writes denied per item |
 | GET | `/cdc?entities=Invoice,Customer&changedSince=<ISO>` | Changes in the last 30 days; deleted entities as `{"Id", "status": "Deleted", "MetaData"}` |
 | GET | `/reports/{Name}` | ProfitAndLoss, BalanceSheet, TrialBalance, AgedReceivables, AgedReceivableDetail, AgedPayables, AgedPayableDetail, CustomerIncome, GeneralLedger, TransactionList |
-| POST | `/upload` | Multipart attachable upload (creates an Attachable from the JSON metadata part) |
+| POST | `/upload` | Requires multipart/form-data with a JSON metadata part; creates an Attachable from that part |
 
-Delete/void semantics: transactions delete (`{"{Entity}": {"Id", "status":
-"Deleted"}}`); name-list entities are deactivated (`Active: false`) instead;
-void zeroes amounts, sets `PrivateNote: "Voided …"` and removes the ledger
+Delete/void semantics: transactions delete (`{"{Entity}": {"Id", "domain": "QBO", "status":
+"Deleted"}}`); name-list entities are deactivated through updates (`Active: false`)
+and reject `operation=delete`. Delete/void require the current SyncToken.
+Void is supported for Invoice, Payment, SalesReceipt and BillPayment; it zeroes
+amounts and sales quantities, sets `PrivateNote: "Voided …"` and removes the ledger
 postings. Creating a Payment/BillPayment updates the linked Invoice/Bill
-`Balance` and `LinkedTxn`, and customer/vendor balances roll up dynamically.
+`Balance` and `LinkedTxn`; reversing the payment reopens its target and clears the link.
+Deleting/voiding a paid invoice releases the payment as unapplied customer credit.
+Payments require TotalAmt, enforce linked-party consistency, and cannot apply more
+than their total. Unapplied payments reduce customer balances. Customer/account
+balances roll up through nested ancestors; renamed parents update descendant names.
+Invoices derive default due dates from TxnDate and terms (including due on receipt).
+Replacing lines recalculates tax; PDF caches invalidate when transactions change.
 
 ### Query language
 
-`SELECT * | COUNT(*) | Field, Field FROM Entity [WHERE cond [AND cond]...]
+`SELECT * | COUNT(*) FROM Entity [WHERE cond [AND cond]...]
 [ORDERBY Field [ASC|DESC], ...] [STARTPOSITION n] [MAXRESULTS m]` — keywords
 case-insensitive; operators `= < > <= >= !=`, `IN ('a','b')`, `LIKE '%x%'`
 (`%` wildcards only); dotted fields (`MetaData.LastUpdatedTime > '…'`,
 `CustomerRef = '12'` compares the ref value); `Active IN (true, false)`.
+Backslashes escape apostrophes/backslashes in string literals. Numeric amounts sort
+numerically. Pagination requires positive integer values and returns an empty object
+after the last record. Unknown properties return query validation code 4001.
 Defaults: `STARTPOSITION 1`, `MAXRESULTS 100` (max 1000); name-list entities
 default to `Active = true` unless `Active` is mentioned. `OR` and any parse
 error → 400 fault 4000 "Error parsing query". Empty results return
 `{"QueryResponse": {}}`; counts return `{"QueryResponse": {"totalCount": n}}`.
+Field projections are rejected, as in Intuit's query language. The SDK's
+`SELECT *, Sku FROM Item` extension is accepted.
 
 ### Reports
 
@@ -131,13 +152,19 @@ Params: `start_date`, `end_date`, `date_macro` (`This Fiscal Year-to-date`,
 `Last Month`, `This Month`, `Last Fiscal Year`, `All dates`, …),
 `accounting_method=Accrual|Cash`, `summarize_column_by=Total|Month|Quarter|
 Customer|Class|Vendor`, plus `customer`/`vendor`/`class` filters and
-`account` for GeneralLedger. Output is the real QBO structure
+`department` filters on P&L/ledger reports, and `account` for GeneralLedger.
+Filter lists may contain comma-separated ids. Aging reports honor customer/vendor
+filters and reconstruct balances at `report_date` from dated payment allocations.
+Output is the real QBO structure
 (`Header`/`Columns`/`Rows` with `Section`/`Data` rows, `Summary` totals and
 `group` markers such as `Income`, `NetIncome`). P&L income ties exactly to
-invoice subtotals (paid invoices under Cash), expenses to bills/purchases/
+invoice subtotals (linked receipts under Cash), expenses to bills/purchases/
 journals; the Balance Sheet balances because opening Retained Earnings is the
 plug that balances the world's opening trial balance; AR/AP tie to open
 invoice/bill balances.
+Cash P&L retimes linked invoice/bill allocations to payment dates, prorating tax
+and preserving income/expense accounts. Net Operating Income excludes other expenses;
+Net Income includes them. Invalid dates, reversed periods and spans over 100 years fail.
 
 ## Seeded data
 
@@ -184,6 +211,8 @@ On every entity create/update/delete/void the emulator POSTs
 `intuit-signature: base64(HMAC-SHA256(verifier_token, body))` — the exact
 scheme `QuickBooks.validate_webhook_signature` checks. Deliveries are journaled
 at `GET /_emulator/webhooks`.
+Each configured subscription receives only its selected entities, including mixed
+batches. There is no URL validation handshake. Retries preserve the signed body.
 
 ## Actions
 
@@ -198,17 +227,52 @@ at `GET /_emulator/webhooks`.
 - XML serialisation covers reads, queries and CRUD responses, but reports and
   error bodies are JSON only, and the XML shape is a faithful field-for-field
   projection rather than Intuit's exact per-entity XSD ordering.
-- Cash-basis P&L recognises income from payments and keeps bill/purchase
-  expenses on their transaction dates — an approximation of QBO's cash-basis
-  rules (which also re-times by payment links in more corner cases).
-- No SalesReceipt/Deposit records are seeded (both are fully supported via
-  CRUD); world payments deposit straight into the operating bank account.
+- Cash-basis P&L supports linked Invoice/Payment and Bill/BillPayment allocations
+  plus immediate sales receipts/purchases. Credit applications, unapplied cash income,
+  cash-basis balance sheets and tax-specific reporting adjustments are not complete.
+- BalanceSheet/TrialBalance dimension filters, historical edit/deletion reconstruction,
+  and credit-memo aging are not complete. NoReportData is not inferred for every report.
+- No SalesReceipt/Deposit records are seeded; world payments deposit straight
+  into the operating bank account.
 - Payroll, payments (QB Payments API), online invoice payment processing,
   recurring transactions, budgets, purchase orders, price levels, inventory
   quantity tracking and multi-currency revaluation are not emulated.
 - Attachables store metadata only; file bytes from `/upload` are not retained.
+- Transaction line support is sales-item/subtotal/description lines for sales,
+  account-based expense lines for bills/purchases, journal lines and deposit lines.
+  Group, discount, inventory and item-based expense lines are rejected. Inclusive
+  tax and jurisdiction-specific tax-service creation are not complete.
+- Query property validation detects unknown fields but does not exhaustively model
+  every entity's filterable/sortable annotations. Query text is bounded to 64 KiB.
+- CDC rejects unsupported/unknown entity names, future dates and missing entity lists.
+  It does not model Intuit's 1000-object response cap or every entity-specific exclusion.
+- Payment links currently support Invoice targets and BillPayment links support Bill
+  targets; CreditMemo/VendorCredit/JournalEntry applications are not implemented.
+- OAuth refresh rotation follows the original emulator brief's predecessor/successor
+  model, bounded to 24 hours, rather than reproducing Intuit's exact daily token reuse.
+- Webhook retries use the shared dispatcher's three attempts with short test-friendly
+  delays rather than Intuit's production retry schedule. Related balance changes are
+  visible to CDC but do not emit additional webhook events for every affected record.
 - Delegated permissions are a two-role model (full vs read-only) rather than
   QBO's per-feature user permissions; OAuth app tokens are full access.
 - The opening retained-earnings plug (see Reports) is an emulator bookkeeping
   choice: check `Retained Earnings` opening via TrialBalance rather than the
   world's `opening_balance` of 0.
+
+## Fidelity audit references and validation
+
+The audit checked [Intuit's query restrictions and escaping](https://help.developer.intuit.com/s/article/SQL-Queries),
+[Invoice delete/void contracts](https://developer.intuit.com/docs/api/accounting/invoice),
+[Payment required fields](https://developer.intuit.com/app/developer/qbo/docs/api/accounting/all-entities/payment),
+and [OAuth authorization](https://developer.intuit.com/app/developer/qbo/docs/develop/authentication-and-authorization/oauth-2.0).
+The original field-projection and cross-client refresh tests were corrected to follow
+these contracts. An in-process adversarial probe sent 2,296 malformed-field requests
+after fixes with no exceptions or 500 responses; seed construction was about 0.2 seconds.
+Regression tests cover malformed bodies and nested fields across every entity, mutation
+atomicity, payment reversals, auth isolation, query ordering/escaping, default XML,
+webhook filtering, reports and SDK flows.
+
+Final validation: 124 QuickBooks provider tests, 7 QuickBooks SDK tests and all
+10 end-to-end tests passed. A clean full-suite run finished with **3,557 passed,
+1 skipped** (the optional MP4 parser check needs `mutagen`). Ruff checks and
+format checks passed on the QuickBooks paths; a secret-pattern scan found no hits.

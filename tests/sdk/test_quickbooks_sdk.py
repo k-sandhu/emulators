@@ -25,14 +25,14 @@ from quickbooks.objects.payment import Payment, PaymentLine
 pytestmark = pytest.mark.sdk
 
 REALM = "9341569385067351"
-CLIENT_ID = "AB0Emu1atorQuickBooksC1ientId000001"
-CLIENT_SECRET = "emu1ator-quickbooks-secret"
 REDIRECT = "https://localhost/callback"
 ADMIN_HINT = "victoria.hale@halcyonadvisory.example"
 
 
 def make_auth_client() -> AuthClient:
-    auth_client = AuthClient(CLIENT_ID, CLIENT_SECRET, REDIRECT, "sandbox")
+    info = requests.get("https://sandbox-quickbooks.api.intuit.com/_emulator/info", timeout=30).json()
+    credentials = info["credentials"]
+    auth_client = AuthClient(credentials["client_id"], credentials["client_secret"], REDIRECT, "sandbox")
     url = auth_client.get_authorization_url(
         [Scopes.ACCOUNTING, Scopes.OPENID, Scopes.PROFILE, Scopes.EMAIL, Scopes.PHONE, Scopes.ADDRESS]
     )
@@ -139,6 +139,20 @@ def test_invoice_lifecycle_create_pay_pdf(qb: QuickBooks) -> None:
 
     pdf = settled.download_pdf(qb=qb)
     assert pdf[:5] == b"%PDF-"
+    saved_payment.delete(qb=qb)
+    reopened = Invoice.get(saved_invoice.Id, qb=qb)
+    assert float(reopened.Balance) == 750
+    assert not reopened.LinkedTxn
+
+
+def test_sdk_query_escaping_and_numeric_order(qb: QuickBooks) -> None:
+    customer = Customer()
+    customer.DisplayName = "SDK Adam's Candy Shop"
+    customer.save(qb=qb)
+    found = Customer.filter(DisplayName="SDK Adam's Candy Shop", qb=qb)
+    assert len(found) == 1
+    invoices = Invoice.all(qb=qb, order_by="TotalAmt ASC", max_results=1000)
+    assert [i.TotalAmt for i in invoices] == sorted(i.TotalAmt for i in invoices)
 
 
 def test_batch_create_via_sdk(qb: QuickBooks) -> None:
