@@ -117,6 +117,11 @@ def in_scope(
     return None
 
 
+def change_visible(c: m.Call, event: dict[str, Any]) -> bool:
+    """Deletion/move tombstones must preserve the source entry's visibility."""
+    return m.entry_role(c, {"ns": event["ns"], **event.get("access", {})}) is not None
+
+
 # ---------------------------------------------------------------------------------------
 # Cursors
 # ---------------------------------------------------------------------------------------
@@ -139,9 +144,11 @@ def make_state(
     }
 
 
-def decode_state(cursor: str) -> dict[str, Any]:
-    state = Pager.decode(cursor)
-    if not state or state.get("v") != 1 or "ns" not in state:
+def decode_state(c: m.Call, cursor: str) -> dict[str, Any]:
+    state = Pager.decode(cursor, c)
+    if state is None and cursor.startswith("AAH"):
+        raise api_error(tag("reset"))
+    if not state or state.get("v") not in (1, 3) or "ns" not in state:
         raise BadInput(f"request body: cursor: '{cursor}' is not a valid cursor")
     return state
 
@@ -195,7 +202,7 @@ def list_page(
     more = len(remaining) > len(page)
     entries = [render(c, rec, loc, state["ex"]) for _, rec, loc in page]
     nxt = {**state, "after": page[-1][0]} if more else {**state, "after": None, "ph": "delta"}
-    return {"entries": entries, "cursor": Pager.encode(nxt), "has_more": more}
+    return {"entries": entries, "cursor": Pager.encode(nxt, c), "has_more": more}
 
 
 def delta_page(c: m.Call, state: dict[str, Any], base: m.Loc) -> dict[str, Any]:
@@ -207,7 +214,7 @@ def delta_page(c: m.Call, state: dict[str, Any], base: m.Loc) -> dict[str, Any]:
         if ev["seq"] <= state["seq"]:
             continue
         prefix = in_scope(ev, scopes, recursive)
-        if prefix is None:
+        if prefix is None or not change_visible(c, ev):
             continue
         latest[(ev["ns"], ev["path"])] = (ev, prefix)
         # keep dict order by last event
@@ -231,7 +238,7 @@ def delta_page(c: m.Call, state: dict[str, Any], base: m.Loc) -> dict[str, Any]:
             entries.append(d)
     new_seq = page[-1][0]["seq"] if more else now_seq
     nxt = {**state, "seq": new_seq, "ph": "delta", "after": None}
-    return {"entries": entries, "cursor": Pager.encode(nxt), "has_more": more}
+    return {"entries": entries, "cursor": Pager.encode(nxt, c), "has_more": more}
 
 
 @route("files/list_folder", auth="app,user", scope="files.metadata.read")
@@ -260,7 +267,11 @@ def list_shared_link(c: m.Call, a: Any, flags: dict[str, Any]) -> Any:
 
 @route("files/list_folder/continue", auth="app,user", scope="files.metadata.read")
 def list_folder_continue(c: m.Call) -> Any:
-    state = decode_state(c.args.str("cursor"))
+    state = decode_state(c, c.args.str("cursor"))
+    if state["v"] == 3:
+        from emulators.providers.dropbox.sharing_links import list_link_page
+
+        return list_link_page(c, state)
     c.prop_filter = state.get("pf")
     if state["seq"] > m.current_seq(c.ctx):
         raise api_error(tag("reset"))
@@ -279,7 +290,7 @@ def list_folder_get_latest_cursor(c: m.Call) -> Any:
     if loc.rec is not None and loc.rec["type"] != "folder":
         raise path_error("not_folder")
     state = make_state(c, loc, flags, seq=m.current_seq(c.ctx), after=None, phase="delta")
-    return {"cursor": Pager.encode(state)}
+    return {"cursor": Pager.encode(state, c)}
 
 
 # ---------------------------------------------------------------------------------------
@@ -385,6 +396,10 @@ def delete_at(c: m.Call, path: str, parent_rev: str | None) -> dict[str, Any]:
     role = m.entry_role(c, rec)
     if not m.is_writer(role):
         raise path_error("no_write_permission", "path_write")
+    if rec["type"] == "folder" and any(
+        not m.is_writer(m.entry_role(c, child)) for child in c.tree.subtree(rec["ns"], rec["path"])
+    ):
+        raise path_error("no_write_permission", "path_write")
     if rec.get("lock") and rec["lock"]["account_id"] != c.actor.id:
         raise path_error("locked", "path_lookup")
     if parent_rev and rec["type"] == "file" and rec["revisions"][-1]["rev"] != parent_rev:
@@ -462,13 +477,18 @@ def relocate_path(
         if disallowed_name(part):
             raise path_error("disallowed_name", "to")
     same = target.existing is src
-    if target.existing is not None and not same and not autorename_:
+    if target.existing is not None and (not same or copy) and not autorename_:
         raise path_error(
             "conflict", "to", conflict={".tag": "folder" if target.existing["type"] == "folder" else "file"}
         )
     if same and src["name"] == target.name and not copy:
         raise relocation_error("duplicated_or_nested_paths")
     if src["type"] == "folder":
+        children = c.tree.subtree(src["ns"], src["path"])
+        if any(m.entry_role(c, child) is None for child in children):
+            raise path_error("not_found", "from_lookup")
+        if not copy and any(not m.is_writer(m.entry_role(c, child)) for child in children):
+            raise path_error("no_write_permission", "from_write")
         dest_rel = target.final_rel()
         if (
             target.ns == src["ns"]
@@ -482,7 +502,7 @@ def relocate_path(
             raise relocation_error("too_many_files")
     parent = materialize_parents(c, target)
     name = target.name
-    if target.existing is not None and not same:
+    if target.existing is not None and (not same or copy):
         name = unique_name_in(c, target.ns, parent, name)
     ops = Ops(c.ctx, c.tree, c.touched)
     before = dict(src)

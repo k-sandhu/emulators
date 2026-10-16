@@ -12,9 +12,11 @@ Dropbox error conventions (all reproduced here):
 from __future__ import annotations
 
 import base64
+import copy
 import hashlib
 import json
 import re
+import secrets
 from datetime import UTC, datetime
 from typing import Any
 
@@ -210,7 +212,7 @@ class Args:
                 raise self._fail(key, "missing required field")
             return default, None
         name, payload = union_tag(value)
-        if name is None:
+        if not isinstance(name, str):
             raise self._fail(key, "expected union object with a '.tag' field")
         if allowed is not None and name not in allowed:
             raise self._fail(key, f"unknown tag '{name}'")
@@ -236,6 +238,8 @@ def union_tag(value: Any) -> tuple[str | None, Any]:
         return value, None
     if isinstance(value, dict) and ".tag" in value:
         name = value[".tag"]
+        if not isinstance(name, str):
+            return None, None
         rest = {k: v for k, v in value.items() if k != ".tag"}
         if name in rest and len(rest) == 1:
             return name, rest[name]
@@ -304,23 +308,38 @@ def content_hash(data: bytes) -> str:
 
 
 class Pager:
-    """Opaque cursor <-> JSON state."""
+    """Immutable opaque cursors, bound to the caller and restored with store snapshots.
+
+    Client-supplied base64 JSON must never become trusted pagination or ACL state.
+    Longpoll intentionally uses the cursor as a capability without authentication.
+    """
 
     @staticmethod
-    def encode(state: dict[str, Any]) -> str:
-        raw = json.dumps(state, separators=(",", ":"), sort_keys=True).encode()
-        return "AAH" + b64url(raw)
+    def encode(state: dict[str, Any], call: Any) -> str:
+        cursor = "AAH" + secrets.token_urlsafe(32)
+        call.ctx.store.collection("_dropbox_cursors").put(
+            {"id": cursor, "owner": Pager.owner(call), "state": copy.deepcopy(state)}
+        )
+        return cursor
 
     @staticmethod
-    def decode(cursor: str) -> dict[str, Any] | None:
-        if not isinstance(cursor, str) or not cursor.startswith("AAH"):
+    def decode(cursor: str, call: Any) -> dict[str, Any] | None:
+        record = call.ctx.store.collection("_dropbox_cursors").get(cursor)
+        if record is None:
             return None
-        try:
-            padded = cursor[3:] + "=" * (-len(cursor[3:]) % 4)
-            state = json.loads(base64.urlsafe_b64decode(padded))
-        except (ValueError, UnicodeError):
+        if call.route != "files/list_folder/longpoll" and record["owner"] != Pager.owner(call):
             return None
-        return state if isinstance(state, dict) else None
+        return copy.deepcopy(record["state"])
+
+    @staticmethod
+    def owner(call: Any) -> list[Any]:
+        actor = call.actor
+        return [
+            actor.id,
+            actor.admin,
+            actor.team_scope,
+            actor.grant.client_id if actor.grant else actor.app_id,
+        ]
 
 
 # ---------------------------------------------------------------------------------------

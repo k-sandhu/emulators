@@ -301,7 +301,7 @@ def search_page(c: m.Call, state: dict[str, Any]) -> dict[str, Any]:
     offset, limit = state["offset"], 100
     out: dict[str, Any] = {"matches": matches[offset : offset + limit]}
     if offset + limit < len(matches):
-        out["cursor"] = Pager.encode({**state, "offset": offset + limit})
+        out["cursor"] = Pager.encode({**state, "offset": offset + limit}, c)
     return out
 
 
@@ -340,7 +340,7 @@ def properties_search(c: m.Call) -> Any:
 
 @route("file_properties/properties/search/continue", scope="files.metadata.read")
 def properties_search_continue(c: m.Call) -> Any:
-    state = Pager.decode(c.args.str("cursor"))
+    state = Pager.decode(c.args.str("cursor"), c)
     if not state or state.get("t") != "props":
         raise api_error(tag("reset"))
     return search_page(c, state)

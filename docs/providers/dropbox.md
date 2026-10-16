@@ -93,7 +93,11 @@ Lenient by default: any `client_id` / `client_secret` pair is accepted.
 * **Token endpoint**: `POST /oauth2/token` (form-encoded; client id/secret in the body or HTTP Basic) with
   `grant_type=authorization_code` (+ `code_verifier`) or `refresh_token`. Response:
   `{"access_token": "sl.B...", "token_type": "bearer", "expires_in": 14400, "refresh_token": ..., "scope": "...", "uid": "...", "account_id": "dbid:...", "team_id": "dbtid:..."}`
-  (`refresh_token` only for `token_access_type=offline`; `team_id` for Business members, which the SDK reports as `account_id`).
+  (`refresh_token` only for `token_access_type=offline`; user grants return `uid`/`account_id`, team grants return `team_id`).
+  Refresh tokens are reusable and do not rotate; a requested refresh scope must be a subset of the original grant.
+  Code redemption requires the original redirect URI. Registered redirect allowlists and client secrets are enforced when
+  the hub uses strict client authentication; PKCE public clients can redeem and refresh without a client secret.
+  Team authorization requires an administrator. `include_granted_scopes` combines the same app's existing grants.
 * `POST /2/auth/token/revoke` revokes the access token and its refresh token. `check/user` and `check/app` (HTTP Basic) echo.
 * **Acting as a member** (team tokens): `Dropbox-API-Select-User: dbmid:...` or `Dropbox-API-Select-Admin: dbmid:...`
   (an admin; reaches any team-owned namespace, ignoring access inheritance cuts).
@@ -207,7 +211,7 @@ Shared links: `https://www.dropbox.com/scl/fi/<id>/<name>?rlkey=<key>&dl=0` (fil
   `7770591070`, People & Culture `7515113319`, Technology `5913236337`, Marketing & BD `6609964232`, Knowledge Base `6140259346`, Partner Group
   `8722852746`. Access comes from `Space.members` through groups (`owner` is mapped to `editor`; team folders have no user owner).
 * **359 documents** -> files with real DOCX/XLSX/PPTX/PDF/CSV/MD/PNG bytes, `Document.versions` revisions, `client_modified` = world
-  modified time (server time +7 s). Duplicate world paths get Dropbox's ` (1)` suffix. Personal spaces fill each member's home
+  modified time (server time +7 s, capped at the world anchor). Duplicate world paths get Dropbox's ` (1)` suffix. Personal spaces fill each member's home
   (`/Notes`, `/Expenses`, `/Drafts`).
 * `Document.shares` -> **file members** (roles: editor -> `editor`, commenter -> `viewer`, viewer -> `viewer_no_comment`;
   expiry honoured: the Northwind "Draft Financial Statements.pdf" share for Christopher expires 2026-11-15); link shares ->
@@ -259,6 +263,12 @@ Settings (`EMULATORS_DROPBOX_<NAME>` env vars or hub `settings`): `LONGPOLL_MAX_
 
 ## Known gaps
 
+* OAuth `client_credentials` app tokens are not implemented; app-auth endpoints accept HTTP Basic credentials.
+* Shared-folder link cursors paginate the initial listing and recheck link access on continuation. After the last page they
+  return an empty page; shared-link delta tracking and longpoll are not implemented.
+* Webhook retries use the shared dispatcher (three attempts, short delays) rather than Dropbox's production retry schedule
+  and automatic webhook suspension. Verification preserves query parameters already present in the configured URL.
+
 * Not implemented: `paper/*`, `account/*` (profile photos), `team/reports/*`, `team/legal_holds/*`, `team/member_space_limits/*`, `team/sharing_allowlist/*`, `auth/token/from_oauth1`,
   `files/paper/*`, `files/upload_session/append_batch`, `sharing/update_file_policy`, `sharing/relinquish_access`.
 * Thumbnails are generated gradients (PNG and a tiny baseline JPEG) of the requested size, not renderings of the source image;
@@ -273,3 +283,32 @@ Settings (`EMULATORS_DROPBOX_<NAME>` env vars or hub `settings`): `LONGPOLL_MAX_
 * Admin consoles, billing, SSO/domain verification, device approvals and real e-mail invitations (invitees stay *pending* forever) are out of scope.
 * Team routes accept any team token for read routes; write routes need a Team/User-management admin. Rate limiting is only available through
   fault injection.
+
+## Fidelity audit and validation
+
+Request arguments are checked before writes against a local catalog of the official Python SDK's Stone types
+(`argument_schema.json`, generated from SDK 12.2.3). This covers nested structs, union payloads, list elements,
+required fields, timestamp formats and numeric/string limits, without importing the SDK at runtime. Regenerate with
+`uv run python tests/providers/dropbox/generate_argument_schema.py` after updating the dev SDK.
+
+Cursors are opaque, immutable store records bound to the caller, app and admin context. Reset invalidates existing
+cursors; snapshots preserve them. Async job results are available only to their initiating account. Longpoll intentionally
+uses a valid list-folder cursor without authentication. Restricted-file tombstones retain their original visibility;
+bulk copies/moves/deletes conservatively reject a tree containing inaccessible or unwritable descendants.
+Folder-ID prefixes resolve relative descendants for reads and writes. Namespace-root writes return conflicts, and
+self-copies require autorename. Case-only moves preserve the requested display spelling. Permanent folder deletion
+purges descendant tombstones and revision records.
+
+Upload sessions expire after seven days. Batch finishes require closed sessions; concurrent sessions enforce 4 MiB offsets,
+chunk alignment, final close and finish-without-content rules. Identical upload content returns the existing revision unless
+`strict_conflict` applies. Stale update revisions require `autorename` to create a conflicted copy; a strict update of a
+missing file conflicts. Copy references require the same app and continuing source authorization.
+
+Shared links enforce their `rlkey` and download setting through both API and browser routes. Link-list continuations retain
+the original path filter, and returned links work in hostname, prefix and dedicated-port modes. Fault responses include
+request IDs, including rate-limit errors with `Retry-After`.
+
+Reference sources: [Dropbox's public Stone specification](https://github.com/dropbox/dropbox-api-spec),
+[authorization reference](https://docs.dropboxapi.com/dropbox-api/docs/get-started/authorization), and
+[webhook reference](https://docs.dropboxapi.com/dropbox-api/docs/webhooks). Regression coverage is in
+`tests/providers/dropbox/test_audit.py` and `tests/sdk/test_dropbox_audit_sdk.py`.

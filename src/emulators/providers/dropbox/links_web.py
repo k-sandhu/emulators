@@ -94,6 +94,8 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         link, c = lookup_link(slug)
         if link is None or link["kind"] != kind:
             return page("Not found", "<h1>That link doesn't exist</h1>", 404)
+        if not link.get("legacy") and request.query_params.get("rlkey") != link["rlkey"]:
+            return page("Not found", "<h1>That link doesn't exist</h1>", 404)
         rec = c.tree.by_id(link["entry"])
         if rec is None or rec.get("deleted"):
             return page("Not found", "<h1>That file was deleted</h1>", 404)
@@ -117,7 +119,7 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
             return page(
                 rec["name"],
                 f"<h1>{html.escape(rec['name'])}</h1><p>{latest['size']} bytes</p>"
-                f"<p><a href='?dl=1'>Download</a></p>",
+                f"<p><a href='{html.escape(str(request.url.include_query_params(dl='1')))}'>Download</a></p>",
             )
         ns, rel = (rec["mount_ns"], "") if rec.get("mount_ns") else (rec["ns"], rec["path"])
         if wants_file:

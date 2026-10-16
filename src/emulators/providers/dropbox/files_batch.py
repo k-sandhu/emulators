@@ -42,7 +42,7 @@ def launch(c: m.Call, kind: str, result: dict[str, Any], status: str = "complete
 
 def poll(c: m.Call, kind: str) -> dict[str, Any]:
     job = c.ctx.store.collection(m.JOBS).get(c.args.str("async_job_id"))
-    if job is None or job["kind"] != kind:
+    if job is None or job["kind"] != kind or job["account"] != c.actor.id:
         raise api_error(tag("invalid_async_job_id"))
     if job["polls"] > 0:
         job["polls"] -= 1

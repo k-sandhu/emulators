@@ -254,7 +254,14 @@ def copy_reference_get(c: m.Call) -> Any:
     ref = "AAF" + m.new_token(c.ctx, "copyref", 60)
     expires = c.now() + timedelta(hours=4)
     c.ctx.store.collection(m.COPY_REFS).put(
-        {"id": ref, "entry": rec["id"], "account": c.actor.id, "expires": ts(expires)}
+        {
+            "id": ref,
+            "entry": rec["id"],
+            "account": c.actor.id,
+            "expires": ts(expires),
+            "client_id": c.actor.grant.client_id,
+            "admin": c.actor.admin,
+        }
     )
     return {"metadata": m.metadata(c, rec, loc=loc), "copy_reference": ref, "expires": ts(expires)}
 
@@ -265,9 +272,30 @@ def copy_reference_save(c: m.Call) -> Any:
     ref = c.ctx.store.collection(m.COPY_REFS).get(a.str("copy_reference"))
     if ref is None or ref["expires"] <= ts(c.now()):
         raise api_error(tag("invalid_copy_reference"))
+    if ref["client_id"] != c.actor.grant.client_id:
+        raise api_error(tag("no_permission"))
+    owner = m.account(c.ctx, ref["account"])
+    if owner is None or not any(
+        g.get("user_id") == owner["person"] and g["client_id"] == ref["client_id"] and not g.get("revoked")
+        for g in c.ctx.store.collection("_grants")
+        if g["kind"] in ("access", "refresh")
+    ):
+        raise api_error(tag("no_permission"))
     src = c.tree.by_id(ref["entry"])
     if src is None or src.get("deleted"):
         raise api_error(tag("not_found"))
+    source_call = m.Call(
+        ctx=c.ctx,
+        request=c.request,
+        route=c.route,
+        args=c.args,
+        body=b"",
+        request_id=c.request_id,
+        actor=m.Actor(account=owner, admin=ref["admin"]),
+    )
+    items = [src, *c.tree.subtree(src["ns"], src["path"])] if src["type"] == "folder" else [src]
+    if any(m.entry_role(source_call, item) is None for item in items):
+        raise api_error(tag("no_permission"))
     target = write_target(c, a.str("path", pattern=WRITE_PATH))
     check_writable(target)
     if target.existing is not None:

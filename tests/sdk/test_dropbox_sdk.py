@@ -416,7 +416,7 @@ def test_oauth_authorization_code_flow_with_pkce_and_refresh(emulator_intercept:
     page = requests.get(url + "&login_hint=" + MAYA, timeout=10)
     code = re.search(r"id='code'>([^<]+)<", page.text).group(1)  # type: ignore[union-attr]
     result = flow.finish(code)
-    assert result.account_id == "dbtid:AAD94f565a6beeb52a733f8bef7d77b04"  # the SDK reports team_id here
+    assert result.account_id.startswith("dbid:")
     assert result.refresh_token and result.scope == "account_info.read files.metadata.read"
     dbx = dropbox.Dropbox(oauth2_access_token=result.access_token)
     assert dbx.users_get_current_account().email == MAYA

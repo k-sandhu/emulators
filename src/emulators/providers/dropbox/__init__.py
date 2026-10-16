@@ -27,6 +27,7 @@ Modules (routes register themselves with :mod:`dispatch` on import):
 from __future__ import annotations
 
 import json
+import secrets
 from typing import Any
 
 from fastapi import FastAPI
@@ -108,9 +109,18 @@ class DropboxProvider(Provider):
             }
         return {"error_summary": f"{code}/...", "error": {".tag": "other"}, "message": message}
 
-    def fault_response(self, rule: FaultRule) -> tuple[int, dict[str, str], bytes]:
+    def error_headers_for(self, scope: dict[str, Any] | None, status: int) -> dict[str, str]:
+        return {"X-Dropbox-Request-Id": secrets.token_hex(16)}
+
+    def fault_response(
+        self, rule: FaultRule, scope: dict[str, Any] | None = None
+    ) -> tuple[int, dict[str, str], bytes]:
         status = rule.status or 500
-        headers = {"content-type": "application/json", **rule.headers}
+        headers = {
+            "content-type": "application/json",
+            **self.error_headers_for(scope, status),
+            **rule.headers,
+        }
         if rule.body is not None:
             body = rule.body if isinstance(rule.body, (bytes, str)) else json.dumps(rule.body)
             return status, headers, body.encode() if isinstance(body, str) else body

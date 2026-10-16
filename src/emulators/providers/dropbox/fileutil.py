@@ -80,7 +80,7 @@ def write_target(c: m.Call, path: str) -> Target:
     segments = m.split_path(path)
     if not segments:
         return Target(c.actor.root_ns, "", [], "", None, "", "", None, is_root=True)
-    if path.startswith("id:"):
+    if path.startswith("id:") and "/" not in path:
         loc = m.resolve(c, path, allow_root=False)
         if loc is None or loc.rec is None:
             raise path_error("malformed_path")
@@ -91,11 +91,12 @@ def write_target(c: m.Call, path: str) -> Target:
     w = m.resolve_for_write(c, path)
     if w.found:
         rec = w.loc.rec
-        assert rec is not None
+        if rec is None:
+            return Target(w.loc.ns, "", [], "", None, w.loc.pl, w.loc.pd, None, is_root=True)
         ns = rec["ns"]
         prefix = m.locate_ns(c, ns) or ("", "")
         role = m.entry_role(c, rec) if rec["type"] == "file" else m.ns_role(c.actor, c.tree.namespace(ns))
-        return Target(ns, m.parent_of(rec["path"]), [], rec["name"], rec, prefix[0], prefix[1], role)
+        return Target(ns, m.parent_of(rec["path"]), [], segments[-1], rec, prefix[0], prefix[1], role)
     ns = w.loc.ns
     rest = w.rest
     role = m.ns_role(c.actor, c.tree.namespace(ns))

@@ -318,7 +318,7 @@ def _seed_document(
         old.append(
             ops.revision(
                 data,
-                when=when + timedelta(seconds=7),
+                when=min(when + timedelta(seconds=7), w.anchor),
                 client_modified=when,
                 modified_by=owner["id"],
                 rev=revision_for(f"{doc.id}/{i}"),
@@ -329,7 +329,7 @@ def _seed_document(
         parent,
         name,
         data,
-        when=doc.modified + timedelta(seconds=7),
+        when=min(doc.modified + timedelta(seconds=7), w.anchor),
         client_modified=doc.modified,
         modified_by=modifier["id"],
         owner=owner["id"],

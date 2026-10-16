@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import json
 from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from fastapi import FastAPI
 
@@ -25,7 +26,7 @@ from emulators.core.webhooks import hmac_sha256_hex
 from emulators.providers.dropbox import model as m
 from emulators.providers.dropbox.common import Args, Pager, api_error, tag, ts
 from emulators.providers.dropbox.dispatch import route
-from emulators.providers.dropbox.files_core import in_scope, scope_list
+from emulators.providers.dropbox.files_core import change_visible, in_scope, scope_list
 from emulators.providers.dropbox.model import Actor, Call
 
 DEFAULT_LONGPOLL_CAP = 2.0
@@ -119,7 +120,10 @@ async def configure_webhook(ctx: ProviderContext, payload: dict[str, Any]) -> di
         raise EmulatorError(400, {"error": "url and app_secret are required"})
     challenge = m.new_token(ctx, "challenge", 32)
     try:
-        response = await ctx.webhooks.request("GET", url, params={"challenge": challenge})
+        parts = urlsplit(url)
+        query = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True) if k != "challenge"]
+        verification_url = urlunsplit(parts._replace(query=urlencode([*query, ("challenge", challenge)])))
+        response = await ctx.webhooks.request("GET", verification_url)
     except Exception as exc:  # network / transport failures surface as a verification failure
         raise EmulatorError(
             400, {"error": f"webhook verification failed: {type(exc).__name__}: {exc}"}
@@ -199,14 +203,18 @@ def has_changes(ctx: ProviderContext, state: dict[str, Any]) -> bool:
     base = m.Loc(state["ns"], state["rel"], "", None, state["pl"], state["pd"], reachable=state["reach"])
     scopes = scope_list(c, base, recursive=state["rec"], mounted=state["mnt"])
     for ev in ctx.store.collection(m.CHANGES):
-        if ev["seq"] > state["seq"] and in_scope(ev, scopes, state["rec"]) is not None:
+        if (
+            ev["seq"] > state["seq"]
+            and in_scope(ev, scopes, state["rec"]) is not None
+            and change_visible(c, ev)
+        ):
             return True
     return False
 
 
 @route("files/list_folder/longpoll", auth="noauth", void_arg=False)
 async def list_folder_longpoll(c: m.Call) -> Any:
-    state = Pager.decode(c.args.str("cursor"))
+    state = Pager.decode(c.args.str("cursor"), c)
     timeout = c.args.int("timeout", 30, lo=30, hi=480)
     if not state or state.get("v") != 1:
         raise api_error(tag("reset"))

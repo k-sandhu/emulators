@@ -144,7 +144,7 @@ def page(c: m.Call, state: dict[str, Any]) -> dict[str, Any]:
     more = offset + limit < len(items)
     return {
         "file_requests": [render(c, r) for r in items[offset : offset + limit]],
-        "cursor": Pager.encode({**state, "offset": offset + limit}),
+        "cursor": Pager.encode({**state, "offset": offset + limit}, c),
         "has_more": more,
     }
 
@@ -156,7 +156,7 @@ def list_v2(c: m.Call) -> Any:
 
 @route("file_requests/list/continue", scope="file_requests.read")
 def list_continue(c: m.Call) -> Any:
-    state = Pager.decode(c.args.str("cursor"))
+    state = Pager.decode(c.args.str("cursor"), c)
     if not state or state.get("t") != "freq":
         raise api_error(tag("invalid_cursor"))
     return page(c, state)

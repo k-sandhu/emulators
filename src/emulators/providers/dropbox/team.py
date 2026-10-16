@@ -178,9 +178,9 @@ def members_page(c: m.Call, state: dict[str, Any], v2: bool) -> dict[str, Any]:
     build = member_info_v2 if v2 else member_info_v1
     return {
         "members": [build(c, a) for a in chunk],
-        "cursor": Pager.encode({**state, "offset": offset + limit})
+        "cursor": Pager.encode({**state, "offset": offset + limit}, c)
         if more
-        else Pager.encode({**state, "offset": len(items)}),
+        else Pager.encode({**state, "offset": len(items)}, c),
         "has_more": more,
     }
 
@@ -196,7 +196,7 @@ def list_members(c: m.Call, v2: bool) -> Any:
 
 
 def continue_members(c: m.Call, v2: bool) -> Any:
-    state = Pager.decode(c.args.str("cursor"))
+    state = Pager.decode(c.args.str("cursor"), c)
     if not state or state.get("t") != "tmembers":
         raise api_error(tag("invalid_cursor"))
     return members_page(c, state, v2)
@@ -542,16 +542,16 @@ def groups_page(c: m.Call, state: dict[str, Any]) -> dict[str, Any]:
     more = offset + limit < len(items)
     return {
         "groups": [group_summary(g) for g in items[offset : offset + limit]],
-        "cursor": Pager.encode({**state, "offset": offset + limit})
+        "cursor": Pager.encode({**state, "offset": offset + limit}, c)
         if more
-        else Pager.encode({**state, "offset": len(items)}),
+        else Pager.encode({**state, "offset": len(items)}, c),
         "has_more": more,
     }
 
 
 @route("team/groups/list/continue", auth="team", scope="groups.read")
 def groups_list_continue(c: m.Call) -> Any:
-    state = Pager.decode(c.args.str("cursor"))
+    state = Pager.decode(c.args.str("cursor"), c)
     if not state or state.get("t") != "groups":
         raise api_error(tag("invalid_cursor"))
     return groups_page(c, state)
@@ -580,9 +580,9 @@ def members_listing(c: m.Call, state: dict[str, Any]) -> dict[str, Any]:
     more = offset + limit < len(members)
     return {
         "members": [group_member_info(c, a, group) for a in members[offset : offset + limit]],
-        "cursor": Pager.encode({**state, "offset": offset + limit})
+        "cursor": Pager.encode({**state, "offset": offset + limit}, c)
         if more
-        else Pager.encode({**state, "offset": len(members)}),
+        else Pager.encode({**state, "offset": len(members)}, c),
         "has_more": more,
     }
 
@@ -600,7 +600,7 @@ def groups_members_list(c: m.Call) -> Any:
 
 @route("team/groups/members/list/continue", auth="team", scope="groups.read")
 def groups_members_list_continue(c: m.Call) -> Any:
-    state = Pager.decode(c.args.str("cursor"))
+    state = Pager.decode(c.args.str("cursor"), c)
     if not state or state.get("t") != "gmembers":
         raise api_error(tag("invalid_cursor"))
     return members_listing(c, state)
@@ -774,9 +774,9 @@ def team_folder_page(c: m.Call, state: dict[str, Any]) -> dict[str, Any]:
     more = offset + limit < len(items)
     return {
         "team_folders": [team_folder_meta(ns) for ns in items[offset : offset + limit]],
-        "cursor": Pager.encode({**state, "offset": offset + limit})
+        "cursor": Pager.encode({**state, "offset": offset + limit}, c)
         if more
-        else Pager.encode({**state, "offset": len(items)}),
+        else Pager.encode({**state, "offset": len(items)}, c),
         "has_more": more,
     }
 
@@ -790,7 +790,7 @@ def team_folder_list(c: m.Call) -> Any:
 
 @route("team/team_folder/list/continue", auth="team", scope="team_data.team_space")
 def team_folder_list_continue(c: m.Call) -> Any:
-    state = Pager.decode(c.args.str("cursor"))
+    state = Pager.decode(c.args.str("cursor"), c)
     if not state or state.get("t") != "tfolders":
         raise api_error(tag("invalid_cursor"))
     return team_folder_page(c, state)
@@ -958,9 +958,9 @@ def namespaces_page(c: m.Call, state: dict[str, Any]) -> dict[str, Any]:
         out.append(d)
     return {
         "namespaces": out,
-        "cursor": Pager.encode({**state, "offset": offset + limit})
+        "cursor": Pager.encode({**state, "offset": offset + limit}, c)
         if more
-        else Pager.encode({**state, "offset": len(items)}),
+        else Pager.encode({**state, "offset": len(items)}, c),
         "has_more": more,
     }
 
@@ -974,7 +974,7 @@ def namespaces_list(c: m.Call) -> Any:
 
 @route("team/namespaces/list/continue", auth="team", scope="team_data.member")
 def namespaces_list_continue(c: m.Call) -> Any:
-    state = Pager.decode(c.args.str("cursor"))
+    state = Pager.decode(c.args.str("cursor"), c)
     if not state or state.get("t") != "namespaces":
         raise api_error(tag("invalid_cursor"))
     return namespaces_page(c, state)

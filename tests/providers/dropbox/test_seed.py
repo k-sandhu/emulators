@@ -6,6 +6,7 @@ import time
 from typing import Any
 
 from emulators.core.hub import EmulatorHub
+from emulators.providers.dropbox.common import ts
 
 
 def collection(hub: Any, name: str) -> list[dict[str, Any]]:
@@ -96,6 +97,7 @@ def test_every_file_has_real_content_and_revisions() -> None:
         )
         stamps = [r["server_modified"] for r in rec["revisions"]]
         assert stamps == sorted(stamps)
+        assert max(stamps) <= ts(hub.world.anchor)
 
 
 async def test_reset_restores_the_seed_and_snapshots_work(dbx: Any, hub: Any) -> None:

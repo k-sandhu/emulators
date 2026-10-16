@@ -239,7 +239,7 @@ def members_page(c: m.Call, state: dict[str, Any]) -> dict[str, Any]:
     for kind, item in flat[offset : offset + limit]:
         out[kind].append(item)
     if offset + limit < len(flat):
-        out["cursor"] = Pager.encode({**state, "offset": offset + limit})
+        out["cursor"] = Pager.encode({**state, "offset": offset + limit}, c)
     return out
 
 
@@ -260,7 +260,7 @@ def list_file_members(c: m.Call) -> Any:
 
 @route("sharing/list_file_members/continue", scope="sharing.read")
 def list_file_members_continue(c: m.Call) -> Any:
-    state = Pager.decode(c.args.str("cursor"))
+    state = Pager.decode(c.args.str("cursor"), c)
     if not state or state.get("t") != "fmem":
         raise api_error(tag("invalid_cursor"))
     return members_page(c, state)
@@ -294,7 +294,8 @@ def list_file_members_batch(c: m.Call) -> Any:
                         "limit": 100,
                         "offset": limit,
                         "actions": None,
-                    }
+                    },
+                    c,
                 )
             out.append({"file": ref, "result": tag("result", members=members, member_count=total)})
         except EmulatorError as exc:
@@ -451,7 +452,7 @@ def received_page(c: m.Call, state: dict[str, Any]) -> dict[str, Any]:
         entries.append(shared_file_metadata(c, rec, loc, state.get("actions")))
     out: dict[str, Any] = {"entries": entries}
     if offset + limit < len(items):
-        out["cursor"] = Pager.encode({**state, "offset": offset + limit})
+        out["cursor"] = Pager.encode({**state, "offset": offset + limit}, c)
     return out
 
 
@@ -471,7 +472,7 @@ def list_received_files(c: m.Call) -> Any:
 
 @route("sharing/list_received_files/continue", scope="sharing.read")
 def list_received_files_continue(c: m.Call) -> Any:
-    state = Pager.decode(c.args.str("cursor"))
+    state = Pager.decode(c.args.str("cursor"), c)
     if not state or state.get("t") != "recv":
         raise api_error(tag("invalid_cursor"))
     return received_page(c, state)

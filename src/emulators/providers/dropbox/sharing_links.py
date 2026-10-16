@@ -4,10 +4,10 @@ settings changes and revocation, plus the helpers the public ``www.dropbox.com``
 from __future__ import annotations
 
 from typing import Any
-from urllib.parse import quote, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 from emulators.core.errors import EmulatorError
-from emulators.core.provider import url_for_host
+from emulators.core.provider import external_base, url_for_host
 from emulators.providers.dropbox import model as m
 from emulators.providers.dropbox.common import (
     READ_PATH,
@@ -51,12 +51,15 @@ def link_url(c: m.Call, link: dict[str, Any], name: str) -> str:
     )
 
 
-def parse_link(url: str) -> tuple[str, str] | None:
+def parse_link(url: str, base_path: str = "") -> tuple[str, str] | None:
     """``(kind, slug)`` for ``/scl/fi|fo/<slug>/..``, ``/s/<slug>/..`` and ``/sh/<slug>/..``."""
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
         return None
-    parts = [p for p in parsed.path.split("/") if p]
+    path = parsed.path
+    if base_path and path.startswith(base_path.rstrip("/") + "/"):
+        path = path[len(base_path.rstrip("/")) :]
+    parts = [p for p in path.split("/") if p]
     if len(parts) >= 3 and parts[0] == "scl" and parts[1] in ("fi", "fo"):
         return ("file" if parts[1] == "fi" else "folder"), parts[2]
     if len(parts) >= 2 and parts[0] in ("s", "sh"):
@@ -65,11 +68,16 @@ def parse_link(url: str) -> tuple[str, str] | None:
 
 
 def find_link(c: m.Call, url: str) -> dict[str, Any] | None:
-    parsed = parse_link(url)
+    origin = urlparse(external_base(c.request))
+    if urlparse(url).hostname not in (*LINK_HOSTS, origin.hostname):
+        return None
+    parsed = parse_link(url, origin.path)
     if parsed is None:
         return None
     link = c.ctx.store.collection(m.LINKS).get(parsed[1])
     if link is None or link["kind"] != parsed[0]:
+        return None
+    if not link.get("legacy") and parse_qs(urlparse(url).query).get("rlkey") != [link["rlkey"]]:
         return None
     if link.get("expires") and link["expires"] <= ts(c.now()):
         return None
@@ -332,11 +340,11 @@ def list_shared_links(c: m.Call) -> Any:
     cursor = a.str("cursor", None)
     state = {"offset": 0}
     if cursor is not None:
-        state = Pager.decode(cursor) or {}
+        state = Pager.decode(cursor, c) or {}
         if state.get("t") != "links":
             raise api_error(tag("reset"))
-    path = a.str("path", None)
-    direct = a.bool("direct_only", False)
+    path = state.get("path") if cursor else a.str("path", None)
+    direct = state.get("direct", False) if cursor else a.bool("direct_only", False)
     target = None
     if path:
         loc = lookup(c, path, allow_root=False)
@@ -372,7 +380,9 @@ def list_shared_links(c: m.Call) -> Any:
     more = offset + page_size < len(out)
     result: dict[str, Any] = {"links": [link_metadata(c, lk, rec) for lk, rec in chunk], "has_more": more}
     if more:
-        result["cursor"] = Pager.encode({"t": "links", "offset": offset + page_size})
+        result["cursor"] = Pager.encode(
+            {"t": "links", "offset": offset + page_size, "path": path, "direct": direct}, c
+        )
     return result
 
 
@@ -390,6 +400,8 @@ def get_shared_link_metadata(c: m.Call) -> Any:
 def get_shared_link_file(c: m.Call) -> Any:
     a = c.args
     link, rec = require_link(c, a.str("url"), a.str("link_password", None))
+    if not link.get("allow_download", True):
+        raise api_error(tag("shared_link_access_denied"))
     target = rec
     if a.has("path") and a.str("path") not in ("", "/"):
         target = subpath_entry(c, rec, a.str("path"))
@@ -430,7 +442,7 @@ def modify_shared_link_settings(c: m.Call) -> Any:
 @route("sharing/revoke_shared_link", scope="sharing.write")
 def revoke_shared_link(c: m.Call) -> Any:
     url = c.args.str("url")
-    if parse_link(url) is None:
+    if parse_link(url, urlparse(external_base(c.request)).path) is None:
         raise api_error(tag("shared_link_malformed"))
     link = find_link(c, url)
     if link is None:
@@ -465,8 +477,32 @@ def list_link_folder(c: m.Call, a: Args, flags: dict[str, Any]) -> Any:
     if base["type"] != "folder":
         raise path_error("not_folder")
     ns, rel = (base["mount_ns"], "") if base.get("mount_ns") else (base["ns"], base["path"])
+    state = {
+        "v": 3,
+        "link": link["id"],
+        "url": sl.str("url"),
+        "password": sl.str("password", None),
+        "ns": ns,
+        "rel": rel,
+        "limit": flags["lim"],
+        "after": None,
+        "dl": flags["dl"],
+    }
+    return list_link_page(c, state)
+
+
+def list_link_page(c: m.Call, state: dict[str, Any]) -> Any:
+    """Recheck link access on each page; continuations retain the original listing options."""
+    try:
+        require_link(c, state["url"], state["password"])
+    except EmulatorError:
+        raise path_error("not_found") from None
     entries = []
-    for child in c.tree.children(ns, rel):
+    for child in c.tree.children(state["ns"], state["rel"]):
+        if child.get("no_inherit") or (state["after"] is not None and child["path"] <= state["after"]):
+            continue
+        if not state["dl"] and child["type"] == "file" and not child.get("downloadable", True):
+            continue
         if child["type"] == "folder":
             entries.append({".tag": "folder", "name": child["name"], "id": child["id"]})
         else:
@@ -484,8 +520,13 @@ def list_link_folder(c: m.Call, a: Args, flags: dict[str, Any]) -> Any:
                     "content_hash": latest["content_hash"],
                 }
             )
-    state = {"v": 3, "link": link["id"], "ns": ns, "rel": rel}
-    return {"entries": entries[: flags["lim"]], "cursor": Pager.encode(state), "has_more": False}
+    limit = state["limit"]
+    page = entries[:limit]
+    more = len(entries) > limit
+    if page:
+        last = c.tree.by_id(page[-1]["id"])
+        state = {**state, "after": last["path"]}
+    return {"entries": page, "cursor": Pager.encode(state, c), "has_more": more}
 
 
 def thumbnail_for_link(c: m.Call, payload: Any) -> Download:

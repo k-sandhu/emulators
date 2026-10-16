@@ -205,6 +205,7 @@ class Actor:
     root_ns: str = ""
     scopes: list[str] = field(default_factory=list)
     app_auth: bool = False
+    app_id: str | None = None
 
     @property
     def id(self) -> str:
@@ -383,8 +384,18 @@ def view_root(c: Call) -> Loc:
     return Loc(ns=c.actor.root_ns, rel="", dpath="", rec=None, pl="", pd="", is_view_root=True)
 
 
-def walk(c: Call, ns: str, segments: list[str], pl: str = "", pd: str = "") -> Walk:
-    cur, rel, dpath, rec = ns, "", "", None
+def walk(
+    c: Call,
+    ns: str,
+    segments: list[str],
+    pl: str = "",
+    pd: str = "",
+    *,
+    rel: str = "",
+    dpath: str = "",
+    rec: dict[str, Any] | None = None,
+) -> Walk:
+    cur = ns
     for i, seg in enumerate(segments):
         if rec is not None and rec["type"] == "file":
             return Walk(False, Loc(cur, rel, dpath, rec, pl, pd), i, segments[i:], file_ancestor=True)
@@ -443,7 +454,11 @@ def resolve(c: Call, path: str, *, allow_root: bool = True, wrapper: str = "path
         loc = loc_for_entry(c, rec)
         if not rest:
             return loc
-        w = walk(c, loc.ns, split_path(rest), loc.pl, loc.pd) if rec["type"] == "folder" else None
+        w = (
+            walk(c, loc.ns, split_path(rest), loc.pl, loc.pd, rel=loc.rel, dpath=loc.dpath)
+            if rec["type"] == "folder"
+            else None
+        )
         if w is None or not w.found:
             return None
         return w.loc
@@ -467,6 +482,21 @@ def resolve(c: Call, path: str, *, allow_root: bool = True, wrapper: str = "path
 def resolve_for_write(c: Call, path: str) -> Walk:
     """Walk as far as the path exists; ``rest`` are the segments still to create."""
     actor = c.actor
+    if path.startswith("id:"):
+        head, _, rest = path.partition("/")
+        loc = resolve(c, head, allow_root=False)
+        if loc is None or loc.rec is None:
+            raise path_error("malformed_path")
+        return walk(
+            c,
+            loc.ns,
+            split_path(rest),
+            loc.pl,
+            loc.pd,
+            rel=loc.rel,
+            dpath=loc.dpath,
+            rec=loc.rec,
+        )
     if path.startswith("ns:"):
         ns_id, rest = parse_ns_path(c, path)
         ns = c.tree.namespace(ns_id)

@@ -75,11 +75,7 @@ async def test_authorization_code_flow_with_pkce_and_refresh(dbx: Any) -> None:
     assert body["token_type"] == "bearer" and body["expires_in"] == 14400
     assert body["access_token"].startswith("sl.") and body["refresh_token"]
     assert body["scope"] == "account_info.read files.metadata.read"
-    assert (
-        body["account_id"].startswith("dbid:")
-        and body["team_id"].startswith("dbtid:")
-        and body["uid"].isdigit()
-    )
+    assert body["account_id"].startswith("dbid:") and "team_id" not in body and body["uid"].isdigit()
     me = await dbx.ok(body["access_token"], "users/get_current_account")
     assert me["email"] == dbx.MAYA
     # a code is single-use
@@ -136,7 +132,7 @@ async def test_online_flow_has_no_refresh_token_and_basic_client_auth(dbx: Any) 
     basic = base64.b64encode(b"halcyon-app:s3cret").decode()
     ok = await dbx.client.post(
         TOKEN,
-        data={"grant_type": "authorization_code", "code": code},
+        data={"grant_type": "authorization_code", "code": code, "redirect_uri": REDIRECT},
         headers={"Authorization": f"Basic {basic}"},
     )
     assert ok.status_code == 200 and "refresh_token" not in ok.json()
@@ -146,7 +142,12 @@ async def test_online_flow_has_no_refresh_token_and_basic_client_auth(dbx: Any) 
     code = parse_qs(urlparse(r.headers["location"]).query)["code"][0]
     other = await dbx.client.post(
         "https://api.dropbox.com/oauth2/token",
-        data={"grant_type": "authorization_code", "code": code, "client_id": "halcyon-app"},
+        data={
+            "grant_type": "authorization_code",
+            "code": code,
+            "client_id": "halcyon-app",
+            "redirect_uri": REDIRECT,
+        },
     )
     assert other.status_code == 200
     unsupported = await dbx.client.post(TOKEN, data={"grant_type": "password", "client_id": "x"})
@@ -192,7 +193,13 @@ async def test_team_scopes_yield_a_team_token(dbx: Any) -> None:
     code = parse_qs(urlparse(r.headers["location"]).query)["code"][0]
     body = (
         await dbx.client.post(
-            TOKEN, data={"grant_type": "authorization_code", "code": code, "client_id": "team-app"}
+            TOKEN,
+            data={
+                "grant_type": "authorization_code",
+                "code": code,
+                "client_id": "team-app",
+                "redirect_uri": REDIRECT,
+            },
         )
     ).json()
     info = await dbx.ok(body["access_token"], "team/get_info")

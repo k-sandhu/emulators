@@ -27,7 +27,7 @@ async def test_upload_add_conflict_autorename_overwrite_update(dbx: Any) -> None
     assert over["id"] == first["id"] and over["rev"] != first["rev"] and over["size"] == 13
     # update with a stale rev creates a conflicted copy; strict_conflict rejects
     stale = await dbx.put(
-        token, "/Drafts/plan.txt", b"stale", mode={".tag": "update", "update": first["rev"]}
+        token, "/Drafts/plan.txt", b"stale", mode={".tag": "update", "update": first["rev"]}, autorename=True
     )
     assert "conflicted copy" in stale["name"] and stale["id"] != first["id"]
     r = await dbx.upload(

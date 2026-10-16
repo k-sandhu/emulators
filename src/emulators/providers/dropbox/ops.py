@@ -7,6 +7,7 @@ Permission and conflict policy lives in the routes; this module is the mechanism
 
 from __future__ import annotations
 
+import copy
 from datetime import datetime
 from typing import Any
 
@@ -63,6 +64,7 @@ class Ops:
                 "name": rec["name"],
                 "type": rec["type"],
                 "entry": rec["id"],
+                "access": {k: copy.deepcopy(rec[k]) for k in ("owner", "members", "no_inherit") if k in rec},
             }
         )
         rec["seq"] = seq
@@ -238,7 +240,17 @@ class Ops:
         self._log(rec, "upsert")
 
     def purge(self, rec: dict[str, Any]) -> None:
-        for victim in [rec, *self.subtree_of(rec)]:
+        # delete() has already removed children from the live index, so walk stored tombstones.
+        victims = [rec]
+        if rec["type"] == "folder" and not rec.get("mount_ns"):
+            victims += [
+                item
+                for item in self.tree.entries.values()
+                if item["ns"] == rec["ns"]
+                and item["path"].startswith(rec["path"] + "/")
+                and item.get("deleted")
+            ]
+        for victim in victims:
             self.ctx.store.collection(ENTRIES).delete(victim["id"])
             self.ctx.store.collection(TEXT).delete(victim["id"])
             self.tree.drop(victim)

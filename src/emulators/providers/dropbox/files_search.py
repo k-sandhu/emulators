@@ -127,7 +127,7 @@ def page(c: m.Call, state: dict[str, Any]) -> dict[str, Any]:
     more = offset + limit < len(hits)
     out: dict[str, Any] = {"matches": matches, "has_more": more}
     if more:
-        out["cursor"] = Pager.encode({**state, "offset": offset + limit})
+        out["cursor"] = Pager.encode({**state, "offset": offset + limit}, c)
     return out
 
 
@@ -172,7 +172,7 @@ def search_v2(c: m.Call) -> Any:
 
 @route("files/search/continue_v2", scope="files.metadata.read")
 def search_continue_v2(c: m.Call) -> Any:
-    state = Pager.decode(c.args.str("cursor"))
+    state = Pager.decode(c.args.str("cursor"), c)
     if not state or state.get("v") != 2:
         raise BadInput("request body: cursor: invalid cursor")
     return page(c, state)

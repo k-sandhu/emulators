@@ -193,7 +193,11 @@ def events_page(c: m.Call, state: dict[str, Any]) -> dict[str, Any]:
     chunk = items[offset : offset + limit]
     more = offset + limit < len(items)
     nxt = {**state, "offset": offset + len(chunk)}
-    return {"events": [render_event(c.ctx, r) for r in chunk], "cursor": Pager.encode(nxt), "has_more": more}
+    return {
+        "events": [render_event(c.ctx, r) for r in chunk],
+        "cursor": Pager.encode(nxt, c),
+        "has_more": more,
+    }
 
 
 @route("team_log/get_events", auth="team", scope="events.read")
@@ -228,7 +232,7 @@ def get_events(c: m.Call) -> Any:
 
 @route("team_log/get_events/continue", auth="team", scope="events.read")
 def get_events_continue(c: m.Call) -> Any:
-    state = Pager.decode(c.args.str("cursor"))
+    state = Pager.decode(c.args.str("cursor"), c)
     if not state or state.get("t") != "events":
         raise api_error(tag("bad_cursor"))
     return events_page(c, state)

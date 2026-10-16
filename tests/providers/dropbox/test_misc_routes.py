@@ -54,6 +54,9 @@ async def test_v1_file_routes(dbx: Any) -> None:
     sid = start.json()["session_id"]
     r = await dbx.upload(token, "files/upload_session/append", {"session_id": sid, "offset": 2}, b"cd")
     assert r.status_code == 200
+    await dbx.upload(
+        token, "files/upload_session/append_v2", {"cursor": {"session_id": sid, "offset": 4}, "close": True}
+    )
     fb = await dbx.ok(
         token,
         "files/upload_session/finish_batch",

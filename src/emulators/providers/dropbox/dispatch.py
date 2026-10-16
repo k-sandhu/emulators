@@ -19,7 +19,7 @@ from typing import Any
 from fastapi import FastAPI, Request
 from fastapi.responses import Response
 
-from emulators.core.auth import bearer_token
+from emulators.core.auth import OAuthError, basic_credentials, bearer_token
 from emulators.core.errors import EmulatorError
 from emulators.core.provider import ProviderContext
 from emulators.providers.dropbox import model as m
@@ -33,6 +33,7 @@ from emulators.providers.dropbox.common import (
     missing_scope,
     text_error,
 )
+from emulators.providers.dropbox.validation import validate_argument
 
 ANON_ACCOUNT: dict[str, Any] = {
     "id": "",
@@ -131,7 +132,14 @@ def authenticate(ctx: ProviderContext, request: Request, rd: RouteDef) -> m.Acto
         return m.Actor(account=ANON_ACCOUNT)
     if basic:
         if "app" in rd.auth:
-            return m.Actor(account=ANON_ACCOUNT, app_auth=True)
+            credentials = basic_credentials(request)
+            if credentials is None:
+                raise BadInput('Bad HTTP "Authorization" header: invalid Basic credentials')
+            try:
+                ctx.tokens.authenticate_client(*credentials, require_secret=True)
+            except OAuthError:
+                raise auth_error("invalid_access_token") from None
+            return m.Actor(account=ANON_ACCOUNT, app_auth=True, app_id=credentials[0])
         raise auth_error("invalid_access_token")
     if token is None:
         if header:
@@ -142,6 +150,8 @@ def authenticate(ctx: ProviderContext, request: Request, rd: RouteDef) -> m.Acto
         raise auth_error("invalid_access_token")
     if grant.expires_at is not None and ctx.tokens.is_expired(token):
         raise auth_error("expired_access_token")
+    if rd.auth == ("app",):
+        raise auth_error("route_access_denied")
     scopes = list(grant.scopes)
     if rd.scope and scopes and rd.scope not in scopes:
         raise missing_scope(rd.scope)
@@ -243,14 +253,14 @@ def parse_arg(request: Request, rd: RouteDef, body: bytes) -> tuple[Args, bytes]
             if qarg:
                 try:
                     return Args(json.loads(qarg)), b""
-                except ValueError:
+                except (ValueError, RecursionError):
                     raise BadInput("request body: could not decode input as JSON") from None
             return Args(None), b""
         if request.method == "POST":
             _content_type_ok(request, JSON_TYPES, rd.name)
         try:
             data = json.loads(body)
-        except ValueError:
+        except (ValueError, RecursionError):
             raise BadInput("request body: could not decode input as JSON") from None
         return Args(data), b""
     raw = request.headers.get("dropbox-api-arg") or qarg
@@ -260,7 +270,7 @@ def parse_arg(request: Request, rd: RouteDef, body: bytes) -> tuple[Args, bytes]
         raise BadInput('Bad HTTP header "Dropbox-API-Arg": missing')
     try:
         data = decode_header_json(raw)
-    except ValueError:
+    except (ValueError, RecursionError):
         raise BadInput('HTTP header "Dropbox-API-Arg": could not decode input as JSON') from None
     if request.method == "POST":
         _content_type_ok(request, OCTET_TYPES, rd.name)
@@ -357,6 +367,7 @@ async def handle(ctx: ProviderContext, request: Request, route_path: str) -> Res
         body = await request.body()
         args, payload = parse_arg(request, rd, body)
         actor = authenticate(ctx, request, rd)
+        validate_argument(name, args)
         c = m.Call(
             ctx=ctx, request=request, route=name, args=args, body=payload, actor=actor, request_id=request_id
         )

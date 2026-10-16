@@ -188,7 +188,7 @@ def list_page(c: m.Call, state: dict[str, Any]) -> dict[str, Any]:
     chunk = items[offset : offset + limit]
     out: dict[str, Any] = {"entries": [folder_metadata(c, ns, actions=state.get("actions")) for ns in chunk]}
     if offset + limit < len(items):
-        out["cursor"] = Pager.encode({**state, "offset": offset + limit})
+        out["cursor"] = Pager.encode({**state, "offset": offset + limit}, c)
     return out
 
 
@@ -209,7 +209,7 @@ def list_folders(c: m.Call) -> Any:
 
 @route("sharing/list_folders/continue", scope="sharing.read")
 def list_folders_continue(c: m.Call) -> Any:
-    state = Pager.decode(c.args.str("cursor"))
+    state = Pager.decode(c.args.str("cursor"), c)
     if not state or state.get("t") != "folders":
         raise api_error(tag("invalid_cursor"))
     return list_page(c, state)
@@ -256,13 +256,13 @@ def members_page(c: m.Call, state: dict[str, Any]) -> dict[str, Any]:
     for kind, item in chunk:
         out[kind].append(item)
     if offset + limit < len(flat):
-        out["cursor"] = Pager.encode({**state, "offset": offset + limit})
+        out["cursor"] = Pager.encode({**state, "offset": offset + limit}, c)
     return out
 
 
 @route("sharing/list_folder_members/continue", scope="sharing.read")
 def list_folder_members_continue(c: m.Call) -> Any:
-    state = Pager.decode(c.args.str("cursor"))
+    state = Pager.decode(c.args.str("cursor"), c)
     if not state or state.get("t") != "fmembers":
         raise api_error(tag("invalid_cursor"))
     return members_page(c, {**state, "wrap": True})

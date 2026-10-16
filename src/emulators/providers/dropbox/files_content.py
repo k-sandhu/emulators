@@ -15,6 +15,7 @@ from emulators.core.provider import url_for_host
 from emulators.providers.dropbox import catalog
 from emulators.providers.dropbox import model as m
 from emulators.providers.dropbox.common import (
+    BLOCK,
     READ_PATH,
     WRITE_OR_ID,
     Args,
@@ -119,6 +120,8 @@ def commit_file(
         audit(c, "file_add", made)
         return made
 
+    if existing is None and mode == "update" and strict_conflict:
+        raise fail("conflict", conflict={".tag": "file"})
     if existing is None:
         return create(target.name)
     if existing["type"] == "folder" or existing.get("mount_ns"):
@@ -127,12 +130,14 @@ def commit_file(
         return create(unique_name_in(c, target.ns, target.parent_rel, target.name))
     if existing.get("lock") and existing["lock"]["account_id"] != actor:
         raise fail("conflict", conflict={".tag": "file"})
+    if not strict_conflict and existing["revisions"][-1]["content_hash"] == content_hash(data):
+        return existing
     if mode == "overwrite" or (mode == "update" and existing["revisions"][-1]["rev"] == mode_rev):
         ops.write_revision(existing, data, when=when, client_modified=client_modified, modified_by=actor)
         audit(c, "file_edit", existing)
         return existing
     if mode == "update":
-        if strict_conflict:
+        if not autorename_:
             raise fail("conflict", conflict={".tag": "file"})
         return create(unique_name_in(c, target.ns, target.parent_rel, conflicted_copy_name(c, target.name)))
     if not autorename_:
@@ -188,7 +193,11 @@ def new_session(c: m.Call, *, close: bool, kind: str = "sequential") -> dict[str
 
 def find_session(c: m.Call, session_id: str, *, wrapper: str | None = None) -> dict[str, Any]:
     sess = c.ctx.store.collection(SESSIONS).get(session_id)
-    if sess is None or sess["account"] != c.actor.id:
+    if (
+        sess is None
+        or sess["account"] != c.actor.id
+        or parse_ts(sess["created"]) + timedelta(days=7) <= c.now()
+    ):
         raise lookup_error("not_found", wrapper)
     return sess
 
@@ -200,15 +209,23 @@ def lookup_error(kind: str, wrapper: str | None, **fields: Any) -> EmulatorError
     return api_error(err)
 
 
-def append_chunk(c: m.Call, sess: dict[str, Any], offset: int, data: bytes, wrapper: str | None) -> None:
+def append_chunk(
+    c: m.Call, sess: dict[str, Any], offset: int, data: bytes, wrapper: str | None, *, close: bool = False
+) -> None:
     if sess["closed"]:
         raise lookup_error("closed", wrapper)
     if sess["type"] == "concurrent":
+        if offset % BLOCK:
+            raise lookup_error("concurrent_session_invalid_offset", wrapper)
+        if not close and len(data) % BLOCK:
+            raise lookup_error("concurrent_session_invalid_data_size", wrapper)
         if any(o < offset + len(data) and offset < o + n for o, _, n in sess["parts"]):
             raise lookup_error("concurrent_session_invalid_offset", wrapper)
     elif offset != sess["offset"]:
         raise lookup_error("incorrect_offset", wrapper, correct_offset=sess["offset"])
     if len(data) > MAX_UPLOAD:
+        raise lookup_error("payload_too_large", wrapper)
+    if offset + len(data) > 2**41 - BLOCK:
         raise lookup_error("too_large", wrapper)
     key = c.ctx.store.blobs.put(data)
     sess["parts"].append([offset, key, len(data)])
@@ -224,6 +241,8 @@ def upload_session_start(c: m.Call) -> Any:
     verify_hash(a, c.body)
     if kind == "concurrent" and c.body:
         raise api_error(tag("concurrent_session_data_not_allowed"))
+    if kind == "concurrent" and a.bool("close"):
+        raise api_error(tag("concurrent_session_close_not_allowed"))
     sess = new_session(c, close=False, kind="concurrent" if kind == "concurrent" else "sequential")
     if c.body:
         append_chunk(c, sess, 0, c.body, None)
@@ -253,7 +272,7 @@ def upload_session_append_v2(c: m.Call) -> Any:
     sid, offset = cursor_of(c.args)
     verify_hash(c.args, c.body)
     sess = find_session(c, sid)
-    append_chunk(c, sess, offset, c.body, None)
+    append_chunk(c, sess, offset, c.body, None, close=c.args.bool("close"))
     if c.args.bool("close"):
         sess["closed"] = True
     return None
@@ -275,6 +294,13 @@ def finish_one(c: m.Call, entry: Args, extra: bytes, *, batch: bool = False) -> 
     commit = entry.obj("commit")
     assert commit is not None
     sess = find_session(c, sid, wrapper="lookup_failed")
+    if batch and not sess["closed"]:
+        raise lookup_error("not_closed", "lookup_failed")
+    if sess["type"] == "concurrent":
+        if extra:
+            raise api_error(tag("concurrent_session_data_not_allowed"))
+        if not sess["closed"]:
+            raise api_error(tag("concurrent_session_not_closed"))
     if extra:
         if sess["closed"]:
             raise lookup_error("closed", "lookup_failed")

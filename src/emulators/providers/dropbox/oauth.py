@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import html
+import re
 from datetime import timedelta
 from typing import Any
 from urllib.parse import parse_qs, urlencode
@@ -72,6 +73,7 @@ def mint(
     team: bool,
     offline: bool,
     ttl: int = ACCESS_TTL,
+    pkce: bool = False,
 ) -> dict[str, Any]:
     """Issue an access token (+ refresh token when ``offline``) and build the token response."""
     refresh = None
@@ -83,7 +85,7 @@ def mint(
             ttl=None,
             prefix="",
             length=64,
-            extra={"team": team},
+            extra={"team": team, "pkce": pkce},
         )
     access = ctx.tokens.issue_access(
         client_id=client_id,
@@ -102,10 +104,11 @@ def mint(
     if refresh:
         body["refresh_token"] = refresh.token
     body["scope"] = " ".join(scopes)
-    body["uid"] = str(acct["uid"])
-    body["account_id"] = acct["id"]
-    if acct.get("is_team"):
+    if team:
         body["team_id"] = m.team_info(ctx)["id"]
+    else:
+        body["uid"] = str(acct["uid"])
+        body["account_id"] = acct["id"]
     return body
 
 
@@ -137,8 +140,28 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         state = q.get("state")
         if not client_id:
             return _page("Dropbox", "<h1>Error</h1><p>Missing client_id.</p>", 400)
+        try:
+            client = ctx.tokens.authenticate_client(client_id, None, require_secret=False)
+        except OAuthError as exc:
+            return _page("Dropbox", f"<h1>Error</h1><p>{html.escape(exc.description)}</p>", 400)
+        if client.get("redirect_uris") and redirect_uri not in client["redirect_uris"] and redirect_uri:
+            return _page("Dropbox", "<h1>Error</h1><p>Invalid redirect_uri.</p>", 400)
         scopes = (q.get("scope") or "").split() or list(DEFAULT_SCOPES)
         team = is_team_scopes(scopes) or q.get("include_granted_scopes") == "team"
+        if q.get("token_access_type", "online") not in ("online", "offline"):
+            return _page("Dropbox", "<h1>Error</h1><p>Invalid token_access_type.</p>", 400)
+        if q.get("include_granted_scopes") not in (None, "user", "team"):
+            return _page("Dropbox", "<h1>Error</h1><p>Invalid include_granted_scopes.</p>", 400)
+        if q.get("include_granted_scopes") == "user" and team:
+            return _page(
+                "Dropbox", "<h1>Error</h1><p>Team scopes cannot be combined with user grants.</p>", 400
+            )
+        if q.get("code_challenge") and q.get("code_challenge_method", "plain") not in ("plain", "S256"):
+            return _page("Dropbox", "<h1>Error</h1><p>Invalid code_challenge_method.</p>", 400)
+        if q.get("code_challenge") and not re.fullmatch(r"[A-Za-z0-9._~-]{43,128}", q["code_challenge"]):
+            return _page("Dropbox", "<h1>Error</h1><p>Invalid code_challenge.</p>", 400)
+        if response_type == "token" and not redirect_uri:
+            return _page("Dropbox", "<h1>Error</h1><p>redirect_uri is required for token flow.</p>", 400)
         if response_type not in ("code", "token"):
             if redirect_uri:
                 url = redirect_with_params(
@@ -155,11 +178,13 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         acct = None
         if hint:
             acct = m.account_by_email(ctx, hint) or m.account_by_person(ctx, hint)
+        if acct is not None and team and not acct.get("roles"):
+            return _page("Dropbox", "<h1>Error</h1><p>A team administrator must authorize this app.</p>", 400)
         if acct is None or acct["status"] == "suspended":
             people = [
                 {"display_name": a["display_name"], "email": a["email"], "login_hint": a["email"]}
                 for a in ctx.store.collection(m.ACCOUNTS)
-                if a["status"] == "active" and (a["is_team"] or not team)
+                if a["status"] == "active" and (not team or (a["is_team"] and a.get("roles")))
             ]
             base = external_base(request) + request.url.path
             rest = urlencode([(k, v) for k, v in q.multi_items() if k != "login_hint"])
@@ -172,6 +197,16 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
             )
             return HTMLResponse(page)
         ctx.tokens.authenticate_client(client_id, None, require_secret=False)
+        if q.get("include_granted_scopes"):
+            for previous in ctx.store.collection("_grants"):
+                if (
+                    previous["kind"] in ("access", "refresh")
+                    and not previous.get("revoked")
+                    and previous["client_id"] == client_id
+                    and bool(previous.get("extra", {}).get("team")) == team
+                    and (team or previous.get("user_id") == acct["person"])
+                ):
+                    scopes = list(dict.fromkeys([*scopes, *previous.get("scopes", [])]))
         offline = q.get("token_access_type") == "offline"
         if response_type == "token":
             body = mint(ctx, acct, client_id=client_id, scopes=scopes, team=team, offline=False)
@@ -179,8 +214,8 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
                 "access_token": body["access_token"],
                 "token_type": "bearer",
                 "expires_in": body["expires_in"],
-                "uid": body["uid"],
-                "account_id": body["account_id"],
+                "uid": body.get("uid"),
+                "account_id": body.get("account_id"),
                 "scope": body["scope"],
                 "state": state,
             }
@@ -221,8 +256,21 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         secret = form.get("client_secret") or (creds[1] if creds else None)
         grant_type = form.get("grant_type")
         try:
-            ctx.tokens.authenticate_client(client_id, secret, require_secret=False)
+            pending = (
+                ctx.tokens.resolve(form.get("code"), "code") if grant_type == "authorization_code" else None
+            )
+            refresh = (
+                ctx.tokens.resolve(form.get("refresh_token"), "refresh")
+                if grant_type == "refresh_token"
+                else None
+            )
+            public_client = bool(
+                (pending and pending.code_challenge) or (refresh and refresh.extra.get("pkce"))
+            )
+            ctx.tokens.authenticate_client(client_id, secret, require_secret=not public_client)
             if grant_type == "authorization_code":
+                if pending is not None and pending.redirect_uri != (form.get("redirect_uri") or None):
+                    raise OAuthError("invalid_grant", "redirect_uri must match the authorization request")
                 grant = ctx.tokens.redeem_code(
                     form.get("code"),
                     client_id=client_id,
@@ -239,6 +287,7 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
                     scopes=grant.scopes,
                     team=bool(grant.extra.get("team")),
                     offline=bool(grant.extra.get("offline")),
+                    pkce=bool(grant.code_challenge),
                 )
             elif grant_type == "refresh_token":
                 refresh = ctx.tokens.resolve(form.get("refresh_token"), "refresh")
@@ -250,6 +299,8 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
                 if acct is None:
                     raise OAuthError("invalid_grant", "refresh token is invalid or revoked")
                 scopes = (form.get("scope") or "").split() or list(refresh.scopes)
+                if refresh.scopes and not set(scopes).issubset(refresh.scopes):
+                    raise OAuthError("invalid_scope", "requested scopes exceed the original grant")
                 access = ctx.tokens.issue_access(
                     client_id=refresh.client_id,
                     user_id=refresh.user_id,

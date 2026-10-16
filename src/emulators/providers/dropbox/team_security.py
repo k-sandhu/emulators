@@ -84,7 +84,7 @@ def page_members(c: m.Call, kind: str) -> tuple[list[dict[str, Any]], int, dict[
     cursor = c.args.str("cursor", None)
     offset = 0
     if cursor is not None:
-        state = Pager.decode(cursor)
+        state = Pager.decode(cursor, c)
         if not state or state.get("t") != kind:
             raise api_error(tag("reset"))
         offset = state["offset"]
@@ -98,7 +98,7 @@ def paged(c: m.Call, kind: str, render: Any) -> dict[str, Any]:
     more = offset + PAGE < len(members)
     out: dict[str, Any] = {kind_key(kind): [render(a) for a in chunk], "has_more": more}
     if more:
-        out["cursor"] = Pager.encode({**state, "offset": offset + PAGE})
+        out["cursor"] = Pager.encode({**state, "offset": offset + PAGE}, c)
     return out
 
 
