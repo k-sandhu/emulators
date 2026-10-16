@@ -15,7 +15,20 @@ from emulators.core.provider import ProviderContext
 from .common import APP_ID, PORTAL_ID, fail
 
 SINGULAR = {"companies": "company", "contacts": "contact", "deals": "deal", "tickets": "ticket"}
-DECODE_URI = {"3A": ":", "2F": "/", "3F": "?", "40": "@", "21": "!", "24": "$", "27": "'", "28": "(", "29": ")", "2A": "*", "2C": ",", "3B": ";"}
+DECODE_URI = {
+    "3A": ":",
+    "2F": "/",
+    "3F": "?",
+    "40": "@",
+    "21": "!",
+    "24": "$",
+    "27": "'",
+    "28": "(",
+    "29": ")",
+    "2A": "*",
+    "2C": ",",
+    "3B": ";",
+}
 
 
 def configure(ctx: ProviderContext, payload: dict[str, Any]) -> dict[str, Any]:
@@ -35,10 +48,22 @@ def configure(ctx: ProviderContext, payload: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(sub, dict):
             fail(400, "Invalid subscription.")
         subscription_type = sub.get("subscriptionType", sub.get("eventType"))
-        if subscription_type not in {f"{kind}.{event}" for kind in SINGULAR.values() for event in ("creation", "propertyChange", "deletion")}:
+        if not isinstance(subscription_type, str) or subscription_type not in {
+            f"{kind}.{event}"
+            for kind in SINGULAR.values()
+            for event in ("creation", "propertyChange", "deletion")
+        }:
             fail(400, "Unsupported subscriptionType.")
+        if isinstance(sub.get("id", i + 1), bool) or not str(sub.get("id", i + 1)).isdigit():
+            fail(400, "Subscription id must be an integer.")
+        if "active" in sub and not isinstance(sub["active"], bool):
+            fail(400, "Subscription active must be a boolean.")
         cleaned.append({**sub, "subscriptionType": subscription_type, "id": int(sub.get("id", i + 1))})
-    ctx.store.meta["webhook"] = {"target_url": url, "client_secret": payload["client_secret"], "subscriptions": cleaned}
+    ctx.store.meta["webhook"] = {
+        "target_url": url,
+        "client_secret": payload["client_secret"],
+        "subscriptions": cleaned,
+    }
     return {"target_url": url, "subscriptions": cleaned}
 
 
@@ -60,10 +85,18 @@ async def emit(ctx: ProviderContext, changes: list[tuple[str, str, str, dict[str
                 if prop and sub.get("propertyName") and sub["propertyName"] != prop:
                     continue
                 ctx.store.meta["event_counter"] = ctx.store.meta.get("event_counter", 0) + 1
-                event = {"eventId": ctx.store.meta["event_counter"], "subscriptionId": sub["id"],
-                    "portalId": PORTAL_ID, "appId": APP_ID, "occurredAt": now,
-                    "subscriptionType": event_type, "attemptNumber": 0, "objectId": int(rid),
-                    "changeSource": "CRM", "sourceId": str(APP_ID)}
+                event = {
+                    "eventId": ctx.store.meta["event_counter"],
+                    "subscriptionId": sub["id"],
+                    "portalId": PORTAL_ID,
+                    "appId": APP_ID,
+                    "occurredAt": now,
+                    "subscriptionType": event_type,
+                    "attemptNumber": 0,
+                    "objectId": int(rid),
+                    "changeSource": "CRM",
+                    "sourceId": str(APP_ID),
+                }
                 if prop is not None:
                     event.update(propertyName=prop, propertyValue=value)
                 events.append(event)
@@ -71,14 +104,18 @@ async def emit(ctx: ProviderContext, changes: list[tuple[str, str, str, dict[str
     uri = re.sub(r"%([0-9a-fA-F]{2})", lambda m: DECODE_URI.get(m[1].upper(), m[0]), target)
     secret = config["client_secret"]
     for offset in range(0, len(events), 100):
-        content = json.dumps(events[offset:offset + 100], separators=(",", ":")).encode()
+        content = json.dumps(events[offset : offset + 100], separators=(",", ":")).encode()
 
         def sign(raw: bytes, attempt: int) -> dict[str, str]:
             timestamp = str(int(ctx.clock.now().timestamp() * 1000))
             signed = b"POST" + uri.encode() + raw + timestamp.encode()
-            return {"X-HubSpot-Signature-v3": base64.b64encode(hmac.new(secret.encode(), signed, hashlib.sha256).digest()).decode(),
-                    "X-HubSpot-Request-Timestamp": timestamp,
-                    "X-HubSpot-Signature": hashlib.sha256(secret.encode() + raw).hexdigest(),
-                    "X-HubSpot-Signature-Version": "v1"}
+            return {
+                "X-HubSpot-Signature-v3": base64.b64encode(
+                    hmac.new(secret.encode(), signed, hashlib.sha256).digest()
+                ).decode(),
+                "X-HubSpot-Request-Timestamp": timestamp,
+                "X-HubSpot-Signature": hashlib.sha256(secret.encode() + raw).hexdigest(),
+                "X-HubSpot-Signature-Version": "v1",
+            }
 
         await ctx.webhooks.deliver(target, content, event_type="hubspot.batch", sign=sign)

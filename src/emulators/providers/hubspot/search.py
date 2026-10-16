@@ -11,11 +11,27 @@ from emulators.core.provider import ProviderContext
 
 from .common import fail
 
-OPERATORS = {"EQ", "NEQ", "LT", "LTE", "GT", "GTE", "BETWEEN", "IN", "NOT_IN",
-             "HAS_PROPERTY", "NOT_HAS_PROPERTY", "CONTAINS_TOKEN", "NOT_CONTAINS_TOKEN"}
-QUERY_FIELDS = {"contacts": ["firstname", "lastname", "email", "phone", "company"],
-                "companies": ["name", "domain", "phone", "website"],
-                "deals": ["dealname"], "tickets": ["subject", "content"]}
+OPERATORS = {
+    "EQ",
+    "NEQ",
+    "LT",
+    "LTE",
+    "GT",
+    "GTE",
+    "BETWEEN",
+    "IN",
+    "NOT_IN",
+    "HAS_PROPERTY",
+    "NOT_HAS_PROPERTY",
+    "CONTAINS_TOKEN",
+    "NOT_CONTAINS_TOKEN",
+}
+QUERY_FIELDS = {
+    "contacts": ["firstname", "lastname", "email", "phone", "company"],
+    "companies": ["name", "domain", "phone", "website"],
+    "deals": ["dealname"],
+    "tickets": ["subject", "content"],
+}
 
 
 def comparable(ctx: ProviderContext, kind: str, name: str, value: Any) -> Any:
@@ -33,7 +49,11 @@ def comparable(ctx: ProviderContext, kind: str, name: str, value: Any) -> Any:
             fail(400, f"Invalid numeric value for {name}.")
     if definition["type"] in ("date", "datetime"):
         try:
-            return Decimal(text) if re.fullmatch(r"-?\d+", text) else Decimal(str(parse_instant(text).timestamp() * 1000))
+            return (
+                Decimal(text)
+                if re.fullmatch(r"-?\d+", text)
+                else Decimal(str(parse_instant(text).timestamp() * 1000))
+            )
         except (ValueError, InvalidOperation):
             fail(400, f"Invalid date value for {name}.")
     return text if definition["type"] == "enumeration" else text.casefold()
@@ -45,16 +65,27 @@ def validate(ctx: ProviderContext, kind: str, payload: dict[str, Any]) -> None:
         fail(400, "At most five filterGroups are supported.")
     count = 0
     for group in groups:
-        if not isinstance(group, dict) or not isinstance(group.get("filters"), list) or not group["filters"] or len(group["filters"]) > 6:
+        if (
+            not isinstance(group, dict)
+            or not isinstance(group.get("filters"), list)
+            or not group["filters"]
+            or len(group["filters"]) > 6
+        ):
             fail(400, "Each filterGroup requires between one and six filters.")
         for item in group["filters"]:
             if not isinstance(item, dict):
                 fail(400, "Invalid search filter.")
             name, operator = item.get("propertyName"), item.get("operator")
-            if operator not in OPERATORS or not ctx.store[f"properties:{kind}"].get(name):
+            if (
+                not isinstance(operator, str)
+                or operator not in OPERATORS
+                or not ctx.store[f"properties:{kind}"].get(name)
+            ):
                 fail(400, "Invalid property or search operator.")
             if operator in ("IN", "NOT_IN"):
-                if not isinstance(item.get("values"), list) or any(not isinstance(v, str) for v in item["values"]):
+                if not isinstance(item.get("values"), list) or any(
+                    not isinstance(v, str) for v in item["values"]
+                ):
                     fail(400, "IN and NOT_IN require an array of string values.")
                 for value in item["values"]:
                     comparable(ctx, kind, name, value)
@@ -100,21 +131,41 @@ def matches_filter(ctx: ProviderContext, kind: str, props: dict[str, str], item:
     wanted = comparable(ctx, kind, name, item["value"])
     if op in ("CONTAINS_TOKEN", "NOT_CONTAINS_TOKEN"):
         pattern = "^" + re.escape(str(wanted)).replace(r"\*", ".*") + "$"
-        found = any(re.fullmatch(pattern, token, re.IGNORECASE) for token in re.findall(r"[\w@.\-]+", str(raw)))
+        found = any(
+            re.fullmatch(pattern, token, re.IGNORECASE) for token in re.findall(r"[\w@.\-]+", str(raw))
+        )
         return found if op == "CONTAINS_TOKEN" else not found
     if op == "BETWEEN":
         return wanted <= value <= comparable(ctx, kind, name, item["highValue"])
-    return {"EQ": lambda: value == wanted, "NEQ": lambda: value != wanted,
-            "LT": lambda: value < wanted, "LTE": lambda: value <= wanted,
-            "GT": lambda: value > wanted, "GTE": lambda: value >= wanted}[op]()
+    return {
+        "EQ": lambda: value == wanted,
+        "NEQ": lambda: value != wanted,
+        "LT": lambda: value < wanted,
+        "LTE": lambda: value <= wanted,
+        "GT": lambda: value > wanted,
+        "GTE": lambda: value >= wanted,
+    }[op]()
 
 
-def apply(ctx: ProviderContext, kind: str, records: list[dict[str, Any]], payload: dict[str, Any]) -> list[dict[str, Any]]:
+def apply(
+    ctx: ProviderContext, kind: str, records: list[dict[str, Any]], payload: dict[str, Any]
+) -> list[dict[str, Any]]:
     validate(ctx, kind, payload)
     groups = payload.get("filterGroups", [])
     query = payload.get("query", "").casefold()
-    fields = QUERY_FIELDS.get(kind, list({p for r in records for p in r["properties"] if p not in ("hubspot_owner_id", "hs_object_id")}))
-    result = [r for r in records if (not groups or any(all(matches_filter(ctx, kind, r["properties"], f) for f in g["filters"]) for g in groups)) and (not query or any(query in r["properties"].get(p, "").casefold() for p in fields))]
+    fields = QUERY_FIELDS.get(
+        kind,
+        list({p for r in records for p in r["properties"] if p not in ("hubspot_owner_id", "hs_object_id")}),
+    )
+    result = [
+        r
+        for r in records
+        if (
+            not groups
+            or any(all(matches_filter(ctx, kind, r["properties"], f) for f in g["filters"]) for g in groups)
+        )
+        and (not query or any(query in r["properties"].get(p, "").casefold() for p in fields))
+    ]
     sorts = payload.get("sorts", [])
     if sorts:
         sort = sorts[0]
@@ -122,5 +173,10 @@ def apply(ctx: ProviderContext, kind: str, records: list[dict[str, Any]], payloa
         descending = sort.startswith("-") if isinstance(sort, str) else sort.get("direction") == "DESCENDING"
         present = [r for r in result if r["properties"].get(name) not in (None, "")]
         missing = [r for r in result if r["properties"].get(name) in (None, "")]
-        result = sorted(present, key=lambda r: comparable(ctx, kind, name, r["properties"][name]), reverse=descending) + missing
+        result = (
+            sorted(
+                present, key=lambda r: comparable(ctx, kind, name, r["properties"][name]), reverse=descending
+            )
+            + missing
+        )
     return result
