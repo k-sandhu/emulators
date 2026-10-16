@@ -89,13 +89,16 @@ async def put_content(
     item["file"] = {"mimeType": mimetypes.guess_type(name)[0] or "application/octet-stream", "hashes": {}}
     item["lastModifiedBy"] = common.identity(ctx.world, ctx.world.person(p.person_id or drive["_owner"]))
     dm.content(ctx, item)
-    await dm.changed(ctx, item, "updated" if existing else "created")
+    await dm.changed(ctx, item, "updated" if existing else "created", content_changed=True)
     return item, 200 if existing else 201
 
 
 def precondition(request: Request, item: dict[str, Any]) -> None:
-    if request.headers.get("if-match") not in (None, "*", item["eTag"]):
+    tags = (item["eTag"], item["cTag"])
+    if request.headers.get("if-match") not in (None, "*", *tags):
         raise common.graph_error(412, "preconditionFailed", "The item has changed.")
+    if request.headers.get("if-none-match") in ("*", *tags):
+        raise common.graph_error(412, "preconditionFailed", "The item already exists or has not changed.")
 
 
 async def create_session(
@@ -108,19 +111,28 @@ async def create_session(
     existing: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     payload = await dm.json_body(request) if await request.body() else {}
+    if "deferCommit" in payload and not isinstance(payload["deferCommit"], bool):
+        raise common.graph_error(400, "invalidRequest", "deferCommit must be a Boolean.")
     if payload.get("deferCommit"):
         raise common.graph_error(400, "notSupported", "Deferred commit is not supported.")
     options = payload.get("item", {})
     if not isinstance(options, dict):
         raise common.graph_error(400, "invalidRequest", "item must be an object.")
-    name = dm.validate_name(options.get("name", name))
-    behavior = options.get("@microsoft.graph.conflictBehavior", "replace")
+    requested_name = dm.validate_name(options.get("name", name))
+    if requested_name != name:
+        raise common.graph_error(400, "invalidRequest", "item.name must match the name in the request URL.")
+    behavior = options.get("@microsoft.graph.conflictBehavior", "fail")
+    if behavior not in ("fail", "replace", "rename"):
+        raise common.graph_error(400, "invalidRequest", "Invalid conflict behavior.")
     if existing:
         precondition(request, existing)
         dm.require_item(ctx, drive["id"], existing["id"], p, write=True)
     else:
         dm.require_item(ctx, drive["id"], parent["id"], p, write=True)
-    conflict(ctx, parent, name, behavior)
+        old = dm.child_named(ctx, parent, name)
+        if old:
+            precondition(request, old)
+        conflict(ctx, parent, name, behavior)
     sid = secrets.token_urlsafe(32)
     expiry = isoformat_z(ctx.clock.now() + timedelta(hours=1))
     ctx.store[SESSIONS].put(
@@ -162,7 +174,7 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
                 "nextExpectedRanges": [f"{session['received']}-"],
             }
         match = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)", request.headers.get("content-range", ""))
-        if not match:
+        if not match or any(len(v) > 20 for v in match.groups()):
             raise common.graph_error(400, "invalidRequest", "A valid Content-Range header is required.")
         start, end, total = map(int, match.groups())
         data = await request.body()
@@ -182,6 +194,7 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         session["total"] = total
         session["chunks"].append(ctx.store.blobs.put(data))
         session["received"] = end + 1
+        session["expires"] = isoformat_z(ctx.clock.now() + timedelta(hours=1))
         if end + 1 < total:
             return JSONResponse(
                 {"expirationDateTime": session["expires"], "nextExpectedRanges": [f"{end + 1}-"]},

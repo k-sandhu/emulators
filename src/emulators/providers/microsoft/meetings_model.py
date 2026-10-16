@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+from datetime import timedelta
 from types import SimpleNamespace
 from typing import Any
 
@@ -158,11 +159,12 @@ def create_attendance(
     sessions = []
     for record in records:
         session_id = stable_guid(call_id, record["id"])
-        identity = {"user": record["identity"]}
         endpoint = {
             "@odata.type": "#microsoft.graph.callRecords.participantEndpoint",
-            "identity": identity,
+            "associatedIdentity": record["identity"],
+            "participantId": record["id"],
             "userAgent": {
+                "@odata.type": "#microsoft.graph.callRecords.clientUserAgent",
                 "applicationVersion": "1.0",
                 "headerValue": "Teams",
                 "platform": "windows",
@@ -197,15 +199,21 @@ def create_attendance(
             "version": 1,
             "type": "groupCall",
             "modalities": ["audio", "video"],
-            "startDateTime": meeting["startDateTime"],
-            "endDateTime": meeting["endDateTime"],
-            "lastModifiedDateTime": meeting["endDateTime"],
+            "startDateTime": min((s["startDateTime"] for s in sessions), default=meeting["startDateTime"]),
+            "endDateTime": max((s["endDateTime"] for s in sessions), default=meeting["endDateTime"]),
+            "lastModifiedDateTime": max((s["endDateTime"] for s in sessions), default=meeting["endDateTime"]),
             "joinWebUrl": meeting["joinWebUrl"],
-            "organizer": common.identity(ctx.world, ctx.world.person(meeting["_organizer"])),
-            "participants_v2": [
-                {"id": stable_guid(call_id, r["id"], "participant"), "identity": {"user": r["identity"]}}
-                for r in records
-            ],
+            "organizer_v2": {
+                "id": common.user_id(ctx.world, meeting["_organizer"]),
+                "identity": {
+                    "user": {
+                        "id": common.user_id(ctx.world, meeting["_organizer"]),
+                        "displayName": ctx.world.person(meeting["_organizer"]).display_name,
+                        "tenantId": common.tenant_id(ctx.world),
+                    }
+                },
+            },
+            "participants_v2": [{"id": r["id"], "identity": {"user": r["identity"]}} for r in records],
             "_meeting": meeting["id"],
             "_sessions": sessions,
         }
@@ -227,6 +235,7 @@ def seed(ctx: ProviderContext) -> None:
             [*source.attendee_ids, *source.optional_ids],
         )
         meeting["_ended"] = source.happened
+        meeting["creationDateTime"] = isoformat_z(min(source.start - timedelta(days=7), ctx.world.anchor))
         ctx.store[MEETINGS].put(meeting)
         if source.transcribed and source.happened:
             transcript = artifact(ctx, meeting, "transcript")

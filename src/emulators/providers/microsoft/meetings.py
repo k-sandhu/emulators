@@ -15,7 +15,7 @@ from fastapi.responses import JSONResponse, Response
 
 from emulators.core.clock import isoformat_z, parse_instant
 from emulators.core.provider import ProviderContext
-from emulators.providers.microsoft import common
+from emulators.providers.microsoft import common, meetings_payloads
 from emulators.providers.microsoft import drive_model as dm
 from emulators.providers.microsoft import meetings_model as mm
 from emulators.world import documents, media
@@ -32,7 +32,7 @@ def times(start: Any, end: Any) -> tuple[str, str]:
         raise common.graph_error(
             400, "BadRequest", "Valid startDateTime and endDateTime, with end after start, are required."
         ) from None
-    return isoformat_z(a), isoformat_z(b)
+    return isoformat_z(a, timespec="auto"), isoformat_z(b, timespec="auto")
 
 
 def attendee_ids(ctx: ProviderContext, payload: dict[str, Any]) -> list[str]:
@@ -48,7 +48,7 @@ def attendee_ids(ctx: ProviderContext, payload: dict[str, Any]) -> list[str]:
         ):
             raise common.graph_error(400, "BadRequest", "Each attendee must contain a user identity or upn.")
         identifier = attendee.get("identity", {}).get("user", {}).get("id") or attendee.get("upn")
-        if not identifier:
+        if not isinstance(identifier, str) or not identifier:
             raise common.graph_error(400, "BadRequest", "Each attendee requires a user identity or upn.")
         result.append(dm.person_id(ctx, identifier))
     return result
@@ -58,6 +58,7 @@ async def create_meeting(
     request: Request, ctx: ProviderContext, pid: str, *, external: bool = False
 ) -> Response:
     payload = await dm.json_body(request)
+    meetings_payloads.validate(payload)
     external_id = payload.get("externalId")
     if external and (not isinstance(external_id, str) or not external_id):
         raise common.graph_error(400, "BadRequest", "externalId is required.")
@@ -71,6 +72,7 @@ async def create_meeting(
     record = mm.meeting_shape(
         ctx, ctx.ids.guid(), pid, payload["subject"], start, end, attendee_ids(ctx, payload)
     )
+    meetings_payloads.apply_roles(record, payload)
     record["creationDateTime"] = isoformat_z(ctx.clock.now())
     if external:
         record["externalId"] = external_id
@@ -219,16 +221,31 @@ def get_all_artifacts(
     match = re.fullmatch(r"getAll(Transcripts|Recordings)\((.*)\)", function)
     if not match:
         raise common.item_not_found()
-    args = dict(re.findall(r"(\w+)\s*=\s*('(?:[^']|'')*'|[^,]+)", match.group(2)))
+    raw_args = match.group(2).strip()
+    entries = re.findall(r"(\w+)\s*=\s*('(?:[^']|'')*'|[^,\s]+)\s*(?:,|$)", raw_args)
+    args = dict(entries)
+    consumed = re.sub(r"\w+\s*=\s*('(?:[^']|'')*'|[^,\s]+)\s*(?:,|$)", "", raw_args).strip()
+    if (
+        consumed
+        or len(args) != len(entries)
+        or set(args) - {"meetingOrganizerUserId", "startDateTime", "endDateTime"}
+    ):
+        raise common.graph_error(400, "BadRequest", "Invalid artifact function parameters.")
     organizer = args.get("meetingOrganizerUserId", "").strip("'")
+    if not organizer:
+        organizer_filter = re.search(
+            r"MeetingOrganizer/User/Id\s+eq\s+'((?:[^']|'')*)'", request.query_params.get("$filter", ""), re.I
+        )
+        if organizer_filter:
+            organizer = organizer_filter.group(1).replace("''", "'")
     if not organizer or dm.person_id(ctx, organizer) != pid:
         raise common.graph_error(
             400, "BadRequest", "meetingOrganizerUserId must match the user in the request path."
         )
     try:
-        start = parse_instant(args["startDateTime"].strip("'"))
-        end = parse_instant(args["endDateTime"].strip("'"))
-        if start >= end:
+        start = parse_instant(args["startDateTime"].strip("'")) if "startDateTime" in args else None
+        end = parse_instant(args["endDateTime"].strip("'")) if "endDateTime" in args else None
+        if start and end and start >= end:
             raise ValueError
     except (ValueError, KeyError, TypeError):
         raise common.graph_error(
@@ -241,7 +258,8 @@ def get_all_artifacts(
         r
         for r in source
         if ctx.store[mm.MEETINGS].get(r["_meeting"])["_organizer"] == pid
-        and start <= parse_instant(r["createdDateTime"]) < end
+        and (start is None or start <= parse_instant(r["createdDateTime"]))
+        and (end is None or parse_instant(r["createdDateTime"]) < end)
     ]
     return dm.collection(
         request,
@@ -253,7 +271,7 @@ def get_all_artifacts(
 async def meeting_dispatch(
     request: Request, ctx: ProviderContext, pid: str, tail: str, p: common.Principal
 ) -> Any:
-    if tail.startswith(("getAllTranscripts(", "getAllRecordings(")):
+    if tail.startswith(("getAllTranscripts(", "getAllRecordings(")) and request.method == "GET":
         return get_all_artifacts(request, ctx, pid, tail, p)
     if tail == "createOrGet" and request.method == "POST":
         return await create_meeting(request, ctx, pid, external=True)
@@ -262,18 +280,23 @@ async def meeting_dispatch(
             return await create_meeting(request, ctx, pid)
         if request.method == "GET":
             filter_text = request.query_params.get("$filter", "")
-            match = re.fullmatch(r"JoinWebUrl\s+eq\s+'((?:[^']|'')*)'", filter_text, re.IGNORECASE)
+            match = re.fullmatch(
+                r"(JoinWebUrl|joinMeetingIdSettings/joinMeetingId)\s+eq\s+'((?:[^']|'')*)'",
+                filter_text,
+                re.IGNORECASE,
+            )
             if not match:
                 raise common.graph_error(
                     400,
                     "BadRequest",
-                    "Online meetings must be retrieved by id or an exact JoinWebUrl filter.",
+                    "Online meetings require an exact JoinWebUrl or joinMeetingIdSettings/joinMeetingId filter.",
                 )
-            join_url = match.group(1).replace("''", "'")
+            value = match.group(2).replace("''", "'")
+            by_url = match.group(1).casefold() == "joinweburl"
             records = [
                 m
                 for m in ctx.store[mm.MEETINGS]
-                if m["joinWebUrl"] == join_url
+                if (m["joinWebUrl"] if by_url else m["joinMeetingIdSettings"]["joinMeetingId"]) == value
                 and pid in m["_attendees"]
                 and (p.app_only or p.person_id in m["_attendees"])
             ]
@@ -285,6 +308,7 @@ async def meeting_dispatch(
             return dm.single(request, meeting, "onlineMeeting")
         if request.method == "PATCH":
             payload = await dm.json_body(request)
+            meetings_payloads.validate(payload)
             allowed = {
                 "subject",
                 "startDateTime",
@@ -315,6 +339,7 @@ async def meeting_dispatch(
                 shape = mm.meeting_shape(
                     ctx, meeting["_key"], meeting["_organizer"], meeting["subject"], start, end, ids
                 )
+                meetings_payloads.apply_roles(shape, payload)
                 payload["participants"] = shape["participants"]
                 meeting["_attendees"] = shape["_attendees"]
             meeting.update(payload, startDateTime=start, endDateTime=end)
@@ -345,7 +370,12 @@ async def add_transcript(ctx: ProviderContext, payload: dict[str, Any]) -> dict[
                 "speaker_id": meeting["_organizer"],
                 "text": text,
                 "offset_s": 0,
-                "duration_s": max(1, len(text.split()) * 0.4),
+                "duration_s": min(
+                    max(1, len(text.split()) * 0.4),
+                    (
+                        parse_instant(meeting["endDateTime"]) - parse_instant(meeting["startDateTime"])
+                    ).total_seconds(),
+                ),
             }
         ]
     if not isinstance(turns, list) or not turns:
@@ -365,12 +395,17 @@ async def add_transcript(ctx: ProviderContext, payload: dict[str, Any]) -> dict[
             if (
                 not math.isfinite(start)
                 or not math.isfinite(duration)
+                or not math.isfinite(start + duration)
                 or start < 0
                 or duration <= 0
+                or start + duration
+                > (
+                    parse_instant(meeting["endDateTime"]) - parse_instant(meeting["startDateTime"])
+                ).total_seconds()
                 or not isinstance(turn["text"], str)
             ):
                 raise ValueError
-        except (ValueError, TypeError, KeyError):
+        except (ValueError, TypeError, KeyError, OverflowError):
             raise common.graph_error(400, "BadRequest", "Invalid transcript turn.") from None
         cues.append(
             {
@@ -487,6 +522,21 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
                 raise common.item_not_found()
             sessions = copy.deepcopy(call["_sessions"])
             expand = request.query_params.get("$expand", "")
+            if tail == "organizer_v2":
+                return dm.single(request, call["organizer_v2"], "microsoft.graph.callRecords.organizer")
+            if tail == "participants_v2":
+                return dm.collection(
+                    request,
+                    call["participants_v2"],
+                    context="Collection(microsoft.graph.callRecords.participant)",
+                )
+            if tail.startswith("participants_v2/"):
+                participant = next(
+                    (r for r in call["participants_v2"] if r["id"] == tail.split("/")[1]), None
+                )
+                if participant and len(tail.split("/")) == 2:
+                    return dm.single(request, participant, "microsoft.graph.callRecords.participant")
+                raise common.item_not_found()
             if tail.startswith("sessions"):
                 if "segments" not in expand:
                     sessions = [{k: v for k, v in s.items() if k != "segments"} for s in sessions]
@@ -497,11 +547,25 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
                 sid = tail.split("/")[1]
                 session = next((s for s in sessions if s["id"] == sid), None)
                 if session:
+                    parts = tail.split("/")
+                    if len(parts) > 2:
+                        segments = next(s for s in call["_sessions"] if s["id"] == sid)["segments"]
+                        if parts[2] == "segments" and len(parts) == 3:
+                            return dm.collection(
+                                request, segments, context="Collection(microsoft.graph.callRecords.segment)"
+                            )
+                        if parts[2] == "segments" and len(parts) == 4:
+                            segment = next((s for s in segments if s["id"] == parts[3]), None)
+                            if segment:
+                                return dm.single(request, segment, "microsoft.graph.callRecords.segment")
+                        raise common.item_not_found()
                     return dm.single(request, session, "microsoft.graph.callRecords.session")
                 raise common.item_not_found()
             if tail:
                 raise common.item_not_found()
             record = dm.public(call)
+            if "participants_v2" not in expand:
+                record.pop("participants_v2", None)
             if "sessions" in expand:
                 record["sessions"] = (
                     sessions

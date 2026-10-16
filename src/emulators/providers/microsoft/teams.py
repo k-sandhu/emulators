@@ -9,10 +9,10 @@ from urllib.parse import urlencode
 from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 
-from emulators.core.clock import isoformat_z
+from emulators.core.clock import isoformat_z, parse_instant
 from emulators.core.odata import select_record
 from emulators.core.provider import ProviderContext, external_base
-from emulators.providers.microsoft import common
+from emulators.providers.microsoft import common, teams_content
 from emulators.providers.microsoft import drive_model as dm
 from emulators.providers.microsoft import outlook_payloads as payloads
 from emulators.providers.microsoft import teams_model as tm
@@ -20,21 +20,49 @@ from emulators.providers.microsoft import teams_model as tm
 seed = tm.seed
 
 
-def message_wire(ctx: ProviderContext, message: dict[str, Any], expand: str = "") -> dict[str, Any]:
+def message_wire(
+    request: Request, ctx: ProviderContext, message: dict[str, Any], expand: str = ""
+) -> dict[str, Any]:
     result = dm.public(message)
     if "replies" in expand:
-        result["replies"] = [
-            dm.public(r)
-            for r in ctx.store[tm.MESSAGES].where(_scope=message["_scope"], replyToId=message["id"])
-        ]
+        replies = sorted(
+            ctx.store[tm.MESSAGES].where(_scope=message["_scope"], replyToId=message["id"]),
+            key=lambda r: parse_instant(r["createdDateTime"]),
+        )
+        result["replies"] = [dm.public(r) for r in replies[:200]]
+        if len(replies) > 200:
+            channel = message["channelIdentity"]
+            path = (
+                f"/{common.version_of(request)}/teams/{channel['teamId']}/channels/{channel['channelId']}"
+                f"/messages/{message['id']}/replies"
+            )
+            result["replies@odata.nextLink"] = (
+                dm.graph_url(request, ctx, path)
+                + "?"
+                + urlencode({"$skiptoken": common._encode_skiptoken(200), "$top": 50}, safe="$")
+            )
     return result
 
 
 def list_messages(request: Request, ctx: ProviderContext, records: list[dict[str, Any]]) -> dict[str, Any]:
-    records = sorted(records, key=lambda r: r["lastModifiedDateTime"], reverse=True)
+    def modified(record: dict[str, Any]) -> Any:
+        timestamps = [parse_instant(record["lastModifiedDateTime"])]
+        if record.get("channelIdentity") and record["replyToId"] is None:
+            timestamps.extend(
+                parse_instant(r["lastModifiedDateTime"])
+                for r in ctx.store[tm.MESSAGES].where(_scope=record["_scope"], replyToId=record["id"])
+            )
+        return max(timestamps)
+
+    replies = bool(records and all(r["replyToId"] is not None for r in records))
+    records = sorted(
+        records,
+        key=(lambda r: parse_instant(r["createdDateTime"])) if replies else modified,
+        reverse=not replies,
+    )
     return dm.collection(
         request,
-        [message_wire(ctx, r, request.query_params.get("$expand", "")) for r in records],
+        [message_wire(request, ctx, r, request.query_params.get("$expand", "")) for r in records],
         context="Collection(microsoft.graph.chatMessage)",
         default_page_size=20,
         max_page_size=50,
@@ -66,8 +94,10 @@ def delta_messages(request: Request, ctx: ProviderContext, scope: str, p: common
             if token == "latest"
             else [copy.deepcopy(r) for r in ctx.store[tm.MESSAGES].where(_scope=scope)]
         )
-    options = common.query_options(request)
+    options = dm.query_options(request)
     size = common.page_size(request, options.top, 20, 50)
+    if size == 0:
+        raise common.graph_error(400, "BadRequest", "Delta page size must be positive.")
     more = bool(size and len(records) > size)
     cursor_id = dm.delta_token(
         ctx, "channel/" + scope, p, records if more else [], sequence, size if more else 0
@@ -98,10 +128,14 @@ async def messages_dispatch(
     records = ctx.store[tm.MESSAGES].where(_scope=scope)
     reply_to: str | None = None
     if parts and parts[0] == "delta" and request.method == "GET":
+        if chat:
+            raise common.item_not_found()
         return delta_messages(request, ctx, scope, p)
     if len(parts) > 1 and parts[1] == "replies":
+        if chat:
+            raise common.item_not_found()
         parent = ctx.store[tm.MESSAGES].get(tm.message_key(scope, parts[0]))
-        if not parent or parent["replyToId"] or parent["deletedDateTime"]:
+        if not parent or parent["replyToId"] or (parent["deletedDateTime"] and request.method != "GET"):
             raise common.item_not_found()
         reply_to = parent["id"]
         parts = parts[2:]
@@ -114,11 +148,17 @@ async def messages_dispatch(
                     "Sending messages requires delegated authentication outside migration mode."
                 )
             payload = await dm.json_body(request)
+            hosted = teams_content.validate(payload)
             body = payloads.item_body(payload.get("body"))
             if not body["content"].strip() and not payload.get("attachments"):
                 raise common.graph_error(400, "BadRequest", "Message content cannot be empty.")
             timestamp = isoformat_z(ctx.clock.now(), timespec="milliseconds")
-            mid = str(max(ctx.clock.timestamp() * 1000, max((int(r["id"]) for r in records), default=0) + 1))
+            mid = str(
+                max(
+                    int(ctx.clock.now().timestamp() * 1000),
+                    max((int(r["id"]) for r in records), default=0) + 1,
+                )
+            )
             record = tm.new_message(
                 ctx,
                 scope,
@@ -133,6 +173,9 @@ async def messages_dispatch(
             for key in ("subject", "summary", "importance", "locale", "attachments", "mentions"):
                 if key in payload:
                     record[key] = payload[key]
+            if record["mentions"]:
+                record["body"]["contentType"] = "html"
+            teams_content.store(request, ctx, record, hosted)
             ctx.store[tm.MESSAGES].put_as(tm.message_key(scope, mid), record)
             if chat:
                 chat["lastUpdatedDateTime"] = timestamp
@@ -143,10 +186,12 @@ async def messages_dispatch(
     if message is None or message["replyToId"] != reply_to:
         raise common.item_not_found()
     op = "/".join(parts[1:])
+    if op == "hostedContents" or op.startswith("hostedContents/"):
+        return teams_content.handle(request, ctx, message, op)
     if not op and request.method == "GET":
         return dm.single(
             request,
-            message_wire(ctx, message, request.query_params.get("$expand", "")),
+            message_wire(request, ctx, message, request.query_params.get("$expand", "")),
             "microsoft.graph.chatMessage",
         )
     if request.method == "PATCH" and not op:
@@ -155,6 +200,11 @@ async def messages_dispatch(
         if message["deletedDateTime"]:
             raise common.graph_error(400, "BadRequest", "A deleted message cannot be edited.")
         payload = await dm.json_body(request)
+        teams_content.validate(payload)
+        if "hostedContents" in payload:
+            raise common.graph_error(
+                400, "BadRequest", "Hosted content can only be supplied when creating a message."
+            )
         body = payloads.item_body(payload.get("body"))
         timestamp = isoformat_z(ctx.clock.now(), timespec="milliseconds")
         message["messageHistory"].append(
@@ -164,19 +214,30 @@ async def messages_dispatch(
             "contentType": body.get("contentType", message["body"]["contentType"]),
             "content": body["content"],
         }
+        for key in ("attachments", "mentions"):
+            if key in payload:
+                message[key] = payload[key]
+        if message["mentions"]:
+            message["body"]["contentType"] = "html"
         message["lastEditedDateTime"] = message["lastModifiedDateTime"] = timestamp
         message["etag"] = str(int(message["etag"]) + 1)
         await tm.changed(ctx, message, "updated")
         return Response(status_code=204)
     if op in ("softDelete", "undoSoftDelete") and request.method == "POST":
+        if p.app_only:
+            raise common.access_denied("Message deletion and restoration require delegated authentication.")
         owner = channel and p.person_id in ctx.store[tm.TEAMS].get(channel["_team"])["_owners"]
         if p.delegated and p.person_id != message["_author"] and not owner:
             raise common.access_denied()
         if op == "softDelete":
+            if message["deletedDateTime"]:
+                return Response(status_code=204)
             message["_prior_body"] = copy.deepcopy(message["body"])
             message["deletedDateTime"] = isoformat_z(ctx.clock.now(), timespec="milliseconds")
             message["body"] = {"contentType": "html", "content": ""}
         else:
+            if not message["deletedDateTime"]:
+                return Response(status_code=204)
             message["deletedDateTime"] = None
             message["body"] = message.pop("_prior_body", {"contentType": "html", "content": ""})
         message["lastModifiedDateTime"] = isoformat_z(ctx.clock.now(), timespec="milliseconds")
@@ -331,6 +392,21 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
                     [tm.member(ctx, pid, []) for pid in chat["_members"]],
                     context="Collection(conversationMember)",
                 )
+            if tail == "messages" or tail.startswith("messages/"):
+                return await messages_dispatch(
+                    request, ctx, p, cid, tail.removeprefix("messages").lstrip("/"), chat=chat
+                )
+            raise common.item_not_found()
+
+        @routes.api_route("/users/{uid}/chats/{cid}/{tail:path}", methods=dm.METHODS)
+        async def user_chat_messages(request: Request, uid: str, cid: str, tail: str) -> Any:
+            p = common.principal(request, ctx)
+            pid = dm.person_id(ctx, uid)
+            if p.delegated and p.person_id != pid:
+                raise common.access_denied()
+            chat = tm.require_chat(ctx, cid, p)
+            if pid not in chat["_members"]:
+                raise common.item_not_found()
             if tail == "messages" or tail.startswith("messages/"):
                 return await messages_dispatch(
                     request, ctx, p, cid, tail.removeprefix("messages").lstrip("/"), chat=chat

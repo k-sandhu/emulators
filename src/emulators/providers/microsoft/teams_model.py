@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import html
 import re
+from datetime import timedelta
 from typing import Any
 
 from emulators.core.clock import isoformat_z
@@ -181,6 +182,10 @@ def seed_messages(
 def seed(ctx: ProviderContext) -> None:
     for team in ctx.world.teams:
         tid = common.group_id(ctx.world, team.group_id or f"team-{team.id}")
+        created = min(
+            (m.created for channel in team.channels for m in channel.messages),
+            default=ctx.world.anchor,
+        ) - timedelta(days=1)
         ctx.store[TEAMS].put(
             {
                 "id": tid,
@@ -188,7 +193,7 @@ def seed(ctx: ProviderContext) -> None:
                 "description": team.description,
                 "visibility": team.visibility.lower(),
                 "webUrl": f"https://teams.microsoft.com/l/team/{tid}/conversations?groupId={tid}&tenantId={common.tenant_id(ctx.world)}",
-                "createdDateTime": isoformat_z(ctx.world.anchor),
+                "createdDateTime": isoformat_z(created),
                 "isArchived": False,
                 "classification": None,
                 "specialization": "none",
@@ -230,7 +235,7 @@ def seed(ctx: ProviderContext) -> None:
                     "tenantId": common.tenant_id(ctx.world),
                     "webUrl": f"https://teams.microsoft.com/l/channel/{dm.quote(cid, safe='')}/{dm.quote(channel.name)}?groupId={tid}&tenantId={common.tenant_id(ctx.world)}",
                     "membershipType": "private" if channel.is_private else "standard",
-                    "createdDateTime": isoformat_z(ctx.world.anchor),
+                    "createdDateTime": isoformat_z(created),
                     "_team": tid,
                     "_members": list(channel.member_ids)
                     if channel.is_private

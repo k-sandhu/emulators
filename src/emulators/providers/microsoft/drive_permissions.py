@@ -15,9 +15,47 @@ from emulators.providers.microsoft import drive_model as dm
 
 
 def valid_roles(value: Any) -> list[str]:
-    if not isinstance(value, list) or not value or any(r not in ("read", "write", "owner") for r in value):
-        raise common.graph_error(400, "invalidRequest", "roles must contain read, write, or owner.")
+    if not isinstance(value, list) or not value or any(r not in ("read", "write") for r in value):
+        raise common.graph_error(400, "invalidRequest", "roles must contain read or write.")
     return value
+
+
+def validate_options(payload: dict[str, Any]) -> None:
+    for key in ("requireSignIn", "sendInvitation", "retainInheritedPermissions"):
+        if key in payload and not isinstance(payload[key], bool):
+            raise common.graph_error(400, "invalidRequest", f"{key} must be a Boolean.")
+    if "password" in payload and payload["password"] is not None and not isinstance(payload["password"], str):
+        raise common.graph_error(400, "invalidRequest", "password must be a string.")
+    expiry = payload.get("expirationDateTime")
+    if expiry is not None:
+        try:
+            parse_instant(expiry)
+        except (ValueError, TypeError, AttributeError):
+            raise common.graph_error(400, "invalidRequest", "Invalid expirationDateTime.") from None
+
+
+def visible_permissions(
+    ctx: ProviderContext, item: dict[str, Any], p: common.Principal
+) -> list[dict[str, Any]]:
+    """Non-owners see their own grants, without redemption URLs for read-only callers."""
+    records = dm.permissions(ctx, item)
+    role = dm.role_for(ctx, item, p)
+    if p.app_only or role == "owner":
+        return records
+    visible = []
+    for permission in records:
+        applies = any(p.person_id in ctx.world.expand_principal(pid) for pid in permission["_principals"])
+        scope = permission.get("link", {}).get("scope")
+        applies |= scope == "anonymous" or (
+            scope == "organization" and bool(p.person_id and not ctx.world.person(p.person_id).is_external)
+        )
+        if applies:
+            record = dm.public(permission)
+            if role == "read":
+                record.pop("shareId", None)
+                record.get("link", {}).pop("webUrl", None)
+            visible.append(record)
+    return visible
 
 
 async def handle(
@@ -26,10 +64,11 @@ async def handle(
     if request.method != "GET":
         dm.require_item(ctx, item["_drive"], item["id"], p, write=True)
     if operation == "permissions" and request.method == "GET":
-        return dm.collection(request, dm.permissions(ctx, item), context="Collection(permission)")
+        return dm.collection(request, visible_permissions(ctx, item, p), context="Collection(permission)")
     if operation.startswith("permissions/"):
         pid = operation.split("/", 1)[1]
-        permission = next((r for r in dm.permissions(ctx, item) if r["id"] == pid), None)
+        records = visible_permissions(ctx, item, p) if request.method == "GET" else dm.permissions(ctx, item)
+        permission = next((r for r in records if r["id"] == pid), None)
         if permission is None:
             raise common.item_not_found()
         if request.method == "GET":
@@ -42,6 +81,7 @@ async def handle(
             return Response(status_code=204)
         if request.method == "PATCH":
             payload = await dm.json_body(request)
+            validate_options(payload)
             if set(payload) - {"roles", "expirationDateTime"}:
                 raise common.graph_error(
                     400, "invalidRequest", "Only roles and expirationDateTime can be updated."
@@ -59,6 +99,7 @@ async def handle(
             return dm.public(permission)
     if operation == "invite" and request.method == "POST":
         payload = await dm.json_body(request)
+        validate_options(payload)
         roles = valid_roles(payload.get("roles"))
         recipients = payload.get("recipients")
         if not isinstance(recipients, list) or not recipients:
@@ -103,6 +144,11 @@ async def handle(
                 target,
                 roles,
                 invitation={"email": email, "signInRequired": payload.get("requireSignIn", True)},
+                **(
+                    {"expirationDateTime": payload["expirationDateTime"]}
+                    if payload.get("expirationDateTime")
+                    else {}
+                ),
             )
             for target, email in resolved
         ]
@@ -110,6 +156,7 @@ async def handle(
         return {"value": [dm.public(r) for r in results]}
     if operation == "createLink" and request.method == "POST":
         payload = await dm.json_body(request)
+        validate_options(payload)
         kind, scope = payload.get("type", "view"), payload.get("scope", "organization")
         if kind not in ("view", "edit", "embed") or scope not in ("anonymous", "organization", "users"):
             raise common.graph_error(400, "invalidRequest", "Invalid sharing link type or scope.")

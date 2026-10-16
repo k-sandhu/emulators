@@ -80,7 +80,7 @@ async def delete_item(ctx: ProviderContext, item: dict[str, Any], p: common.Prin
     descendants = [
         i
         for i in ctx.store[dm.ITEMS].where(_drive=item["_drive"])
-        if i["id"] == item["id"] or i["_path"].startswith(item["_path"] + "/")
+        if not i.get("_deleted") and (i["id"] == item["id"] or i["_path"].startswith(item["_path"] + "/"))
     ]
     if any(dm.role_for(ctx, child, p) not in ("write", "owner") for child in descendants):
         raise common.access_denied()
@@ -155,7 +155,6 @@ async def rename_move(
             child["parentReference"]["path"] = "/drive/root:" + ("/" + parent_path if parent_path else "")
             if child["parentReference"].get("id") == item["id"]:
                 child["parentReference"]["name"] = name
-            await dm.changed(ctx, child)
     await dm.changed(ctx, item)
     return dm.wire_item(request, ctx, item)
 
@@ -186,8 +185,10 @@ def delta(
             copy.deepcopy(i) for i in ctx.store[dm.ITEMS].where(_drive=drive["id"]) if not i.get("_deleted")
         ]
     records = [i for i in records if dm.role_for(ctx, i, p)]
-    options = common.query_options(request)
+    options = dm.query_options(request)
     size = common.page_size(request, options.top, 200, 200)
+    if size == 0:
+        raise common.graph_error(400, "invalidRequest", "Delta page size must be positive.")
     page = records[:size]
     result: dict[str, Any] = {
         "@odata.context": common.context_url(request, "Collection(driveItem)"),
@@ -199,13 +200,13 @@ def delta(
                 {
                     "id": item["id"],
                     "deleted": {"state": "deleted"},
-                    "parentReference": item["parentReference"],
+                    "parentReference": {k: v for k, v in item["parentReference"].items() if k != "path"},
                 }
             )
         else:
-            result["value"].append(
-                common.single_response(request, dm.wire_item(request, ctx, item), context="driveItem")
-            )
+            wire = dm.wire_item(request, ctx, item)
+            wire.get("parentReference", {}).pop("path", None)
+            result["value"].append(common.single_response(request, wire, context="driveItem"))
             result["value"][-1].pop("@odata.context", None)
     more = bool(size and len(records) > size)
     next_token = dm.delta_token(ctx, resource, p, records if more else [], sequence, size if more else 0)
@@ -362,7 +363,7 @@ async def dispatch(request: Request, ctx: ProviderContext, drive: dict[str, Any]
             in (
                 i["name"]
                 + " "
-                + i.get("description", "")
+                + (i.get("description") or "")
                 + " "
                 + (" ".join(ctx.world.document(i["_doc"]).paragraphs) if i.get("_doc") else "")
             ).casefold()
@@ -417,6 +418,8 @@ async def dispatch(request: Request, ctx: ProviderContext, drive: dict[str, Any]
     if op == "content":
         if request.method == "GET":
             dm.content(ctx, item, request.query_params.get("format"))
+            if request.headers.get("if-none-match") in ("*", item["eTag"], item["cTag"]):
+                return Response(status_code=304, headers={"ETag": item["eTag"]})
             return RedirectResponse(
                 dm.download_url(request, ctx, item, request.query_params.get("format")), status_code=302
             )

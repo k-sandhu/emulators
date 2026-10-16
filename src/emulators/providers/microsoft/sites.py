@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import math
 import re
+from datetime import timedelta
 from typing import Any
 
 from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 
-from emulators.core.clock import isoformat_z
+from emulators.core.clock import isoformat_z, parse_instant
 from emulators.core.ids import stable_guid
 from emulators.core.provider import ProviderContext
 from emulators.providers.microsoft import common
@@ -28,7 +30,7 @@ def seed(ctx: ProviderContext) -> None:
             "name": ctx.world.org.slug,
             "displayName": ctx.world.org.name,
             "webUrl": "https://" + dm.HOST,
-            "createdDateTime": isoformat_z(ctx.world.anchor),
+            "createdDateTime": isoformat_z(ctx.world.anchor - timedelta(days=365)),
             "lastModifiedDateTime": isoformat_z(ctx.world.anchor),
             "description": "Halcyon Advisory Group intranet",
             "siteCollection": {"hostname": dm.HOST},
@@ -47,7 +49,7 @@ def seed(ctx: ProviderContext) -> None:
                 "displayName": space.name,
                 "webUrl": f"https://{dm.HOST}/sites/{space.slug}",
                 "description": space.description,
-                "createdDateTime": isoformat_z(ctx.world.anchor),
+                "createdDateTime": isoformat_z(ctx.world.anchor - timedelta(days=365)),
                 "lastModifiedDateTime": isoformat_z(ctx.world.anchor),
                 "siteCollection": {"hostname": dm.HOST},
                 "_space": space.id,
@@ -232,6 +234,8 @@ async def list_dispatch(
     parts = tail.strip("/").split("/")
     listings = ctx.store[LISTS].where(_site=site["id"])
     if not tail:
+        if request.method != "GET":
+            raise common.graph_error(405, "methodNotAllowed", "Lists can only be enumerated here.")
         return dm.collection(request, listings, context="Collection(list)")
     listing = next((r for r in listings if r["id"] == parts[0] or r["name"] == parts[0]), None)
     if listing is None:
@@ -358,6 +362,21 @@ def validate_fields(ctx: ProviderContext, listing: dict[str, Any], fields: Any) 
             raise common.graph_error(400, "invalidRequest", f"Field '{name}' must be numeric.")
         if "text" in columns[name] and value is not None and not isinstance(value, str):
             raise common.graph_error(400, "invalidRequest", f"Field '{name}' must be a string.")
+        if (
+            "text" in columns[name]
+            and isinstance(value, str)
+            and len(value) > columns[name]["text"]["maxLength"]
+        ):
+            raise common.graph_error(400, "invalidRequest", f"Field '{name}' exceeds its maximum length.")
+        if "number" in columns[name] and isinstance(value, float) and not math.isfinite(value):
+            raise common.graph_error(400, "invalidRequest", f"Field '{name}' must be finite.")
+        if "dateTime" in columns[name] and value is not None:
+            try:
+                parse_instant(value)
+            except (ValueError, AttributeError, TypeError):
+                raise common.graph_error(
+                    400, "invalidRequest", f"Field '{name}' must be a timestamp."
+                ) from None
 
 
 def register(app: FastAPI, ctx: ProviderContext) -> None:
@@ -411,12 +430,9 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
                 ]
                 return dm.collection(request, records, context="Collection(drive)")
             if op == "permissions" and request.method == "GET":
-                if not p.app_only:
+                if not p.app_only and "Sites.FullControl.All" not in p.scopes:
                     raise common.access_denied("This API requires application permissions.")
-                drive = dm.drive_for_site(ctx, site["id"])
-                return dm.collection(
-                    request, dm.permissions(ctx, dm.root_item(ctx, drive)), context="Collection(permission)"
-                )
+                return dm.collection(request, [], context="Collection(permission)")
             if op == "lists" or op.startswith("lists/"):
                 return await list_dispatch(request, ctx, site, op.removeprefix("lists").lstrip("/"), p)
             raise common.item_not_found()

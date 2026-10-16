@@ -127,7 +127,9 @@ async def test_meeting_access_attendance_call_records_and_bulk_exports(
         call_url = BASE + "/v1.0/communications/callRecords/" + call_id
         assert (await client.get(call_url, headers=auth)).status_code == 403
         app = bearer(await mint(client, BASE, app_only=True))
-        call = (await client.get(call_url + "?$expand=sessions($expand=segments)", headers=app)).json()
+        call = (
+            await client.get(call_url + "?$expand=sessions($expand=segments),participants_v2", headers=app)
+        ).json()
         assert call["type"] == "groupCall" and call["version"] == 1
         assert call["participants_v2"] and call["sessions"][0]["segments"]
         assert (await client.get(call_url + "/sessions", headers=app)).json()["value"]
@@ -290,6 +292,6 @@ async def test_end_meeting_artifact_and_call_notifications(make_client: Callable
         assert {n["resourceData"]["@odata.type"] for n in notifications} == {
             "#microsoft.graph.callTranscript",
             "#microsoft.graph.callRecording",
-            "#microsoft.graph.callRecord",
+            "#Microsoft.Graph.callRecord",
         }
         assert all(n["clientState"] == "meeting-contract" for n in notifications)

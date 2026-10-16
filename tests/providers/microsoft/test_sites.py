@@ -66,7 +66,10 @@ async def test_sites_discovery_libraries_columns_and_library_items(
         )
         assert changed.status_code == 200
         assert changed.json()["Title"] == "Library metadata"
-        assert (await client.get(base + f"/sites/{site['id']}/permissions", headers=auth)).json()["value"]
+        # Site permissions are application grants, not document library user/group ACLs.
+        assert (await client.get(base + f"/sites/{site['id']}/permissions", headers=auth)).json()[
+            "value"
+        ] == []
 
 
 async def test_engagement_tracker_mutations_and_site_permissions(make_client: Callable[..., Any]) -> None:

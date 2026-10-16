@@ -136,6 +136,8 @@ async def notify(ctx: ProviderContext, resource: str, change_type: str, data: di
         if observed != watched and not observed.startswith(watched + "/"):
             continue
         actual = "updated" if watched in {"users", "groups"} and change_type == "created" else change_type
+        if watched == "communications/callRecords" and change_type == "created":
+            actual = "created" if "created" in subscription["changeType"].split(",") else "updated"
         if actual not in subscription["changeType"].split(","):
             continue
         kind = (
@@ -181,6 +183,9 @@ async def notify(ctx: ProviderContext, resource: str, change_type: str, data: di
                 }
             ]
         }
+        if kind == "callRecord":
+            payload["value"][0]["resourceData"]["@odata.type"] = "#Microsoft.Graph.callRecord"
+            payload["value"][0]["resourceData"].pop("@odata.etag", None)
         await ctx.webhooks.deliver(
             subscription["notificationUrl"],
             json.dumps(payload).encode(),

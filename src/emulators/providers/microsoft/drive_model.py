@@ -20,7 +20,7 @@ from fastapi.responses import Response
 
 from emulators.core.clock import isoformat_z, parse_instant
 from emulators.core.ids import stable_guid
-from emulators.core.odata import ODataError
+from emulators.core.odata import ODataError, QueryOptions
 from emulators.core.provider import ProviderContext, external_base, url_for_host
 from emulators.providers.microsoft import common
 from emulators.providers.microsoft.quickxor import quickxor_hash
@@ -35,7 +35,28 @@ METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE"]
 
 
 async def json_body(request: Request) -> dict[str, Any]:
-    return await common.json_body(request, code="invalidRequest")
+    try:
+        payload = await common.json_body(request, code="invalidRequest")
+
+        def validate(value: Any, depth: int = 0) -> None:
+            if depth > 64:
+                raise ValueError
+            if isinstance(value, str):
+                value.encode("utf-8")
+            elif isinstance(value, list):
+                for entry in value:
+                    validate(entry, depth + 1)
+            elif isinstance(value, dict):
+                for key, entry in value.items():
+                    validate(key, depth + 1)
+                    validate(entry, depth + 1)
+
+        validate(payload)
+        return payload
+    except (UnicodeEncodeError, RecursionError, ValueError):
+        raise common.graph_error(
+            400, "invalidRequest", "Invalid Unicode or excessive JSON nesting."
+        ) from None
 
 
 def public(record: dict[str, Any]) -> dict[str, Any]:
@@ -57,6 +78,8 @@ def collection(request: Request, records: list[dict[str, Any]], **kwargs: Any) -
         result = common.collection_response(request, [public(r) for r in records], **kwargs)
     except ODataError as exc:
         raise common.graph_error(400, exc.code, exc.message) from None
+    except ValueError:
+        raise common.graph_error(400, "BadRequest", "Invalid numeric query parameter.") from None
     if "@odata.nextLink" in result:
         query = result["@odata.nextLink"].split("?", 1)[1]
         result["@odata.nextLink"] = external_base(request) + path_of(request) + "?" + query
@@ -64,7 +87,15 @@ def collection(request: Request, records: list[dict[str, Any]], **kwargs: Any) -
 
 
 def single(request: Request, record: dict[str, Any], context: str) -> dict[str, Any]:
+    query_options(request)
     return common.single_response(request, public(record), context=context)
+
+
+def query_options(request: Request) -> QueryOptions:
+    try:
+        return common.query_options(request)
+    except ValueError:
+        raise common.graph_error(400, "BadRequest", "Invalid numeric query parameter.") from None
 
 
 def site_id(ctx: ProviderContext, space_id: str = "root") -> str:
@@ -230,7 +261,7 @@ def new_item(
 ) -> dict[str, Any]:
     owner = owner or drive["_owner"]
     iid = item_id(ctx, drive["id"], key)
-    timestamp = created or isoformat_z(ctx.world.anchor)
+    timestamp = created or isoformat_z(ctx.clock.now())
     path = ((parent["_path"] + "/") if parent and parent["_path"] else "") + name if parent else ""
     parent_ref: dict[str, Any] = {"driveType": drive["driveType"], "driveId": drive["id"]}
     if parent:
@@ -274,7 +305,9 @@ def new_item(
     return ctx.store[ITEMS].put(item)
 
 
-def ensure_folder(ctx: ProviderContext, drive: dict[str, Any], path: str) -> dict[str, Any]:
+def ensure_folder(
+    ctx: ProviderContext, drive: dict[str, Any], path: str, *, created: str | None = None
+) -> dict[str, Any]:
     parent = root_item(ctx, drive)
     for segment in path.strip("/").split("/") if path else []:
         match = child_named(ctx, parent, segment)
@@ -285,6 +318,7 @@ def ensure_folder(ctx: ProviderContext, drive: dict[str, Any], path: str) -> dic
             segment,
             key="folder/" + ((parent["_path"] + "/") if parent["_path"] else "") + segment,
             folder=True,
+            created=created,
         )
     return parent
 
@@ -343,15 +377,15 @@ def seed(ctx: ProviderContext) -> None:
                 "_site": site_id(ctx, space.id) if space.kind == "team" else None,
             }
         )
-        root = new_item(ctx, drive, None, "root", key="root", folder=True)
+        root = new_item(ctx, drive, None, "root", key="root", folder=True, created=drive["createdDateTime"])
         drive["_root"] = root["id"]
         add_permission(ctx, root, space.owner_id, ["owner"])
         for target, role in space.members:
             add_permission(ctx, root, target, [ROLES[role]])
         if space.kind == "personal":
-            ensure_folder(ctx, drive, "Apps")
+            ensure_folder(ctx, drive, "Apps", created=drive["createdDateTime"])
         for path in ctx.world.folders_in(space.id):
-            ensure_folder(ctx, drive, path)
+            ensure_folder(ctx, drive, path, created=drive["createdDateTime"])
         for doc in ctx.world.documents_in(space.id):
             parent = ensure_folder(ctx, drive, doc.folder)
             item = new_item(
@@ -366,6 +400,8 @@ def seed(ctx: ProviderContext) -> None:
                 description=doc.description,
                 lastModifiedBy=common.identity(ctx.world, ctx.world.person(doc.modified_by_id)),
             )
+            item["eTag"] = f'"{{{stable_guid(item["id"]).upper()}}},{doc.versions}"'
+            item["cTag"] = f'"c:{{{stable_guid(item["id"]).upper()}}},{doc.versions}"'
             item["file"]["mimeType"] = documents.EXTENSION_TO_MIME.get(doc.kind, "application/octet-stream")
             item["fileSystemInfo"]["lastModifiedDateTime"] = isoformat_z(doc.modified)
             add_permission(ctx, item, doc.owner_id, ["owner"])
@@ -402,7 +438,7 @@ def add_recording(
     old = ctx.store[ITEMS].get(iid)
     if old:
         return old
-    parent = ensure_folder(ctx, drive, "Recordings")
+    parent = ensure_folder(ctx, drive, "Recordings", created=isoformat_z(end))
     name = re.sub(r'["*:<>?/\\|]', "_", title) + start.strftime("-%Y%m%d_%H%M%S-Meeting Recording.mp4")
     item = new_item(ctx, drive, parent, name, key="recording/" + mid, created=isoformat_z(end))
     item.update(_recording=mid, _duration=max(1, (end - start).total_seconds()), _title=title)
@@ -520,7 +556,7 @@ def binary_response(request: Request, data: bytes, mime: str, etag: str | None =
     requested = request.headers.get("range")
     if requested and (not request.headers.get("if-range") or request.headers["if-range"] == etag):
         match = re.fullmatch(r"bytes=(\d*)-(\d*)", requested)
-        if not match or not any(match.groups()):
+        if not match or not any(match.groups()) or any(len(v) > 20 for v in match.groups()):
             raise common.graph_error(416, "invalidRange", "Invalid byte range.")
         lo, hi = match.groups()
         start = int(lo) if lo else max(0, len(data) - int(hi))
@@ -550,6 +586,8 @@ def wire_item(request: Request, ctx: ProviderContext, item: dict[str, Any]) -> d
     if "file" in item:
         content(ctx, item)
     record = public(item)
+    if "folder" in item:
+        record.pop("cTag", None)
     if "file" in item:
         record["@microsoft.graph.downloadUrl"] = download_url(request, ctx, item)
     if "thumbnails" in request.query_params.get("$expand", "") and "file" in item:
@@ -576,18 +614,22 @@ def validate_name(name: Any) -> str:
     if (
         not isinstance(name, str)
         or not name.strip()
+        or len(name) > 255
         or name in (".", "..")
-        or re.search(r'["*:<>?/\\|]', name)
+        or re.search(r'[\x00-\x1f"*:<>?/\\|]', name)
         or name.endswith((".", " "))
     ):
         raise common.graph_error(400, "invalidRequest", "Invalid item name.")
     return name
 
 
-async def changed(ctx: ProviderContext, item: dict[str, Any], change: str = "updated") -> None:
+async def changed(
+    ctx: ProviderContext, item: dict[str, Any], change: str = "updated", *, content_changed: bool = False
+) -> None:
     item["_version"] += 1
     item["eTag"] = f'"{{{stable_guid(item["id"]).upper()}}},{item["_version"]}"'
-    item["cTag"] = f'"c:{{{stable_guid(item["id"]).upper()}}},{item["_version"]}"'
+    if content_changed:
+        item["cTag"] = f'"c:{{{stable_guid(item["id"]).upper()}}},{item["_version"]}"'
     item["lastModifiedDateTime"] = isoformat_z(ctx.clock.now())
     item["fileSystemInfo"]["lastModifiedDateTime"] = item["lastModifiedDateTime"]
     sequence = ctx.store.meta.get("ms_drive_sequence", 0) + 1

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 from typing import Any
 
 import msal
@@ -10,6 +11,7 @@ import requests
 
 from emulators.core.hub import EmulatorHub
 from emulators.providers.microsoft import common
+from emulators.world.documents import make_png
 
 pytestmark = pytest.mark.sdk
 BASE = "https://graph.microsoft.com/v1.0"
@@ -59,10 +61,19 @@ def test_msal_token_parlance_meeting_workflow(emulator_intercept: Any, emulator_
         if m.platform == "teams" and m.transcribed and m.recorded and m.happened and not m.cancelled
     )
     auth = delegated(world.person(source.organizer_id).email)
+    events = requests.get(
+        BASE + "/me/calendarView",
+        headers=auth,
+        params={"startDateTime": source.start.isoformat(), "endDateTime": source.end.isoformat()},
+        timeout=10,
+    )
+    assert events.status_code == 200, events.text
+    event = next(e for e in events.json()["value"] if e["subject"] == source.title)
+    assert event["onlineMeeting"]["joinUrl"] == common.join_web_url(world, source)
     lookup = requests.get(
         BASE + "/me/onlineMeetings",
         headers=auth,
-        params={"$filter": "JoinWebUrl eq '" + common.join_web_url(world, source) + "'"},
+        params={"$filter": "JoinWebUrl eq '" + event["onlineMeeting"]["joinUrl"] + "'"},
         timeout=10,
     )
     assert lookup.status_code == 200, lookup.text
@@ -95,3 +106,37 @@ def test_msal_application_sites_and_channel_export(
     messages = requests.get(BASE + f"/teams/{tid}/channels/getAllMessages?$top=1", headers=auth, timeout=10)
     assert messages.status_code == 200, messages.text
     assert messages.json()["value"][0]["from"]["user"]["userIdentityType"] == "aadUser"
+
+
+def test_msal_teams_archiver_reply_delta_and_hosted_image(emulator_intercept: Any) -> None:
+    auth = delegated("maya.chen@halcyonadvisory.example")
+    teams = requests.get(BASE + "/me/joinedTeams", headers=auth, timeout=10).json()["value"]
+    channel = requests.get(BASE + f"/teams/{teams[0]['id']}/primaryChannel", headers=auth, timeout=10).json()
+    path = BASE + f"/teams/{teams[0]['id']}/channels/{channel['id']}/messages"
+    delta = requests.get(path + "/delta?token=latest", headers=auth, timeout=10).json()
+    parent = requests.post(path, headers=auth, json={"body": {"content": "SDK archiver"}}, timeout=10)
+    assert parent.status_code == 201, parent.text
+    image = make_png()
+    reply_path = path + f"/{parent.json()['id']}/replies"
+    reply = requests.post(
+        reply_path,
+        headers=auth,
+        json={
+            "body": {"contentType": "html", "content": '<img src="../hostedContents/1/$value">'},
+            "hostedContents": [
+                {
+                    "@microsoft.graph.temporaryId": "1",
+                    "contentType": "image/png",
+                    "contentBytes": base64.b64encode(image).decode(),
+                }
+            ],
+        },
+        timeout=10,
+    )
+    assert reply.status_code == 201, reply.text
+    contents_path = reply_path + f"/{reply.json()['id']}/hostedContents"
+    contents = requests.get(contents_path, headers=auth, timeout=10).json()["value"]
+    downloaded = requests.get(contents_path + f"/{contents[0]['id']}/$value", headers=auth, timeout=10)
+    assert downloaded.content == image
+    changed = requests.get(delta["@odata.deltaLink"], headers=auth, timeout=10).json()
+    assert {m["id"] for m in changed["value"]} == {parent.json()["id"], reply.json()["id"]}
