@@ -12,7 +12,18 @@ from emulators.core.middleware import FaultRule
 from emulators.core.provider import Provider, ProviderContext
 from emulators.providers.zoom import common
 
-MODULES = ("seed", "oauth")
+MODULES = (
+    "seed",  # world -> users, groups, meetings, past instances, recordings
+    "oauth",  # zoom.us/oauth: authorize, token, revoke; mint_token and register_app actions
+    "webhooks",  # configure_webhook / remove_webhook actions, signed event delivery
+    "summary",  # AI Companion meeting summaries (before meetings: /meetings/meeting_summaries)
+    "users",  # users, groups, settings
+    "meetings",  # scheduled meetings, invitation, registrants
+    "past",  # past meetings, report API, dashboard metrics
+    "recordings",  # cloud recordings API
+    "downloads",  # /rec/download redirect, ssrweb streaming, play/share/join pages
+    "simulate",  # start/join/leave/end meeting and replay_event actions
+)
 
 
 def _modules() -> list[Any]:
@@ -57,6 +68,17 @@ class ZoomProvider(Provider):
         for module in _modules():
             if hasattr(module, "register"):
                 module.register(app, ctx)
+
+    def info(self, ctx: ProviderContext) -> dict[str, Any]:
+        data = super().info(ctx)
+        owner = common.owner_person(ctx.world)
+        data["account_id"] = ctx.world.org.zoom_account_id
+        data["account_owner"] = owner.email
+        data["webhook_endpoints"] = [
+            {"id": e["id"], "url": e["url"], "events": e["events"]}
+            for e in ctx.store.collection("webhook_endpoints")
+        ]
+        return data
 
     def error_body(self, status: int, code: str, message: str) -> Any:
         return common.generic_error_body(status, message)

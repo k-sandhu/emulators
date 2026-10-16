@@ -6,17 +6,17 @@ from typing import Any
 
 from emulators.core.provider import ProviderContext
 from emulators.providers.zoom.common import (
+    E_NOT_HOST,
     Principal,
     decode_path_key,
     is_meeting_id,
     meeting_missing,
     no_permission,
     owner_person,
+    recording_missing,
     user_missing,
     zoom_error,
     zoom_user_id,
-    E_NOT_HOST,
-    E_RECORDING_MISSING,
 )
 
 Record = dict[str, Any]
@@ -96,7 +96,9 @@ def meeting_by_uuid(ctx: ProviderContext, uuid: str) -> Record | None:
     return None
 
 
-def can_see_meeting(ctx: ProviderContext, principal: Principal, admin_level: bool, meeting: Record, *, write: bool) -> bool:
+def can_see_meeting(
+    ctx: ProviderContext, principal: Principal, admin_level: bool, meeting: Record, *, write: bool
+) -> bool:
     if admin_level:
         return True
     person = principal.person
@@ -122,15 +124,17 @@ def instances_of(ctx: ProviderContext, meeting_id: int) -> list[Record]:
     return sorted(found, key=lambda i: i["start_time"])
 
 
-def find_instance(ctx: ProviderContext, raw_key: str) -> Record:
+def find_instance(ctx: ProviderContext, raw_key: str, *, ended_only: bool = False) -> Record:
     """A meeting instance by UUID (single or double URL-encoded) or, as Zoom allows, by meeting id
-    (the most recent instance)."""
+    (the most recent instance; ``ended_only`` skips one that is still running)."""
     key = decode_path_key(raw_key)
     inst = ctx.store.collection("instances").get(key)
     if inst is not None:
         return inst
     if is_meeting_id(key):
         found = instances_of(ctx, int(key.replace(" ", "")))
+        if ended_only:
+            found = [i for i in found if i.get("state") == "ended"]
         if found:
             return found[-1]
     raise meeting_missing(key)
@@ -145,7 +149,7 @@ def find_recording(ctx: ProviderContext, raw_key: str, *, include_trashed: bool 
         mine.sort(key=lambda r: r["start_time"])
         rec = next((r for r in reversed(mine) if include_trashed or not r["trashed"]), None)
     if rec is None or (rec["trashed"] and not include_trashed):
-        raise zoom_error(404, E_RECORDING_MISSING, "This recording does not exist.")
+        raise recording_missing()
     return rec
 
 
@@ -156,6 +160,8 @@ def can_see_recording(ctx: ProviderContext, principal: Principal, admin_level: b
     return person is not None and rec["host_id"] == zoom_user_id(ctx.world, person.id)
 
 
-def ensure_recording_access(ctx: ProviderContext, principal: Principal, admin_level: bool, rec: Record) -> None:
+def ensure_recording_access(
+    ctx: ProviderContext, principal: Principal, admin_level: bool, rec: Record
+) -> None:
     if not can_see_recording(ctx, principal, admin_level, rec):
         raise no_permission()

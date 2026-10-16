@@ -144,8 +144,11 @@ class EmulatorHub:
         self._seeded[name] = ctx.store.snapshot()
 
     def reset(self, name: str | None = None) -> None:
-        """Restore seeded state, clear journals, faults and webhook logs."""
+        """Restore seeded state and clear journals and faults. Resetting every provider also
+        resets the shared clock (a single-provider reset leaves it alone)."""
         with self._lock:
+            if name is None:
+                self.clock.reset()
             for provider_name in [name] if name else list(self.contexts):
                 ctx = self.contexts[provider_name]
                 ctx.store.restore(self._seeded[provider_name])

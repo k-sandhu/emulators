@@ -79,7 +79,9 @@ def issue_pair(
             client_id=client_id,
             user_id=user.id if user else None,
             scopes=scopes,
-            token=zoom_token(ctx, kind="refresh", uid=uid, client_id=client_id, ttl_s=int(REFRESH_TTL.total_seconds())),
+            token=zoom_token(
+                ctx, kind="refresh", uid=uid, client_id=client_id, ttl_s=int(REFRESH_TTL.total_seconds())
+            ),
             ttl=REFRESH_TTL,
         )
         extra["refresh"] = refresh.token
@@ -157,7 +159,8 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         state = q.get("state")
         if q.get("error") == "access_denied":
             return RedirectResponse(
-                redirect_with_params(redirect_uri, {"error": "access_denied", "state": state}), status_code=302
+                redirect_with_params(redirect_uri, {"error": "access_denied", "state": state}),
+                status_code=302,
             )
         hint = q.get("login_hint")
         person = resolve_person(ctx, hint)
@@ -165,7 +168,11 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
             return RedirectResponse(
                 redirect_with_params(
                     redirect_uri,
-                    {"error": "access_denied", "error_description": "The user does not exist.", "state": state},
+                    {
+                        "error": "access_denied",
+                        "error_description": "The user does not exist.",
+                        "state": state,
+                    },
                 ),
                 status_code=302,
             )
@@ -191,7 +198,9 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
             code_challenge=q.get("code_challenge"),
             code_challenge_method=q.get("code_challenge_method"),
         )
-        return RedirectResponse(redirect_with_params(redirect_uri, {"code": code.token, "state": state}), status_code=302)
+        return RedirectResponse(
+            redirect_with_params(redirect_uri, {"code": code.token, "state": state}), status_code=302
+        )
 
     @app.post("/oauth/token")
     async def token(request: Request) -> Response:
@@ -214,9 +223,7 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
                     code_verifier=params.get("code_verifier"),
                 )
                 user = resolve_person(ctx, grant.user_id)
-                body = issue_pair(
-                    ctx, client_id=client_id, user=user, scopes=grant.scopes, with_refresh=True
-                )
+                body = issue_pair(ctx, client_id=client_id, user=user, scopes=grant.scopes, with_refresh=True)
             elif grant_type == "refresh_token":
                 old = ctx.tokens.resolve(params.get("refresh_token"), "refresh")
                 if old is None or old.client_id != client_id:
@@ -274,9 +281,7 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
                 for record in ctx.store.collection("_grants"):
                     if record.get("extra", {}).get("refresh") == grant.token:
                         record["revoked"] = True
-        return Response(
-            json.dumps({"status": "success"}), media_type=JSON_TYPE, headers=NO_STORE
-        )
+        return Response(json.dumps({"status": "success"}), media_type=JSON_TYPE, headers=NO_STORE)
 
 
 # -- actions ------------------------------------------------------------------------------
@@ -308,7 +313,12 @@ def actions(provider: Provider) -> None:
             ttl=timedelta(seconds=ttl),
             token=zoom_token(ctx, kind="access", uid=uid, client_id=client_id, ttl_s=ttl),
         )
-        return {"access_token": grant.token, "token_type": "bearer", "expires_in": ttl, "scope": " ".join(scopes)}
+        return {
+            "access_token": grant.token,
+            "token_type": "bearer",
+            "expires_in": ttl,
+            "scope": " ".join(scopes),
+        }
 
     @provider.action("register_app")
     def register_app(ctx: ProviderContext, payload: dict[str, Any]) -> dict[str, Any]:

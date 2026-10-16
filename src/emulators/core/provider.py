@@ -51,6 +51,12 @@ class ProviderContext:
     world: World
     hub: EmulatorHub
     settings: dict[str, str] = field(default_factory=dict)
+    #: How the provider was last reached (set on every request): lets actions and
+    #: background work build absolute URLs without a request (see ``ctx_url_for_host``).
+    last_external_base: str | None = None
+    last_host_mode: bool = False
+    last_proto: str = "https"
+    last_port: str = ""
 
     @property
     def signing_key(self) -> SigningKey:
@@ -89,6 +95,30 @@ def url_for_host(request: Request, ctx: ProviderContext, real_host: str, path: s
         suffix = f":{port}" if port and not default_port else ""
         return f"{proto}://{real_host}{suffix}{path}"
     return external_base(request) + path
+
+
+def ctx_url_for_host(ctx: ProviderContext, real_host: str, path: str) -> str:
+    """``url_for_host`` without a request, based on how the provider was last reached."""
+    if not path.startswith("/"):
+        path = "/" + path
+    if ctx.last_host_mode or ctx.last_external_base is None:
+        default = (ctx.last_proto, ctx.last_port) in (
+            ("https", "443"),
+            ("http", "80"),
+            ("https", ""),
+            ("http", ""),
+        )
+        suffix = "" if default else f":{ctx.last_port}"
+        return f"{ctx.last_proto}://{real_host}{suffix}{path}"
+    return ctx.last_external_base.rstrip("/") + path
+
+
+def remember_request(ctx: ProviderContext, request: Request) -> None:
+    ctx.last_external_base = external_base(request)
+    ctx.last_host_mode = host_mode(request, ctx)
+    ctx.last_proto = request.headers.get("x-forwarded-proto") or request.url.scheme
+    host_header = request.headers.get("x-forwarded-host") or request.headers.get("host") or ""
+    ctx.last_port = host_header.split(":")[1] if ":" in host_header else ""
 
 
 class Provider:
@@ -173,7 +203,9 @@ class Provider:
             "credentials": self.credentials,
             "actions": sorted(self.actions),
             "collections": {
-                n: len(ctx.store.collection(n)) for n in ctx.store.names() if not n.startswith("_")
+                n: len(ctx.store.collection(n))
+                for n in ctx.store.names()
+                if not n.startswith("_") and len(ctx.store.collection(n))
             },
         }
 

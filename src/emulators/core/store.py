@@ -141,12 +141,17 @@ class Store:
             }
 
     def restore(self, snapshot: dict[str, Any]) -> None:
+        """Restore in place: existing ``Collection`` objects and the ``meta`` dict keep their
+        identity, so providers that cached ``store.collection(...)`` keep working after reset."""
         with self.lock:
-            self._collections = {
-                name: Collection(name, copy.deepcopy(items))
-                for name, items in snapshot["collections"].items()
-            }
-            self.meta = copy.deepcopy(snapshot["meta"])
+            saved = snapshot["collections"]
+            for name, collection in self._collections.items():
+                collection._items = copy.deepcopy(saved.get(name, {}))
+            for name, items in saved.items():
+                if name not in self._collections:
+                    self._collections[name] = Collection(name, copy.deepcopy(items))
+            self.meta.clear()
+            self.meta.update(copy.deepcopy(snapshot["meta"]))
 
     def dump(self, *, include: Iterable[str] | None = None) -> dict[str, list[Record]]:
         wanted = set(include) if include else None

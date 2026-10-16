@@ -22,7 +22,7 @@ import httpx
 from emulators.core.errors import EmulatorError
 from emulators.core.provider import Provider, ProviderContext
 from emulators.core.webhooks import hmac_sha256_hex
-from emulators.providers.zoom.common import now_ms, zoom_token, zoom_user_id
+from emulators.providers.zoom.common import now_ms, tracking_id, zoom_token, zoom_user_id
 from emulators.world.model import Person
 
 EVENT_NAMES = (
@@ -52,7 +52,9 @@ _ZOOM_URL = re.compile(r"https://((?:[a-z0-9-]+\.)*zoom\.us)")
 def issue_download_token(ctx: ProviderContext, uuid: str, ttl_s: int = DOWNLOAD_TOKEN_TTL_S) -> str:
     """A ``download_access_token`` / webhook ``download_token``: usable as Bearer or ``?access_token=``
     on that meeting's recording download URLs only."""
-    token = zoom_token(ctx, kind="download", uid=ctx.world.org.zoom_account_id, client_id="zoom-download", ttl_s=ttl_s)
+    token = zoom_token(
+        ctx, kind="download", uid=ctx.world.org.zoom_account_id, client_id="zoom-download", ttl_s=ttl_s
+    )
     ctx.tokens.issue(
         "download",
         client_id="zoom-download",
@@ -112,7 +114,15 @@ async def emit(
         record = await ctx.webhooks.deliver(
             endpoint["url"],
             raw,
-            headers={"user-agent": "Zoom Marketplace/1.0a"},
+            headers={
+                "user-agent": "Zoom Marketplace/1.0a",
+                "x-zm-trackingid": tracking_id(),
+                **(
+                    {"authorization": endpoint["verification_token"]}
+                    if endpoint.get("verification_token")
+                    else {}
+                ),
+            },
             event_type=event,
             content_type="application/json; charset=utf-8",
             metadata={"endpoint_id": endpoint["id"]},
@@ -148,7 +158,11 @@ async def validate_endpoint(ctx: ProviderContext, url: str, secret: str) -> None
     expected = hmac_sha256_hex(secret, plain)
     if response.status_code != 200 or not isinstance(answer, dict):
         raise EmulatorError(
-            400, {"error": "endpoint_validation_failed", "detail": f"endpoint answered HTTP {response.status_code}"}
+            400,
+            {
+                "error": "endpoint_validation_failed",
+                "detail": f"endpoint answered HTTP {response.status_code}",
+            },
         )
     if answer.get("plainToken") != plain or answer.get("encryptedToken") != expected:
         raise EmulatorError(
@@ -163,7 +177,7 @@ async def validate_endpoint(ctx: ProviderContext, url: str, secret: str) -> None
 def actions(provider: Provider) -> None:
     @provider.action("configure_webhook")
     async def configure_webhook(ctx: ProviderContext, payload: dict[str, Any]) -> dict[str, Any]:
-        """Subscribe an endpoint: ``{url, secret_token, events?, skip_validation?}``.
+        """Subscribe an endpoint: ``{url, secret_token, events?, skip_validation?, verification_token?}``.
 
         Runs Zoom's ``endpoint.url_validation`` handshake first (the endpoint must answer
         ``{plainToken, encryptedToken}``) and refuses to save the subscription if it fails.
@@ -188,6 +202,8 @@ def actions(provider: Provider) -> None:
             "events": list(events),
             "validated": not payload.get("skip_validation"),
         }
+        if payload.get("verification_token"):  # legacy: sent verbatim in the Authorization header
+            record["verification_token"] = str(payload["verification_token"])
         ctx.store.collection(ENDPOINTS).put(record)
         return {**record, "events": list(EVENT_NAMES) if "*" in events else record["events"]}
 

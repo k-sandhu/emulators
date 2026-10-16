@@ -24,7 +24,7 @@ from emulators.providers.zoom.common import (
     owner_person,
     zoom_user_id,
 )
-from emulators.world.model import Meeting, Participation, World
+from emulators.world.model import Meeting, Participation, Person, World
 
 BASIC_USER_MODULUS = 9
 ZOOM_GROUP_KINDS = ("department", "role", "all_staff")
@@ -48,7 +48,14 @@ def seed_groups(ctx: ProviderContext) -> None:
         if group.kind not in ZOOM_GROUP_KINDS:
             continue
         member_ids = [zoom_user_id(world, pid) for pid in group.member_ids if world.person(pid).active]
-        groups.put({"id": b64_22(world, "group", group.id), "name": group.name, "_member_ids": member_ids, "_world_id": group.id})
+        groups.put(
+            {
+                "id": b64_22(world, "group", group.id),
+                "name": group.name,
+                "_member_ids": member_ids,
+                "_world_id": group.id,
+            }
+        )
 
 
 def seed_users(ctx: ProviderContext) -> None:
@@ -63,12 +70,18 @@ def seed_users(ctx: ProviderContext) -> None:
     for person in world.employees:
         role_id = "0" if person.id == owner.id else ("1" if person.is_admin else "2")
         basic = (
-            role_id == "2" and person.id not in hosts and number(world, "basic", person.id, digits=6) % BASIC_USER_MODULUS == 0
+            role_id == "2"
+            and person.id not in hosts
+            and number(world, "basic", person.id, digits=6) % BASIC_USER_MODULUS == 0
         )
         zid = zoom_user_id(world, person.id)
         users.put(
             shapes.user_record(
-                world, person, role_id=role_id, user_type=1 if basic else 2, group_ids=memberships.get(zid, [])
+                world,
+                person,
+                role_id=role_id,
+                user_type=1 if basic else 2,
+                group_ids=memberships.get(zid, []),
             )
         )
 
@@ -184,7 +197,12 @@ def _recurrence_for(first: Meeting, group: list[Meeting]) -> dict[str, Any]:
     last = group[-1].start
     zdow = shapes.zoom_weekday(local.date())
     if first.recurrence == "monthly":
-        return {"type": 3, "repeat_interval": 1, "monthly_day": local.day, "end_date_time": isoformat_z(last + timedelta(hours=1))}
+        return {
+            "type": 3,
+            "repeat_interval": 1,
+            "monthly_day": local.day,
+            "end_date_time": isoformat_z(last + timedelta(hours=1)),
+        }
     interval = 2 if first.recurrence == "biweekly" else 1
     return {
         "type": 2,
@@ -194,7 +212,9 @@ def _recurrence_for(first: Meeting, group: list[Meeting]) -> dict[str, Any]:
     }
 
 
-def participant_rows(ctx: ProviderContext, uuid: str, parts: tuple[Participation, ...]) -> list[dict[str, Any]]:
+def participant_rows(
+    ctx: ProviderContext, uuid: str, parts: tuple[Participation, ...]
+) -> list[dict[str, Any]]:
     world = ctx.world
     guest_emails = (ctx.setting("guest_emails", "") or "").lower() in ("1", "true", "yes")
     rows = []

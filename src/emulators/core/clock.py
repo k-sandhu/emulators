@@ -35,6 +35,7 @@ class Clock:
         self._lock = threading.Lock()
         self._offset = timedelta(0)
         self._frozen: datetime | None = utc(frozen_at) if frozen_at else None
+        self._initial_frozen = self._frozen
 
     def now(self) -> datetime:
         with self._lock:
@@ -64,6 +65,13 @@ class Clock:
             if self._frozen is not None:
                 self._offset = self._frozen - datetime.now(UTC)
             self._frozen = None
+        return self.now()
+
+    def reset(self) -> datetime:
+        """Back to the state the clock was created in (live, or frozen at the initial instant)."""
+        with self._lock:
+            self._offset = timedelta(0)
+            self._frozen = self._initial_frozen
         return self.now()
 
     @property

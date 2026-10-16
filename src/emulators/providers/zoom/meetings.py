@@ -15,6 +15,7 @@ from emulators.providers.zoom import lookup, shapes, simulate
 from emulators.providers.zoom import webhooks as hooks
 from emulators.providers.zoom.common import (
     E_MEETING_MISSING,
+    LiveCollection,
     Need,
     Principal,
     authenticate,
@@ -26,6 +27,7 @@ from emulators.providers.zoom.common import (
     respond,
     runtime_b64_22,
     runtime_uuid,
+    user_missing,
     zoom_error,
 )
 from emulators.providers.zoom.timeutil import parse_instant, valid_timezone
@@ -45,7 +47,17 @@ MEETING_TYPES = (1, 2, 3, 8)
 LIST_TYPES = ("scheduled", "live", "upcoming", "upcoming_meetings", "previous_meetings")
 AUDIO_OPTIONS = ("both", "telephony", "voip", "thirdParty")
 PASSWORD_RE = re.compile(r"^[A-Za-z0-9@\-_*]{1,10}$")
-EDITABLE = ("topic", "agenda", "duration", "timezone", "start_time", "recurrence", "settings", "password", "type")
+EDITABLE = (
+    "topic",
+    "agenda",
+    "duration",
+    "timezone",
+    "start_time",
+    "recurrence",
+    "settings",
+    "password",
+    "type",
+)
 
 
 def operator_of(principal: Principal) -> Person | None:
@@ -134,14 +146,16 @@ def matches_type(meeting: dict[str, Any], list_type: str) -> bool:
     if list_type == "live":
         return meeting.get("status") == "started"
     if list_type in ("upcoming", "upcoming_meetings"):
-        return meeting.get("status") == "started" or bool(upcoming_occurrences(meeting)) or meeting["type"] == 3
+        return (
+            meeting.get("status") == "started" or bool(upcoming_occurrences(meeting)) or meeting["type"] == 3
+        )
     if list_type == "previous_meetings":
         return any(o.get("_happened") for o in meeting.get("occurrences", []))
     return True
 
 
 def register(app: FastAPI, ctx: ProviderContext) -> None:
-    meetings = ctx.store.collection("meetings")
+    meetings = LiveCollection(ctx, "meetings")
     world = ctx.world
 
     def new_meeting_id() -> int:
@@ -169,7 +183,9 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
             if q.get("from"):
                 lo = parse_instant(q["from"], "UTC")
             if q.get("to"):
-                hi = parse_instant(q["to"], "UTC") + (timedelta(days=1) if len(q["to"]) == 10 else timedelta())
+                hi = parse_instant(q["to"], "UTC") + (
+                    timedelta(days=1) if len(q["to"]) == 10 else timedelta()
+                )
         except ValueError:
             raise invalid_field("from") from None
         rows = []
@@ -226,9 +242,18 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         principal = authenticate(ctx, request)
         admin = principal.authorize(CREATE_MEETING)
         host = lookup.acting_user(ctx, principal, user_id, admin_level=admin)
-        if host["type"] == 1 and host["status"] != "active":
-            raise no_permission()
         data = await json_body(request)
+        if data.get("schedule_for"):
+            target = lookup.find_user(ctx, str(data["schedule_for"]))
+            if target is None:
+                raise user_missing(str(data["schedule_for"]))
+            if target["id"] != host["id"] and not admin:
+                raise no_permission()
+            host = target
+        if host["status"] != "active":
+            raise zoom_error(
+                400, 3161, "Your user account is not allowed meeting hosting and scheduling capabilities."
+            )
         check_common(data, creating=True)
         incoming = validate_settings(data)
         kind = data.get("type", 2)
@@ -241,7 +266,9 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         duration = data.get("duration", 60)
         recurrence = data.get("recurrence")
         if kind == 8 and not recurrence:
-            raise invalid_field("recurrence", "Recurrence is required for a recurring meeting with fixed time.")
+            raise invalid_field(
+                "recurrence", "Recurrence is required for a recurring meeting with fixed time."
+            )
         mid = new_meeting_id()
         password = str(data.get("password") or shapes.numeric_password(world, mid, ctx.ids.hex(8)))
         enc = shapes.encrypted_password(world, mid, password)
@@ -274,6 +301,8 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         if kind == 8:
             record["recurrence"] = recurrence
             record["occurrences"] = shapes.expand_occurrences(start, tz_name, recurrence, duration)
+            if record["occurrences"]:  # the series starts at its first real occurrence
+                record["start_time"] = record["occurrences"][0]["start_time"]
             for occ in record["occurrences"]:
                 occ["_uuid"] = uuid if occ is record["occurrences"][0] else runtime_uuid(ctx)
         elif kind == 3:
@@ -292,7 +321,12 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         await hooks.emit(
             ctx,
             "meeting.created",
-            {**shapes.meeting_payload(record), "join_url": record["join_url"], "password": password, "settings": record["settings"]},
+            {
+                **shapes.meeting_payload(record),
+                "join_url": record["join_url"],
+                "password": password,
+                "settings": record["settings"],
+            },
             operator=operator_of(principal),
         )
         return respond(request, ctx, shapes.meeting_detail(record), status=201)
@@ -306,8 +340,12 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         meeting = lookup.find_meeting(ctx, meeting_id)
         lookup.ensure_meeting_access(ctx, principal, admin, meeting)
         occurrence_id = request.query_params.get("occurrence_id")
-        if occurrence_id and not any(o["occurrence_id"] == occurrence_id for o in meeting.get("occurrences", [])):
-            raise zoom_error(404, E_MEETING_MISSING, f"Meeting ID {meeting_id} occurrence {occurrence_id} does not exist.")
+        if occurrence_id and not any(
+            o["occurrence_id"] == occurrence_id for o in meeting.get("occurrences", [])
+        ):
+            raise zoom_error(
+                404, E_MEETING_MISSING, f"Meeting ID {meeting_id} occurrence {occurrence_id} does not exist."
+            )
         return host_view(
             request,
             meeting,
@@ -342,9 +380,15 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         old: dict[str, Any] = {}
         new: dict[str, Any] = {}
         if occurrence_id:
-            occ = next((o for o in meeting.get("occurrences", []) if o["occurrence_id"] == occurrence_id), None)
+            occ = next(
+                (o for o in meeting.get("occurrences", []) if o["occurrence_id"] == occurrence_id), None
+            )
             if occ is None:
-                raise zoom_error(404, E_MEETING_MISSING, f"Meeting ID {meeting_id} occurrence {occurrence_id} does not exist.")
+                raise zoom_error(
+                    404,
+                    E_MEETING_MISSING,
+                    f"Meeting ID {meeting_id} occurrence {occurrence_id} does not exist.",
+                )
             if "start_time" in data:
                 old["start_time"] = occ["start_time"]
                 occ["start_time"] = isoformat_z(parse_start(data, meeting["timezone"]))
@@ -353,7 +397,12 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
                 old["duration"] = occ["duration"]
                 occ["duration"] = new["duration"] = data["duration"]
         else:
-            if meeting["type"] == 8 and "type" in data and data["type"] != 8 and data.get("recurrence") is None:
+            if (
+                meeting["type"] == 8
+                and "type" in data
+                and data["type"] != 8
+                and data.get("recurrence") is None
+            ):
                 raise invalid_field("type")
             for key in ("topic", "agenda", "duration", "timezone"):
                 if key in data:
@@ -369,8 +418,12 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
                 if meeting["type"] != 8:
                     meeting["type"] = 8
             if "password" in data:
-                meeting["password"] = meeting["h323_password"] = meeting["pstn_password"] = str(data["password"])
-                meeting["encrypted_password"] = shapes.encrypted_password(world, meeting["id"], data["password"])
+                meeting["password"] = meeting["h323_password"] = meeting["pstn_password"] = str(
+                    data["password"]
+                )
+                meeting["encrypted_password"] = shapes.encrypted_password(
+                    world, meeting["id"], data["password"]
+                )
                 meeting["join_url"] = shapes.join_url(meeting["id"], meeting["encrypted_password"])
             if incoming:
                 old["settings"] = copy.deepcopy(meeting["settings"])
@@ -387,7 +440,9 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
                         if not occ.get("_happened"):
                             occ["start_time"] = meeting.get("start_time", occ["start_time"])
                             occ["duration"] = meeting.get("duration", occ["duration"])
-                            occ["occurrence_id"] = str(int(parse_instant(occ["start_time"]).timestamp() * 1000))
+                            occ["occurrence_id"] = str(
+                                int(parse_instant(occ["start_time"]).timestamp() * 1000)
+                            )
         if new:
             await hooks.emit(
                 ctx,
@@ -395,7 +450,12 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
                 {"id": meeting["id"], "uuid": meeting["uuid"], "host_id": meeting["host_id"], **new},
                 operator=operator_of(principal),
                 payload_extra={
-                    "old_object": {"id": meeting["id"], "uuid": meeting["uuid"], "host_id": meeting["host_id"], **old},
+                    "old_object": {
+                        "id": meeting["id"],
+                        "uuid": meeting["uuid"],
+                        "host_id": meeting["host_id"],
+                        **old,
+                    },
                     "time_stamp": ctx.clock.timestamp() * 1000,
                     **({"scope": "single"} if occurrence_id else {}),
                 },
@@ -414,15 +474,25 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
             raise zoom_error(400, 3000, "Cannot delete a meeting that is in progress.")
         occurrence_id = request.query_params.get("occurrence_id")
         if occurrence_id:
-            occ = next((o for o in meeting.get("occurrences", []) if o["occurrence_id"] == occurrence_id), None)
+            occ = next(
+                (o for o in meeting.get("occurrences", []) if o["occurrence_id"] == occurrence_id), None
+            )
             if occ is None:
-                raise zoom_error(404, E_MEETING_MISSING, f"Meeting ID {meeting_id} occurrence {occurrence_id} does not exist.")
+                raise zoom_error(
+                    404,
+                    E_MEETING_MISSING,
+                    f"Meeting ID {meeting_id} occurrence {occurrence_id} does not exist.",
+                )
             occ["status"] = "deleted"
             extra = {"scope": "single", "time_stamp": ctx.clock.timestamp() * 1000}
             await hooks.emit(
                 ctx,
                 "meeting.deleted",
-                {**shapes.meeting_payload(meeting), "start_time": occ["start_time"], "occurrence_id": occurrence_id},
+                {
+                    **shapes.meeting_payload(meeting),
+                    "start_time": occ["start_time"],
+                    "occurrence_id": occurrence_id,
+                },
                 operator=operator_of(principal),
                 payload_extra=extra,
             )
@@ -459,7 +529,10 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         if meeting.get("status") != "started":
             raise zoom_error(400, 3002, f"Meeting {meeting_id} is not in progress.")
         await simulate.end_meeting(
-            ctx, meeting, record=meeting["settings"].get("auto_recording") == "cloud", operator=operator_of(principal)
+            ctx,
+            meeting,
+            record=meeting["settings"].get("auto_recording") == "cloud",
+            operator=operator_of(principal),
         )
         return Response(status_code=204)
 
@@ -470,7 +543,9 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
 
     def require_registration(meeting: dict[str, Any]) -> None:
         if meeting["settings"].get("approval_type", 2) == 2:
-            raise zoom_error(400, 3000, f"Registration has not been enabled for this meeting: {meeting['id']}.")
+            raise zoom_error(
+                400, 3000, f"Registration has not been enabled for this meeting: {meeting['id']}."
+            )
 
     @app.get("/v2/meetings/{meeting_id}/registrants")
     async def list_registrants(request: Request, meeting_id: str) -> Response:
@@ -509,7 +584,24 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
                 "email": email,
                 "first_name": data["first_name"],
                 "last_name": data.get("last_name", ""),
-                **{k: data.get(k, "") for k in ("address", "city", "country", "zip", "state", "phone", "industry", "org", "job_title", "purchasing_time_frame", "role_in_purchase_process", "no_of_employees", "comments")},
+                **{
+                    k: data.get(k, "")
+                    for k in (
+                        "address",
+                        "city",
+                        "country",
+                        "zip",
+                        "state",
+                        "phone",
+                        "industry",
+                        "org",
+                        "job_title",
+                        "purchasing_time_frame",
+                        "role_in_purchase_process",
+                        "no_of_employees",
+                        "comments",
+                    )
+                },
                 "custom_questions": data.get("custom_questions", []),
                 "status": "approved" if auto else "pending",
                 "create_time": isoformat_z(ctx.clock.now()),
@@ -545,7 +637,9 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
                 (r for r in known.values() if r["email"].lower() == str(entry.get("email", "")).lower()), None
             )
             if reg is None:
-                raise zoom_error(404, 3043, f"Registrant does not exist: {entry.get('id') or entry.get('email')}.")
+                raise zoom_error(
+                    404, 3043, f"Registrant does not exist: {entry.get('id') or entry.get('email')}."
+                )
             reg["status"] = mapping[action]
         return Response(status_code=204)
 

@@ -34,7 +34,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from emulators.core.errors import EmulatorError
 from emulators.core.middleware import EmulatorMiddleware, FaultRule
-from emulators.core.provider import ProviderContext
+from emulators.core.provider import ProviderContext, remember_request
 
 
 def _render_error(exc: EmulatorError) -> Response:
@@ -89,6 +89,11 @@ def build_provider_app(ctx: ProviderContext) -> Any:
             **(getattr(exc, "headers", None) or {}),
         }
         return JSONResponse(body, status_code=exc.status_code, headers=headers)
+
+    @app.middleware("http")
+    async def _remember(request: Request, call_next: Any) -> Response:
+        remember_request(ctx, request)
+        return await call_next(request)
 
     app.include_router(admin_router(ctx))
     provider.build(app, ctx)

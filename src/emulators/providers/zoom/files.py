@@ -48,7 +48,7 @@ def clock_text(seconds: float, *, millis: bool = False) -> str:
     h, rest = divmod(int(total), 3600)
     m, s = divmod(rest, 60)
     text = f"{h:02d}:{m:02d}:{s:02d}"
-    return f"{text}.{int(round((total - int(total)) * 1000)):03d}" if millis else text
+    return f"{text}.{round((total - int(total)) * 1000):03d}" if millis else text
 
 
 def make_cues(turns: list[tuple[float, str, str]]) -> list[media.Cue]:
@@ -56,7 +56,9 @@ def make_cues(turns: list[tuple[float, str, str]]) -> list[media.Cue]:
     cues: list[media.Cue] = []
     cursor = 0.0
     for start_s, speaker, text in turns:
-        for cue in media.build_cues([(speaker, text)], start_offset_s=max(start_s, cursor), gap_s=0.0, max_cue_s=7.0):
+        for cue in media.build_cues(
+            [(speaker, text)], start_offset_s=max(start_s, cursor), gap_s=0.0, max_cue_s=7.0
+        ):
             cues.append(cue)
             cursor = cue.end_s
     return cues
@@ -86,7 +88,8 @@ def vtt_bytes(instance: dict[str, Any]) -> bytes:
 def chat_bytes(instance: dict[str, Any]) -> bytes:
     """Zoom's ``meeting_saved_chat.txt``: one tab-separated line per message."""
     lines = [
-        f"{clock_text(m['offset_s'])}\t From  {m['name']} to  Everyone:\t{m['text']}" for m in instance["chat"]
+        f"{clock_text(m['offset_s'])}\t From  {m['name']} to  Everyone:\t{m['text']}"
+        for m in instance["chat"]
     ]
     return ("\n".join(lines) + "\n").encode("utf-8")
 
@@ -218,9 +221,7 @@ def refresh_totals(record: dict[str, Any]) -> None:
 
 def recording_wire(record: dict[str, Any], *, trash_view: bool = False) -> dict[str, Any]:
     """The meeting-recordings object returned by the list and get endpoints."""
-    files = (
-        [f for f in record["recording_files"] if f.get("_trashed")] if trash_view else live_files(record)
-    )
+    files = [f for f in record["recording_files"] if f.get("_trashed")] if trash_view else live_files(record)
     wire_files = []
     for f in files:
         entry = {k: v for k, v in f.items() if not k.startswith("_")}

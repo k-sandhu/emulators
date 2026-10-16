@@ -36,7 +36,13 @@ CLIENT_VERSIONS = (
     "6.0.2.30157(mac)",
 )
 DIAL_IN = (
-    {"country_name": "US", "city": "Washington DC", "number": "+1 301 715 8592", "type": "toll", "country": "US"},
+    {
+        "country_name": "US",
+        "city": "Washington DC",
+        "number": "+1 301 715 8592",
+        "type": "toll",
+        "country": "US",
+    },
     {"country_name": "US", "city": "New York", "number": "+1 646 931 3860", "type": "toll", "country": "US"},
     {"country_name": "US", "city": "Chicago", "number": "+1 312 626 6799", "type": "toll", "country": "US"},
 )
@@ -93,7 +99,14 @@ def start_url(world: World, meeting_id: int, host_id: str) -> str:
 
 def zak_token(world: World, meeting_id: int, host_id: str) -> str:
     header = {"zm_sks": b64url(digest(world, "zak", meeting_id)[:12]), "alg": "HS256"}
-    payload = {"iss": "web", "clt": 0, "mnum": str(meeting_id), "aud": "client", "uid": host_id, "exp": 4102444800}
+    payload = {
+        "iss": "web",
+        "clt": 0,
+        "mnum": str(meeting_id),
+        "aud": "client",
+        "uid": host_id,
+        "exp": 4102444800,
+    }
     sig = b64url(digest(world, "zaks", meeting_id, host_id))
     enc = lambda v: b64url(json.dumps(v, separators=(",", ":")).encode())  # noqa: E731
     return f"{enc(header)}.{enc(payload)}.{sig}"
@@ -107,7 +120,9 @@ def share_token(world: World, kind: str, *parts: object, length: int = 64) -> st
 # -- users --------------------------------------------------------------------------------
 
 
-def user_record(world: World, person: Person, *, role_id: str, user_type: int, group_ids: list[str]) -> dict[str, Any]:
+def user_record(
+    world: World, person: Person, *, role_id: str, user_type: int, group_ids: list[str]
+) -> dict[str, Any]:
     zid = zoom_user_id(world, person.id)
     office = world.office(person.office_id) if person.office_id else None
     dept = world.department(person.department_id).name if person.department_id else ""
@@ -116,9 +131,11 @@ def user_record(world: World, person: Person, *, role_id: str, user_type: int, g
         last_login = world.anchor - timedelta(hours=1 + seed_n % (6 * 24))
     else:
         last_login = world.anchor - timedelta(days=30 + seed_n % 40)
-    created = datetime(
-        person.hire_date.year, person.hire_date.month, person.hire_date.day, 9, 0, 0, tzinfo=UTC
-    ) if person.hire_date else datetime(2020, 1, 6, 9, tzinfo=UTC)
+    created = (
+        datetime(person.hire_date.year, person.hire_date.month, person.hire_date.day, 9, 0, 0, tzinfo=UTC)
+        if person.hire_date
+        else datetime(2020, 1, 6, 9, tzinfo=UTC)
+    )
     pmi = number(world, "pmi", person.id, digits=10)
     pwd = encrypted_password(world, "pmi", person.id)
     manager = world.person(person.manager_id).email if person.manager_id else ""
@@ -166,16 +183,66 @@ def user_record(world: World, person: Person, *, role_id: str, user_type: int, g
     }
 
 
-LIST_USER_KEYS = (
-    "id first_name last_name display_name email type pmi timezone verified dept created_at last_login_time "
-    "last_client_version pic_url language phone_number status role_id employee_unique_id user_created_at group_ids"
-).split()
-FULL_USER_KEYS = (
-    "id first_name last_name display_name email type role_name pmi use_pmi personal_meeting_url timezone verified "
-    "dept created_at last_login_time last_client_version pic_url cms_user_id jid group_ids language "
-    "phone_country phone_number status job_title cost_center company location login_types role_id account_id "
-    "account_number cluster user_created_at employee_unique_id"
-).split()
+LIST_USER_KEYS = [
+    "id",
+    "first_name",
+    "last_name",
+    "display_name",
+    "email",
+    "type",
+    "pmi",
+    "timezone",
+    "verified",
+    "dept",
+    "created_at",
+    "last_login_time",
+    "last_client_version",
+    "pic_url",
+    "language",
+    "phone_number",
+    "status",
+    "role_id",
+    "employee_unique_id",
+    "user_created_at",
+    "group_ids",
+]
+FULL_USER_KEYS = [
+    "id",
+    "first_name",
+    "last_name",
+    "display_name",
+    "email",
+    "type",
+    "role_name",
+    "pmi",
+    "use_pmi",
+    "personal_meeting_url",
+    "timezone",
+    "verified",
+    "dept",
+    "created_at",
+    "last_login_time",
+    "last_client_version",
+    "pic_url",
+    "cms_user_id",
+    "jid",
+    "group_ids",
+    "language",
+    "phone_country",
+    "phone_number",
+    "status",
+    "job_title",
+    "cost_center",
+    "company",
+    "location",
+    "login_types",
+    "role_id",
+    "account_id",
+    "account_number",
+    "cluster",
+    "user_created_at",
+    "employee_unique_id",
+]
 
 
 def user_list_item(rec: dict[str, Any], include_fields: set[str]) -> dict[str, Any]:
@@ -265,7 +332,11 @@ def user_settings(rec: dict[str, Any]) -> dict[str, Any]:
             "auto_delete_cmr_days": 30,
             "ip_address_access_control": {"enable": False},
         },
-        "telephony": {"third_party_audio": False, "audio_conference_info": "", "show_international_numbers_link": True},
+        "telephony": {
+            "third_party_audio": False,
+            "audio_conference_info": "",
+            "show_international_numbers_link": True,
+        },
         "feature": {"meeting_capacity": 100, "large_meeting": False, "webinar": False, "zoom_phone": False},
         "tsp": {"call_out": False, "call_out_countries": [], "show_international_numbers_link": True},
     }
@@ -334,11 +405,26 @@ def default_settings(**overrides: Any) -> dict[str, Any]:
 
 
 VALID_AUTO_RECORDING = ("local", "cloud", "none")
-SETTINGS_BOOL_KEYS = (
-    "host_video participant_video cn_meeting in_meeting join_before_host mute_upon_entry watermark use_pmi "
-    "enforce_login waiting_room meeting_authentication registrants_confirmation_email private_meeting "
-    "allow_multiple_devices show_share_button email_notification internal_meeting focus_mode"
-).split()
+SETTINGS_BOOL_KEYS = [
+    "host_video",
+    "participant_video",
+    "cn_meeting",
+    "in_meeting",
+    "join_before_host",
+    "mute_upon_entry",
+    "watermark",
+    "use_pmi",
+    "enforce_login",
+    "waiting_room",
+    "meeting_authentication",
+    "registrants_confirmation_email",
+    "private_meeting",
+    "allow_multiple_devices",
+    "show_share_button",
+    "email_notification",
+    "internal_meeting",
+    "focus_mode",
+]
 
 
 def meeting_listing(rec: dict[str, Any], *, start_time: str | None = None) -> dict[str, Any]:
@@ -490,7 +576,9 @@ def expand_occurrences(
         while accept(day):
             day += timedelta(days=interval)
     elif kind == 2:
-        wanted = {int(x) for x in str(recurrence.get("weekly_days") or zoom_weekday(start_day)).split(",") if x}
+        wanted = {
+            int(x) for x in str(recurrence.get("weekly_days") or zoom_weekday(start_day)).split(",") if x
+        }
         week0 = start_day - timedelta(days=(start_day.weekday() + 1) % 7)  # Sunday of the start week
         day = start_day
         for _ in range(2000):
@@ -530,7 +618,9 @@ def invitation_text(rec: dict[str, Any], host_name: str) -> str:
     zone = _zone(rec["timezone"])
     meeting_id = str(rec["id"])
     spaced = " ".join(
-        [meeting_id[:3], meeting_id[3:7], meeting_id[7:]] if len(meeting_id) == 11 else [meeting_id[:3], meeting_id[3:6], meeting_id[6:]]
+        [meeting_id[:3], meeting_id[3:7], meeting_id[7:]]
+        if len(meeting_id) == 11
+        else [meeting_id[:3], meeting_id[3:6], meeting_id[6:]]
     )
     lines = [f"{host_name} is inviting you to a scheduled Zoom meeting.", "", f"Topic: {rec['topic']}"]
     if rec.get("start_time"):
@@ -542,7 +632,15 @@ def invitation_text(rec: dict[str, Any], host_name: str) -> str:
             lines.append(_recurrence_text(recurrence, start))
     else:
         lines.append("Time: This is a recurring meeting Meet anytime")
-    lines += ["", "Join Zoom Meeting", rec["join_url"], "", f"Meeting ID: {spaced}", f"Passcode: {rec['password']}", "---"]
+    lines += [
+        "",
+        "Join Zoom Meeting",
+        rec["join_url"],
+        "",
+        f"Meeting ID: {spaced}",
+        f"Passcode: {rec['password']}",
+        "---",
+    ]
     lines += ["One tap mobile"]
     for n in DIAL_IN:
         digits = n["number"].replace(" ", "").replace("+", "")
@@ -560,7 +658,9 @@ def _recurrence_text(recurrence: dict[str, Any], start: datetime) -> str:
     if kind == 1:
         return "Every day" if interval == 1 else f"Every {interval} days"
     if kind == 2:
-        days = ",".join(names[int(d)] for d in str(recurrence.get("weekly_days") or zoom_weekday(start.date())).split(","))
+        days = ",".join(
+            names[int(d)] for d in str(recurrence.get("weekly_days") or zoom_weekday(start.date())).split(",")
+        )
         return f"Every week on {days}" if interval == 1 else f"Every {interval} weeks on {days}"
     return f"Every month on day {recurrence.get('monthly_day') or start.day}"
 
@@ -568,9 +668,5 @@ def _recurrence_text(recurrence: dict[str, Any], start: datetime) -> str:
 def _zone(name: str) -> ZoneInfo:
     try:
         return ZoneInfo(name)
-    except Exception:  # noqa: BLE001 - unknown tz names behave as UTC
+    except Exception:
         return ZoneInfo("UTC")
-
-
-def b64_bytes(raw: bytes) -> str:
-    return base64.b64encode(raw).decode()

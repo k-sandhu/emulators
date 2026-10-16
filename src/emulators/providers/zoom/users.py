@@ -13,6 +13,7 @@ from emulators.providers.zoom import lookup, shapes
 from emulators.providers.zoom import webhooks as hooks
 from emulators.providers.zoom.common import (
     E_VALIDATION,
+    LiveCollection,
     Need,
     authenticate,
     invalid_field,
@@ -40,10 +41,26 @@ WRITE_GROUP = Need("group:write", "group:write:group", admin_only=True)
 GROUP_MEMBERS = Need("group:read", "group:read:list_group_members", admin_only=True)
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 USER_TYPES = (1, 2, 3, 99)
-PATCHABLE = (
-    "first_name last_name display_name type pmi timezone dept cost_center language company location job_title "
-    "phone_number host_key manager vanity_name use_pmi verified"
-).split()
+PATCHABLE = [
+    "first_name",
+    "last_name",
+    "display_name",
+    "type",
+    "pmi",
+    "timezone",
+    "dept",
+    "cost_center",
+    "language",
+    "company",
+    "location",
+    "job_title",
+    "phone_number",
+    "host_key",
+    "manager",
+    "vanity_name",
+    "use_pmi",
+    "verified",
+]
 
 
 def user_event(rec: dict[str, Any]) -> dict[str, Any]:
@@ -58,8 +75,8 @@ def user_event(rec: dict[str, Any]) -> dict[str, Any]:
 
 
 def register(app: FastAPI, ctx: ProviderContext) -> None:
-    users = ctx.store.collection("users")
-    groups = ctx.store.collection("groups")
+    users = LiveCollection(ctx, "users")
+    groups = LiveCollection(ctx, "groups")
 
     def operator(principal: Any) -> Any:
         return principal.person
@@ -198,9 +215,8 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
             if rec["id"] not in members:
                 members.append(rec["id"])
                 rec["group_ids"].append(data["group_id"])
-        if "first_name" in data or "last_name" in data:
-            if "display_name" not in data:
-                rec["display_name"] = f"{rec['first_name']} {rec['last_name']}".strip()
+        if ("first_name" in data or "last_name" in data) and "display_name" not in data:
+            rec["display_name"] = f"{rec['first_name']} {rec['last_name']}".strip()
         changed = {k: rec[k] for k in old}
         if changed:
             await hooks.emit(
@@ -208,7 +224,10 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
                 "user.updated",
                 {"id": rec["id"], **changed},
                 operator=operator(principal),
-                payload_extra={"old_object": {"id": rec["id"], **old}, "time_stamp": ctx.clock.timestamp() * 1000},
+                payload_extra={
+                    "old_object": {"id": rec["id"], **old},
+                    "time_stamp": ctx.clock.timestamp() * 1000,
+                },
             )
         return Response(status_code=204)
 
@@ -232,6 +251,31 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         await hooks.emit(ctx, "user.deleted", user_event(rec), operator=operator(principal))
         return Response(status_code=204)
 
+    @app.put("/v2/users/{user_id}/email")
+    async def change_email(request: Request, user_id: str) -> Response:
+        principal = authenticate(ctx, request)
+        admin = principal.authorize(WRITE_USER)
+        rec = lookup.acting_user(ctx, principal, user_id, admin_level=admin)
+        email = str((await json_body(request)).get("email", "")).strip()
+        if not EMAIL_RE.match(email):
+            raise invalid_field("email")
+        clash = lookup.find_user(ctx, email)
+        if clash is not None and clash["id"] != rec["id"]:
+            raise zoom_error(409, 1005, f"User already in the account: {email}")
+        old = rec["email"]
+        rec["email"] = email
+        await hooks.emit(
+            ctx,
+            "user.updated",
+            {"id": rec["id"], "email": email},
+            operator=operator(principal),
+            payload_extra={
+                "old_object": {"id": rec["id"], "email": old},
+                "time_stamp": ctx.clock.timestamp() * 1000,
+            },
+        )
+        return Response(status_code=204)
+
     @app.put("/v2/users/{user_id}/status")
     async def user_status(request: Request, user_id: str) -> Response:
         principal = authenticate(ctx, request)
@@ -247,7 +291,10 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         if action == "deactivate" and rec.get("_person_id"):
             ctx.tokens.revoke_user(rec["_person_id"])
         await hooks.emit(
-            ctx, f"user.{action}d", {"id": rec["id"], "email": rec["email"], "type": rec["type"]}, operator=operator(principal)
+            ctx,
+            f"user.{action}d",
+            {"id": rec["id"], "email": rec["email"], "type": rec["type"]},
+            operator=operator(principal),
         )
         return Response(status_code=204)
 
@@ -409,7 +456,9 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
                 group["_member_ids"].append(user["id"])
                 user["group_ids"].append(group_id)
             added.append(user["id"])
-        return respond(request, ctx, {"ids": ",".join(added), "added_at": isoformat_z(ctx.clock.now())}, status=201)
+        return respond(
+            request, ctx, {"ids": ",".join(added), "added_at": isoformat_z(ctx.clock.now())}, status=201
+        )
 
     @app.delete("/v2/groups/{group_id}/members/{member_id}")
     async def remove_group_member(request: Request, group_id: str, member_id: str) -> Response:

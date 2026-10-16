@@ -21,7 +21,6 @@ import math
 import re
 import secrets
 from dataclasses import dataclass
-from datetime import datetime
 from typing import Any
 from urllib.parse import unquote
 
@@ -30,7 +29,6 @@ from fastapi.responses import JSONResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from emulators.core.auth import Grant, bearer_token
-from emulators.core.clock import isoformat_z
 from emulators.core.errors import EmulatorError
 from emulators.core.ids import b64url, stable_hash
 from emulators.core.provider import ProviderContext, url_for_host
@@ -79,9 +77,7 @@ def zoom_error(
 
 
 def invalid_field(field: str, message: str = "Invalid field.") -> EmulatorError:
-    return zoom_error(
-        400, E_VALIDATION, "Validation Failed.", errors=[{"field": field, "message": message}]
-    )
+    return zoom_error(400, E_VALIDATION, "Validation Failed.", errors=[{"field": field, "message": message}])
 
 
 def invalid_param(name: str) -> EmulatorError:
@@ -228,10 +224,6 @@ def now_ms(ctx: ProviderContext) -> int:
     return int(ctx.clock.now().timestamp() * 1000)
 
 
-def iso(dt: datetime) -> str:
-    return isoformat_z(dt)
-
-
 # -- principals and scopes ----------------------------------------------------------------
 
 DEFAULT_SCOPES = (
@@ -253,6 +245,13 @@ class Need:
         base = [self.classic, self.granular]
         admin = [f"{n}:admin" for n in base]
         return admin if self.admin_only else [*base, *admin]
+
+    def hint(self, *, granular: bool) -> list[str]:
+        """The scope names Zoom lists in a 4700 error: an app uses one dialect or the other."""
+        base = self.granular if granular else self.classic
+        if self.admin_only:
+            return [f"{base}:admin"]
+        return [base, f"{base}:admin"] if granular else [base]
 
 
 @dataclass
@@ -283,10 +282,11 @@ class Principal:
             return self.is_account_admin
         acceptable = need.names()
         if not any(name in self.scopes for name in acceptable):
+            granular = any(sc.removesuffix(":admin").count(":") >= 2 for sc in self.scopes)
             raise zoom_error(
                 401,
                 E_MISSING_SCOPE,
-                f"Invalid access token, does not contain scopes:[{', '.join(acceptable)}].",
+                f"Invalid access token, does not contain scopes:[{', '.join(need.hint(granular=granular))}].",
             )
         has_admin = any(f"{n}:admin" in self.scopes for n in (need.classic, need.granular))
         return has_admin and self.is_account_admin
@@ -306,16 +306,24 @@ def resolve_grant_person(ctx: ProviderContext, grant: Grant) -> Person | None:
     return None
 
 
+def principal_from_grant(ctx: ProviderContext, grant: Grant) -> Principal:
+    person = resolve_grant_person(ctx, grant)
+    if grant.user_id:
+        rec = ctx.store.collection("users").get(zoom_user_id(ctx.world, person.id)) if person else None
+        if person is None or rec is None or rec.get("status") != "active":
+            raise zoom_error(401, E_INVALID_TOKEN, "Invalid access token.")
+    return Principal(grant, person, owner_person(ctx.world).id, frozenset(grant.scopes))
+
+
 def authenticate(ctx: ProviderContext, request: Request) -> Principal:
     token = bearer_token(request)
     grant = ctx.tokens.resolve(token) if token else None
     if grant is None:
         expired = bool(token) and ctx.tokens.is_expired(token)
-        raise zoom_error(401, E_INVALID_TOKEN, "Access token is expired." if expired else "Invalid access token.")
-    person = resolve_grant_person(ctx, grant)
-    if grant.user_id and (person is None or not person.active):
-        raise zoom_error(401, E_INVALID_TOKEN, "Invalid access token.")
-    return Principal(grant, person, owner_person(ctx.world).id, frozenset(grant.scopes))
+        raise zoom_error(
+            401, E_INVALID_TOKEN, "Access token is expired." if expired else "Invalid access token."
+        )
+    return principal_from_grant(ctx, grant)
 
 
 def zoom_user_id(world: World, person_id: str) -> str:
@@ -338,7 +346,9 @@ async def json_body(request: Request) -> dict[str, Any]:
     return data
 
 
-def query_int(request: Request, name: str, default: int, *, minimum: int = 1, maximum: int | None = None) -> int:
+def query_int(
+    request: Request, name: str, default: int, *, minimum: int = 1, maximum: int | None = None
+) -> int:
     raw = request.query_params.get(name)
     if raw in (None, ""):
         return default
@@ -363,7 +373,9 @@ def query_bool(request: Request, name: str, default: bool = False) -> bool:
 
 def _fingerprint(request: Request) -> str:
     pairs = sorted(
-        (k, v) for k, v in request.query_params.multi_items() if k not in ("next_page_token", "page_number")
+        (k, v)
+        for k, v in request.query_params.multi_items()
+        if k not in ("next_page_token", "page_number", "page_size")
     )
     return stable_hash(request.url.path, pairs, length=8)
 
@@ -441,7 +453,11 @@ def render(request: Request, ctx: ProviderContext, data: Any) -> Any:
 
 
 def respond(
-    request: Request, ctx: ProviderContext, data: Any, status: int = 200, headers: dict[str, str] | None = None
+    request: Request,
+    ctx: ProviderContext,
+    data: Any,
+    status: int = 200,
+    headers: dict[str, str] | None = None,
 ) -> ZoomJSONResponse:
     return ZoomJSONResponse(render(request, ctx, data), status_code=status, headers=headers)
 
@@ -490,3 +506,29 @@ def fault_response(rule: Any) -> tuple[int, dict[str, str], bytes]:
     else:
         body = json.dumps(generic_error_body(status))
     return status, headers, body.encode() if isinstance(body, str) else body
+
+
+class LiveCollection:
+    """A named store collection resolved on every access.
+
+    ``Store.restore`` (used by ``reset``) swaps in fresh ``Collection`` objects, so route modules
+    must not hold on to the object ``store.collection(name)`` returned at registration time."""
+
+    def __init__(self, ctx: ProviderContext, name: str) -> None:
+        self._ctx = ctx
+        self._name = name
+
+    def _coll(self) -> Any:
+        return self._ctx.store.collection(self._name)
+
+    def __getattr__(self, attr: str) -> Any:
+        return getattr(self._coll(), attr)
+
+    def __iter__(self) -> Any:
+        return iter(self._coll())
+
+    def __len__(self) -> int:
+        return len(self._coll())
+
+    def __contains__(self, item: object) -> bool:
+        return item in self._coll()
