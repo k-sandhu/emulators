@@ -9,6 +9,7 @@ from __future__ import annotations
 import base64
 import json
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlencode
@@ -21,7 +22,7 @@ from emulators.core.errors import EmulatorError
 from emulators.core.ids import stable_guid
 from emulators.core.odata import ODataError, QueryOptions, apply_query, parse_query_options
 from emulators.core.provider import ProviderContext, external_base
-from emulators.world.model import Person, World
+from emulators.world.model import DirectChat, Meeting, Person, World
 
 GRAPH_VERSIONS = ("v1.0", "beta")
 DEFAULT_PAGE_SIZE = 100
@@ -237,3 +238,68 @@ def single_response(request: Request, record: dict[str, Any], *, context: str) -
         keep = set(options.select) | {"id", "@odata.type", "@odata.etag"}
         item = {k: v for k, v in item.items() if k in keep}
     return {"@odata.context": context_url(request, context), **item}
+
+
+# -- cross-module identifiers ------------------------------------------------------------
+# Calendar events (mail/calendar module) and onlineMeetings (meetings module) must agree
+# on join URLs and ids, because consumers look meetings up by JoinWebUrl.
+
+
+def meeting_thread_id(world: World, meeting_id: str) -> str:
+    """Teams meeting chat thread: ``19:meeting_<base64ish>@thread.v2``."""
+    token = base64.b64encode(stable_guid(world.seed, "ms-meeting-thread", meeting_id).encode()).decode()
+    return f"19:meeting_{token.rstrip('=')[:44]}@thread.v2"
+
+
+def join_web_url(world: World, meeting: Meeting) -> str:
+    from urllib.parse import quote
+
+    thread = quote(meeting_thread_id(world, meeting.id), safe="")
+    organizer = user_id(world, meeting.organizer_id)
+    context = quote(json.dumps({"Tid": tenant_id(world), "Oid": organizer}, separators=(",", ":")), safe="")
+    return f"https://teams.microsoft.com/l/meetup-join/{thread}/0?context={context}"
+
+
+def online_meeting_id(world: World, meeting_id: str, organizer_person_id: str) -> str:
+    """Graph onlineMeeting ids are base64 of ``1*<organizerOid>*0**<threadId>``."""
+    raw = f"1*{user_id(world, organizer_person_id)}*0**{meeting_thread_id(world, meeting_id)}"
+    return base64.b64encode(raw.encode()).decode().rstrip("=")
+
+
+def event_id(world: World, meeting_id: str, person_id: str) -> str:
+    """Outlook event ids differ per mailbox (``AAMkA...``)."""
+    digest = stable_guid(world.seed, "ms-event", meeting_id, person_id).replace("-", "")
+    return "AAMkA" + base64.urlsafe_b64encode(bytes.fromhex(digest * 3)).decode().rstrip("=")
+
+
+def channel_id(world: World, world_channel_id: str) -> str:
+    return f"19:{stable_guid(world.seed, 'ms-channel', world_channel_id).replace('-', '')}@thread.tacv2"
+
+
+def chat_id(world: World, chat: DirectChat) -> str:
+    if len(chat.member_ids) == 2 and not chat.topic:
+        a, b = sorted(user_id(world, m) for m in chat.member_ids)
+        return f"19:{a}_{b}@unq.gbl.spaces"
+    return f"19:{stable_guid(world.seed, 'ms-chat', chat.id).replace('-', '')}@thread.v2"
+
+
+# -- change notification bus -------------------------------------------------------------
+# Modules publish resource changes; the subscriptions module (if present) listens and
+# delivers Graph change notifications to matching subscriptions.
+
+ChangeListener = Callable[[ProviderContext, str, str, dict[str, Any]], Awaitable[None]]
+_change_listeners: list[ChangeListener] = []
+
+
+def on_change(listener: ChangeListener) -> ChangeListener:
+    if listener not in _change_listeners:
+        _change_listeners.append(listener)
+    return listener
+
+
+async def publish_change(ctx: ProviderContext, resource: str, change_type: str, data: dict[str, Any]) -> None:
+    """``resource`` is the Graph path without version, e.g. ``users/{id}/messages/{mid}``;
+    ``change_type`` is ``created``/``updated``/``deleted``; ``data`` is the resource
+    (used for ``resourceData`` and rich notifications)."""
+    for listener in list(_change_listeners):
+        await listener(ctx, resource, change_type, data)

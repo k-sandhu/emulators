@@ -22,7 +22,7 @@ from emulators.core.auth import bearer_token
 from emulators.core.errors import EmulatorError
 from emulators.core.ids import stable_hash
 from emulators.core.provider import ProviderContext
-from emulators.world.model import Person, World
+from emulators.world.model import Meeting, Person, World
 
 STATUS_BY_CODE = {
     400: "INVALID_ARGUMENT",
@@ -132,3 +132,47 @@ def principal(request: Request, ctx: ProviderContext, *, legacy: bool = True) ->
         person = ctx.world.person_by_email(person_id)
         person_id = person.id if person else None
     return Principal(person_id, grant.app_only and not person_id, grant.client_id, list(grant.scopes))
+
+
+# -- cross-module identifiers ------------------------------------------------------------
+# Calendar (hangoutLink), Meet (spaces, conferenceRecords) and Drive (recordings and
+# transcripts in the organizer's "Meet Recordings" folder) must agree on these.
+
+
+def meet_code(world: World, meeting_id: str) -> str:
+    """``abc-defg-hij`` meeting code."""
+    letters = "abcdefghijklmnopqrstuvwxyz"
+    n = int(stable_hash(world.seed, "meet-code", meeting_id, length=24), 16)
+    chars = []
+    for _ in range(10):
+        n, r = divmod(n, 26)
+        chars.append(letters[r])
+    code = "".join(chars)
+    return f"{code[:3]}-{code[3:7]}-{code[7:]}"
+
+
+def meet_uri(world: World, meeting_id: str) -> str:
+    return f"https://meet.google.com/{meet_code(world, meeting_id)}"
+
+
+def meet_space_name(world: World, meeting_id: str) -> str:
+    return "spaces/" + drive_id(world, "meet-space", meeting_id, length=12)
+
+
+def conference_record_name(world: World, meeting_id: str) -> str:
+    return "conferenceRecords/" + drive_id(world, "meet-conf", meeting_id, length=36).replace("_", "-")
+
+
+def meet_recording_file_id(world: World, meeting_id: str) -> str:
+    """Drive file id of the MP4 recording in the organizer's ``Meet Recordings`` folder."""
+    return drive_id(world, "meet-recording", meeting_id)
+
+
+def meet_transcript_doc_id(world: World, meeting_id: str) -> str:
+    """Drive id of the Google Doc transcript in the organizer's ``Meet Recordings`` folder."""
+    return drive_id(world, "meet-transcript", meeting_id, length=44)
+
+
+def meet_artifact_name(meeting: Meeting, what: str) -> str:
+    """Drive file names Meet uses, e.g. ``Weekly sync (2026-10-14 10:02 GMT-4) - Recording``."""
+    return f"{meeting.title} ({meeting.start:%Y-%m-%d %H:%M} GMT) - {what}"

@@ -39,13 +39,18 @@ from emulators.core.webhooks import WebhookDispatcher
 DEFAULT_SEED = "emulators"
 
 
-def discover_providers() -> dict[str, Provider]:
-    """Import every ``emulators.providers.<pkg>`` exposing ``PROVIDER``."""
+def discover_providers(names: Iterable[str] | None = None) -> dict[str, Provider]:
+    """Import ``emulators.providers.<pkg>`` modules exposing ``PROVIDER``.
+
+    With ``names``, only those packages are imported, so a half-finished provider can't
+    break a hub that doesn't use it.
+    """
     import emulators.providers as root
 
+    wanted = set(names) if names is not None else None
     found: dict[str, Provider] = {}
     for info in sorted(pkgutil.iter_modules(root.__path__), key=lambda m: m.name):
-        if info.name.startswith("_"):
+        if info.name.startswith("_") or (wanted is not None and info.name not in wanted):
             continue
         module = importlib.import_module(f"{root.__name__}.{info.name}")
         provider = getattr(module, "PROVIDER", None)
@@ -85,10 +90,10 @@ class EmulatorHub:
         self._seeded: dict[str, dict[str, Any]] = {}
         self._lock = threading.RLock()
 
-        available = discover_providers()
-        for extra in extra_providers:
-            available[extra.name] = extra
         wanted = list(providers) if providers is not None else _env_list("EMULATORS_PROVIDERS")
+        extras = {extra.name: extra for extra in extra_providers}
+        available = discover_providers([w for w in wanted if w not in extras] if wanted else None)
+        available.update(extras)
         if wanted:
             unknown = sorted(set(wanted) - set(available))
             if unknown:
