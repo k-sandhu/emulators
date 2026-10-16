@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.9.30"
+      - run: uv sync --frozen
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.9.30"
+          python-version: ${{ matrix.python }}
+      - name: Install ffmpeg (media validation tests)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+      - run: uv sync --frozen
+      - run: uv run pytest -q -ra
+
+  docker:
+    runs-on: ubuntu-latest
+    needs: [test]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t emulators:ci .
+      - name: Smoke test
+        run: |
+          docker run -d --name emu -p 44080:44080 emulators:ci serve --no-provider-ports
+          for i in $(seq 1 30); do curl -fsS http://127.0.0.1:44080/_emulator/health && break; sleep 2; done
+          curl -fsS http://127.0.0.1:44080/ | head -c 2000
+          docker logs emu
