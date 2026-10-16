@@ -102,7 +102,11 @@ async def rename_move(
     payload = await dm.json_body(request)
     if set(payload) - {"name", "parentReference", "description"}:
         raise common.graph_error(400, "invalidRequest", "One or more properties cannot be updated.")
-    if "description" in payload and payload["description"] is not None and not isinstance(payload["description"], str):
+    if (
+        "description" in payload
+        and payload["description"] is not None
+        and not isinstance(payload["description"], str)
+    ):
         raise common.graph_error(400, "invalidRequest", "description must be a string or null.")
     if "name" not in payload and "parentReference" not in payload:
         for key in ("description",):
@@ -467,11 +471,21 @@ async def dispatch(request: Request, ctx: ProviderContext, drive: dict[str, Any]
         if "file" not in item:
             return {"value": []}
         if op.endswith("/content"):
-            key = item.get("_thumbnail")
+            parts = op.split("/")
+            sizes = {"small": 96, "medium": 176, "large": 800}
+            if len(parts) != 4 or parts[1] != "0" or parts[2] not in sizes:
+                raise common.item_not_found()
+            cache = "_thumbnail_" + parts[2]
+            key = item.get(cache)
             if key is None:
-                data, _ = documents.render("png", item["name"], [])
-                key = item["_thumbnail"] = ctx.store.blobs.put(data)
+                pixels = sizes[parts[2]]
+                data = documents.make_png(pixels, pixels, seed=int(item["id"][-4:], 36))
+                key = item[cache] = ctx.store.blobs.put(data)
             return dm.binary_response(request, ctx.store.blobs.get(key), "image/png")
+        if op == "thumbnails/0":
+            return dm.single(request, dm.thumbnails(request, ctx, item)[0], "thumbnailSet")
+        if op != "thumbnails":
+            raise common.item_not_found()
         return dm.collection(request, dm.thumbnails(request, ctx, item), context="Collection(thumbnailSet)")
     raise common.graph_error(405, "methodNotAllowed", "The HTTP method is not allowed on this resource.")
 

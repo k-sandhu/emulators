@@ -274,7 +274,9 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
             if len(parts) == 2 and request.method == "GET":
                 return dm.single(request, channel, "channel")
             if len(parts) < 3:
-                raise common.graph_error(405, "methodNotAllowed", "The HTTP method is not allowed on this resource.")
+                raise common.graph_error(
+                    405, "methodNotAllowed", "The HTTP method is not allowed on this resource."
+                )
             if parts[2] == "members" and request.method == "GET":
                 return dm.collection(
                     request,

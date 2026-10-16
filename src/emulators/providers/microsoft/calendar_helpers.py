@@ -263,7 +263,10 @@ def from_meeting(ctx: ProviderContext, meeting: Meeting, pid: str) -> dict[str, 
             "createdDateTime": isoformat_z(meeting.start - timedelta(days=7)),
             "lastModifiedDateTime": isoformat_z(meeting.start - timedelta(days=1)),
             "_meeting": meeting.id,
-            "originalStartTimeZone": next((k for k, v in ZONES.items() if v == meeting.timezone), "UTC"),
+            "originalStartTimeZone": next(
+                (office.windows_timezone for office in world.offices if office.timezone == meeting.timezone),
+                next((k for k, v in ZONES.items() if v == meeting.timezone), "UTC"),
+            ),
             "isCancelled": meeting.cancelled,
             "isOrganizer": pid == meeting.organizer_id,
             "iCalUId": stable_hash(world.seed, meeting.id, length=64),
@@ -275,6 +278,7 @@ def from_meeting(ctx: ProviderContext, meeting: Meeting, pid: str) -> dict[str, 
     )
     record["changeKey"] = stable_hash(ctx.world.seed, meeting.id, pid, "event")
     record["@odata.etag"] = f'W/"{record["changeKey"]}"'
+    record["originalEndTimeZone"] = record["originalStartTimeZone"]
     return record
 
 

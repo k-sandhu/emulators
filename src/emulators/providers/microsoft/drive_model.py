@@ -5,10 +5,13 @@ from __future__ import annotations
 import base64
 import copy
 import hashlib
+import io
 import json
 import mimetypes
 import re
 import secrets
+import xml.etree.ElementTree as ET
+import zipfile
 from datetime import timedelta
 from typing import Any
 from urllib.parse import quote, urlencode
@@ -423,15 +426,23 @@ def content(ctx: ProviderContext, item: dict[str, Any], fmt: str | None = None) 
     if cache not in item:
         doc = ctx.world.document(item["_doc"]) if item.get("_doc") else None
         if fmt == "pdf":
-            if not doc or doc.kind not in ("docx", "xlsx", "pptx", "pdf"):
-                raise common.graph_error(406, "notSupported", "This item cannot be converted to PDF.")
-            data, _ = documents.render(
-                "pdf",
-                doc.title,
-                list(doc.paragraphs),
-                author=ctx.world.person(doc.owner_id).display_name,
-                created=doc.created,
-            )
+            original, mime = content(ctx, item)
+            if mime == "application/pdf":
+                data = original
+            else:
+                kind = item["name"].rsplit(".", 1)[-1].lower()
+                paragraphs = (
+                    list(doc.paragraphs) if doc and not item.get("_uploaded") else office_text(original, kind)
+                )
+                if kind not in ("docx", "xlsx", "pptx"):
+                    raise common.graph_error(406, "notSupported", "This item cannot be converted to PDF.")
+                data, _ = documents.render(
+                    "pdf",
+                    doc.title if doc and not item.get("_uploaded") else item["name"],
+                    paragraphs,
+                    author=ctx.world.person(item["_owner"]).display_name,
+                    created=parse_instant(item["createdDateTime"]),
+                )
         elif item.get("_recording"):
             data = media.make_mp4(
                 item["_duration"], title=item["_title"], created=parse_instant(item["createdDateTime"])
@@ -458,6 +469,53 @@ def content(ctx: ProviderContext, item: dict[str, Any], fmt: str | None = None) 
                 "sha256Hash": hashlib.sha256(data).hexdigest().upper(),
             }
     return data, "application/pdf" if fmt == "pdf" else item["file"]["mimeType"]
+
+
+def office_text(data: bytes, kind: str) -> list[str]:
+    """Extract text with the stdlib so uploaded Office renditions never use old seed text."""
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            if kind == "docx":
+                roots = [ET.fromstring(archive.read("word/document.xml"))]
+            elif kind == "pptx":
+                roots = [
+                    ET.fromstring(archive.read(name))
+                    for name in sorted(archive.namelist())
+                    if re.fullmatch(r"ppt/slides/slide\d+\.xml", name)
+                ]
+            elif kind == "xlsx":
+                ns = {"s": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+                strings = (
+                    ET.fromstring(archive.read("xl/sharedStrings.xml"))
+                    if "xl/sharedStrings.xml" in archive.namelist()
+                    else None
+                )
+                shared = ["".join(node.itertext()) for node in strings] if strings is not None else []
+                paragraphs = []
+                for name in sorted(archive.namelist()):
+                    if not re.fullmatch(r"xl/worksheets/sheet\d+\.xml", name):
+                        continue
+                    for row in ET.fromstring(archive.read(name)).findall(".//s:row", ns):
+                        values = []
+                        for cell in row:
+                            value = cell.findtext("s:v", default="", namespaces=ns)
+                            if cell.get("t") == "s":
+                                value = shared[int(value)]
+                            elif cell.get("t") == "inlineStr":
+                                value = "".join(cell.find("s:is", ns).itertext())
+                            values.append(value)
+                        paragraphs.append(" | ".join(values))
+                return paragraphs
+            else:
+                raise ValueError
+            return [
+                node.text or ""
+                for root in roots
+                for node in root.iter()
+                if node.tag.rsplit("}", 1)[-1] == "t"
+            ]
+    except (zipfile.BadZipFile, ET.ParseError, KeyError, ValueError, IndexError, AttributeError):
+        raise common.graph_error(406, "notSupported", "The file cannot be converted to PDF.") from None
 
 
 def binary_response(request: Request, data: bytes, mime: str, etag: str | None = None) -> Response:

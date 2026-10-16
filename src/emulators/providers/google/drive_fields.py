@@ -106,6 +106,25 @@ def validate(tree: Tree, schema: Tree) -> None:
             validate(child, nested)
 
 
+def needs_binary_metadata(fields: str | None) -> bool:
+    if fields is None:
+        return False
+    tree = parse_fields(fields)
+    names = {"size", "quotaBytesUsed", "md5Checksum", "sha1Checksum", "sha256Checksum", "headRevisionId"}
+
+    def walk(node: Tree) -> bool:
+        return (
+            bool(names.intersection(node))
+            or "*" in node
+            or any(
+                (key == "files" and child is None) or (isinstance(child, dict) and walk(child))
+                for key, child in node.items()
+            )
+        )
+
+    return walk(tree)
+
+
 def public(value: Any) -> Any:
     if isinstance(value, dict):
         return {k: public(v) for k, v in value.items() if not k.startswith("_")}

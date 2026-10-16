@@ -14,7 +14,8 @@ from emulators.core.provider import ProviderContext, url_for_host
 from emulators.providers.google.common import Principal, google_error, person_ref
 from emulators.providers.google.common import principal as google_principal
 from emulators.providers.google.directory import expanded_members
-from emulators.providers.google.drive_seed import DOC, FOLDER, NATIVE, SHEET, SLIDE, root_id
+from emulators.providers.google.drive_fields import needs_binary_metadata
+from emulators.providers.google.drive_seed import DOC, FOLDER, NATIVE, SHEET, SLIDE, permission, root_id
 from emulators.world.documents import EXTENSION_TO_MIME, render
 from emulators.world.media import make_mp4
 
@@ -39,7 +40,9 @@ EXPORTS = {
 
 def principal(request: Request, ctx: ProviderContext, *, legacy: bool = True) -> Principal:
     actor = google_principal(request, ctx, legacy=legacy)
-    write = request.method not in ("GET", "HEAD") and not request.url.path.endswith(("/watch", "/channels/stop"))
+    write = request.method not in ("GET", "HEAD") and not request.url.path.endswith(
+        ("/watch", "/channels/stop")
+    )
     allowed = {"drive", "drive.file", "drive.appdata"}
     if not write:
         allowed |= {"drive.readonly", "drive.metadata", "drive.metadata.readonly"}
@@ -49,15 +52,34 @@ def principal(request: Request, ctx: ProviderContext, *, legacy: bool = True) ->
         allowed.add("documents")
         if not write:
             allowed.add("documents.readonly")
-    if actor.scopes and not any("https://www.googleapis.com/auth/" + scope in actor.scopes for scope in allowed):
-        raise google_error(403, "Request had insufficient authentication scopes.", reason="insufficientPermissions", legacy=legacy)
+    if actor.scopes and not any(
+        "https://www.googleapis.com/auth/" + scope in actor.scopes for scope in allowed
+    ):
+        raise google_error(
+            403,
+            "Request had insufficient authentication scopes.",
+            reason="insufficientPermissions",
+            legacy=legacy,
+        )
     return actor
 
 
 def content_scope(actor: Principal) -> None:
-    allowed = {"https://www.googleapis.com/auth/" + name for name in ("drive", "drive.readonly", "drive.file", "drive.appdata", "documents", "documents.readonly")}
+    allowed = {
+        "https://www.googleapis.com/auth/" + name
+        for name in (
+            "drive",
+            "drive.readonly",
+            "drive.file",
+            "drive.appdata",
+            "documents",
+            "documents.readonly",
+        )
+    }
     if actor.scopes and not allowed.intersection(actor.scopes):
-        raise google_error(403, "Request had insufficient authentication scopes.", reason="insufficientPermissions")
+        raise google_error(
+            403, "Request had insufficient authentication scopes.", reason="insufficientPermissions"
+        )
 
 
 def actor_email(ctx: ProviderContext, actor: Principal) -> str:
@@ -72,6 +94,8 @@ def all_permissions(
         return []
     seen.add(row["id"])
     result = copy.deepcopy(row.get("_permissions", []))
+    if not row.get("driveId") and row.get("_owner") and not any(p["role"] == "owner" for p in result):
+        result.append(permission(ctx, row["_owner"], "owner"))
     if row.get("driveId"):
         for perm in result:
             perm["permissionDetails"] = [
@@ -87,6 +111,9 @@ def all_permissions(
             if not parent:
                 continue
             for perm in all_permissions(ctx, parent, seen):
+                if perm["role"] == "owner":
+                    # Folder access is inherited; ownership of a different file is not.
+                    perm["role"] = "writer"
                 if row.get("driveId"):
                     inherited_from = next(
                         (
@@ -178,6 +205,18 @@ def binary(ctx: ProviderContext, row: dict[str, Any]) -> bytes:
     return data
 
 
+def is_trashed(ctx: ProviderContext, row: dict[str, Any], seen: set[str] | None = None) -> bool:
+    seen = set() if seen is None else seen
+    if row["id"] in seen:
+        return False
+    seen.add(row["id"])
+    return bool(row.get("trashed")) or any(
+        is_trashed(ctx, parent, seen)
+        for parent_id in row.get("parents", [])
+        if (parent := ctx.store.collection("drive_files").get(parent_id))
+    )
+
+
 def store_binary(ctx: ProviderContext, row: dict[str, Any], data: bytes) -> None:
     row["_blob"] = ctx.store.blobs.put(data)
     row["size"] = str(len(data))
@@ -189,6 +228,8 @@ def store_binary(ctx: ProviderContext, row: dict[str, Any], data: bytes) -> None
     row["originalFilename"] = row["name"]
     extension = row["name"].rsplit(".", 1)[-1] if "." in row["name"] else ""
     row.update(fileExtension=extension, fullFileExtension=extension)
+    if row["mimeType"].startswith("text/"):
+        row["_paragraphs"] = data.decode(errors="replace").splitlines()
 
 
 def export_content(ctx: ProviderContext, row: dict[str, Any], mime: str) -> bytes:
@@ -232,9 +273,14 @@ def file_shape(
     content_metadata: bool = False,
 ) -> dict[str, Any]:
     mime = row["mimeType"]
-    if content_metadata and mime not in NATIVE and mime != FOLDER:
+    if (
+        (content_metadata or needs_binary_metadata(request.query_params.get("fields")))
+        and mime not in NATIVE
+        and mime != FOLDER
+    ):
         binary(ctx, row)
     result = {k: copy.deepcopy(v) for k, v in row.items() if not k.startswith("_")}
+    result["trashed"] = is_trashed(ctx, row)
     owner = next((p for p in ctx.world.people if p.id == row.get("_owner")), None)
     modified = next((p for p in ctx.world.people if p.id == row.get("_modified_by", row.get("_owner"))), None)
     if not row.get("driveId") and owner:
@@ -304,6 +350,7 @@ def file_shape(
 
 def query_shape(ctx: ProviderContext, row: dict[str, Any], actor: Principal) -> dict[str, Any]:
     result = dict(row)
+    result["trashed"] = is_trashed(ctx, row)
     result["_text"] = (
         row["name"] + " " + row.get("description", "") + " " + " ".join(row.get("_paragraphs", []))
     )

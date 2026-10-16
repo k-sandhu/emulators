@@ -153,6 +153,21 @@ class Tree:
     def children(self, ns: str, rel: str) -> list[dict[str, Any]]:
         return sorted(self.kids.get((ns, rel), ()), key=lambda r: (r["name"].lower(), r["name"]))
 
+    def dead_below(self, ns: str, rel: str, *, recursive: bool) -> list[dict[str, Any]]:
+        """Deleted entries under ``rel`` that no live entry has replaced (latest deletion per path)."""
+        out: dict[str, dict[str, Any]] = {}
+        prefix = rel + "/"
+        for (rns, rpath), recs in self.dead.items():
+            if rns != ns or not recs or (rns, rpath) in self.live:
+                continue
+            if recursive:
+                if not rpath.startswith(prefix):
+                    continue
+            elif parent_of(rpath) != rel:
+                continue
+            out[rpath] = max(recs, key=lambda r: (r.get("deleted_at") or "", r.get("seq", 0)))
+        return list(out.values())
+
     def subtree(self, ns: str, rel: str) -> list[dict[str, Any]]:
         """Live entries strictly below ``rel`` in one namespace (parents before children)."""
         out: list[dict[str, Any]] = []

@@ -177,6 +177,9 @@ async def test_calendar_crud_list_preferences_acl_and_clear(calendar_client: htt
                 method, ROOT + "/users/me/calendarList/" + calendar_id, json={"selected": False}
             )
         ).json()["selected"] is False
+        assert (await client.get(ROOT + "/users/me/calendarList/" + calendar_id)).json()[
+            "summary"
+        ] == "Updated calendar"
     assert (await client.delete(ROOT + "/users/me/calendarList/" + calendar_id)).status_code == 204
     assert (await client.post(ROOT + "/users/me/calendarList", json={"id": calendar_id})).status_code == 200
     acl = (await client.get(ROOT + "/calendars/primary/acl")).json()
@@ -361,3 +364,48 @@ async def test_explicit_readonly_scope_and_malformed_json(calendar_client: httpx
 async def test_bad_recurrence_never_persists(calendar_client: httpx.AsyncClient, rule: str) -> None:
     response = await calendar_client.post(EVENTS, json=event_body(recurrence=[rule]))
     assert response.status_code == 400
+
+
+async def test_recurring_move_time_bounds_and_cancelled_updated_query(
+    calendar_client: httpx.AsyncClient,
+) -> None:
+    client = calendar_client
+    future = await client.get(EVENTS, params={"timeMin": "2035-01-01T00:00:00Z"})
+    assert future.status_code == 200 and future.json()["items"] == []
+    recurring = next(
+        r
+        for r in (await client.get(EVENTS)).json()["items"]
+        if "recurrence" in r and r["organizer"]["email"] == CEO
+    )
+    count = len((await client.get(EVENTS + "/" + recurring["id"] + "/instances")).json()["items"])
+    target = (await client.post(ROOT + "/calendars", json={"summary": "Series destination"})).json()["id"]
+    moved = await client.post(EVENTS + "/" + recurring["id"] + "/move", params={"destination": target})
+    assert moved.status_code == 200
+    instances = (
+        await client.get(ROOT + "/calendars/" + target + "/events/" + recurring["id"] + "/instances")
+    ).json()["items"]
+    assert len(instances) == count and all(r["organizer"]["email"] == target for r in instances)
+    assert (await client.get(EVENTS + "/" + recurring["id"] + "/instances")).json()["items"] == []
+    cancelled = (await client.get(EVENTS, params={"updatedMin": "2026-01-01T00:00:00Z"})).json()["items"]
+    assert any(r["id"] == recurring["id"] and r["status"] == "cancelled" for r in cancelled)
+
+
+async def test_secondary_calendar_deletion_notifies_not_exists(calendar_client: httpx.AsyncClient) -> None:
+    client = calendar_client
+    seen: list[str] = []
+    receiver = FastAPI()
+
+    @receiver.post("/deleted")
+    async def hook(request: Request) -> dict[str, Any]:
+        seen.append(request.headers["x-goog-resource-state"])
+        return {}
+
+    client.hub.webhook_transport = httpx.ASGITransport(app=receiver)  # type: ignore[attr-defined]
+    target = (await client.post(ROOT + "/calendars", json={"summary": "Watched calendar"})).json()["id"]
+    response = await client.post(
+        ROOT + "/calendars/" + target + "/events/watch",
+        json={"id": "deleted-calendar", "type": "web_hook", "address": "https://receiver.example/deleted"},
+    )
+    assert response.status_code == 200
+    assert (await client.delete(ROOT + "/calendars/" + target)).status_code == 204
+    assert seen == ["sync", "not_exists"]

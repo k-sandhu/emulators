@@ -127,6 +127,12 @@ async def update_file(
         candidate.extend(request.query_params["addParents"].split(","))
     if candidate != row.get("parents", []):
         parents, drive = parents_for(ctx, actor, list(dict.fromkeys(candidate)))
+        if row["mimeType"] == FOLDER and drive != row.get("driveId"):
+            raise google_error(
+                403,
+                "Moving folders across shared drives is not supported.",
+                reason="teamDrivesFolderMoveInNotSupported",
+            )
         if row["id"] in parents:
             raise google_error(403, "A file cannot be its own parent.", reason="invalidParent")
         ancestors = list(parents)

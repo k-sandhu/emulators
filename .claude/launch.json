@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "emulators",
+      "runtimeExecutable": "uv",
+      "runtimeArgs": ["run", "emulators", "serve", "--providers", "microsoft,google", "--no-https", "--no-provider-ports", "--port", "44080", "--anchor", "2026-10-16"],
+      "port": 44080
+    }
+  ]
+}

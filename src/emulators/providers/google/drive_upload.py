@@ -7,6 +7,7 @@ import re
 from email import policy
 from email.parser import BytesParser
 from typing import Any
+from urllib.parse import urlencode
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
@@ -132,6 +133,8 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         else:
             if data:
                 raise google_error(400, "Content-Range required", reason="badRequest")
+            if session["total"] is not None and len(chunk) != session["total"]:
+                raise google_error(400, "Upload size does not match the declared length", reason="badRequest")
             session["total"] = len(chunk)
         data += chunk
         session["blob"] = ctx.store.blobs.put(data)
@@ -140,8 +143,9 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         if len(data) != session["total"]:
             raise google_error(400, "Upload size does not match Content-Range", reason="badRequest")
         if session["file"]:
+            update_request = Request({**request.scope, "query_string": urlencode(session["params"]).encode()})
             row = await update_file(
-                ctx, request, actor, session["file"], session["metadata"], data, session["type"]
+                ctx, update_request, actor, session["file"], session["metadata"], data, session["type"]
             )
         else:
             row = await create_file(ctx, actor, session["metadata"], data, session["type"])

@@ -204,7 +204,8 @@ the seeded collections, grants, cursors, upload sessions and channels.
   formatting is synthetic and supports the formats in `about.exportFormats`.
 - Cross-drive folder moves, domain ownership-transfer restrictions, pending-owner workflows,
   ownership notification email delivery, and the full Workspace restriction-policy matrix
-  are not simulated. Folder trash does not yet propagate trash flags to descendants.
+  are not simulated. Descendants inherit a folder's trash state; the change journal records
+  the directly mutated folder rather than separate synthetic entries for all descendants.
 - Change cursors do not expire. The journal retains each mutation; it does not compact
   repeated file changes or implement all of Google's corpus-transition behavior. Watch
   channels do not renew automatically. Quota accounting counts materialized binary metadata.

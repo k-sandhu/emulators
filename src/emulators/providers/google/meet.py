@@ -11,7 +11,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException
 
-from emulators.core.clock import isoformat_z
+from emulators.core.clock import isoformat_z, parse_instant
 from emulators.core.ids import b64url, b64url_decode, stable_hash
 from emulators.core.provider import ProviderContext, url_for_host
 from emulators.providers.google.common import (
@@ -35,6 +35,7 @@ def public(record: dict[str, Any]) -> dict[str, Any]:
 
 
 def create_space(ctx: ProviderContext, owner: str, key: str, config: dict[str, Any]) -> dict[str, Any]:
+    validate_config(config)
     name = meet_space_name(ctx.world, key)
     record = {
         "id": name,
@@ -52,6 +53,8 @@ def create_space(ctx: ProviderContext, owner: str, key: str, config: dict[str, A
 
 
 def validate_config(config: dict[str, Any]) -> None:
+    if not isinstance(config, dict):
+        raise google_error(400, "Invalid space config", legacy=False)
     if config.get("accessType", "TRUSTED") not in ("OPEN", "TRUSTED", "RESTRICTED"):
         raise google_error(400, "Invalid accessType", legacy=False)
     if config.get("entryPointAccess", "ALL") not in ("ALL", "CREATOR_APP_ONLY"):
@@ -101,9 +104,9 @@ def _artifacts(
                         "participant": _participant_name(ctx, name, turn.speaker_id),
                         "text": turn.text,
                         "languageCode": "en-US",
-                        "startTime": isoformat_z(meeting.start + timedelta(seconds=turn.offset_s)),
+                        "startTime": isoformat_z(parse_instant(start) + timedelta(seconds=turn.offset_s)),
                         "endTime": isoformat_z(
-                            meeting.start + timedelta(seconds=turn.offset_s + turn.duration_s)
+                            parse_instant(start) + timedelta(seconds=turn.offset_s + turn.duration_s)
                         ),
                         "_transcript": artifact_name,
                     }
@@ -295,6 +298,8 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
             if actor != space["_owner"]:
                 raise google_error(403, "Only the space owner can update the space.", legacy=False)
             payload = await json_object(request, legacy=False)
+            if "config" in payload:
+                validate_config(payload["config"])
             mask = request.query_params.get("updateMask", "")
             if not mask:
                 raise google_error(400, "updateMask is required", legacy=False)

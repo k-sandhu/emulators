@@ -218,7 +218,7 @@ def list_wire(request: Request, ctx: ProviderContext, item: dict[str, Any]) -> d
     expand = request.query_params.get("$expand", request.query_params.get("expand", ""))
     if "fields" not in expand:
         record.pop("fields", None)
-    elif match := re.search(r"fields\(\$?select=([^)]*)\)", expand):
+    elif "fields" in record and (match := re.search(r"fields\(\$?select=([^)]*)\)", expand)):
         names = {n.strip() for n in match.group(1).split(",")} | {"id"}
         record["fields"] = {k: v for k, v in record["fields"].items() if k in names}
     if "driveItem" in expand and item.get("_drive_item"):
@@ -258,12 +258,15 @@ async def list_dispatch(
     )
     if len(parts) == 2:
         if request.method == "GET":
-            return dm.collection(
+            result = dm.collection(
                 request,
-                [list_wire(request, ctx, r) for r in records],
+                records,
                 context="Collection(listItem)",
                 search_fields=("fields/Title",),
             )
+            sources = {r["id"]: r for r in records}
+            result["value"] = [list_wire(request, ctx, {**r, "_drive_item": sources[r["id"]].get("_drive_item")}) for r in result["value"]]
+            return result
         if request.method == "POST":
             require_site(ctx, site["id"], p, write=True)
             if listing.get("_drive"):
@@ -275,7 +278,10 @@ async def list_dispatch(
             if not isinstance(fields, dict) or not fields.get("Title"):
                 raise common.graph_error(400, "invalidRequest", "fields.Title is required.")
             validate_fields(ctx, listing, fields)
-            iid = str(max((int(r["id"]) for r in records), default=0) + 1)
+            counter = "ms_list_next:" + listing["id"]
+            last = max(ctx.store.meta.get(counter, 0), max((int(r["id"]) for r in records), default=0))
+            iid = str(last + 1)
+            ctx.store.meta[counter] = last + 1
             timestamp = isoformat_z(ctx.clock.now())
             item = {
                 "id": iid,
@@ -347,6 +353,8 @@ def validate_fields(ctx: ProviderContext, listing: dict[str, Any], fields: Any) 
             raise common.graph_error(400, "invalidRequest", f"Field '{name}' is not writable.")
         if "number" in columns[name] and (not isinstance(value, (float, int)) or isinstance(value, bool)):
             raise common.graph_error(400, "invalidRequest", f"Field '{name}' must be numeric.")
+        if "text" in columns[name] and value is not None and not isinstance(value, str):
+            raise common.graph_error(400, "invalidRequest", f"Field '{name}' must be a string.")
 
 
 def register(app: FastAPI, ctx: ProviderContext) -> None:

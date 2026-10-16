@@ -84,6 +84,7 @@ async def put_content(
         created=isoformat_z(ctx.clock.now()),
     )
     item["_blob"] = ctx.store.blobs.put(data)
+    item["_uploaded"] = True
     item.pop("_pdf_blob", None)
     item["file"] = {"mimeType": mimetypes.guess_type(name)[0] or "application/octet-stream", "hashes": {}}
     item["lastModifiedBy"] = common.identity(ctx.world, ctx.world.person(p.person_id or drive["_owner"]))

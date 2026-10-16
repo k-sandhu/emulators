@@ -316,6 +316,9 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
             for collection in ("calendar_events", "calendar_instances"):
                 for row in ctx.store[collection].where(_calendar=cal["id"]):
                     ctx.store[collection].delete(cal["id"] + ":" + row["id"])
+            await notify(ctx, cal["id"], "not_exists")
+            for channel in ctx.store["calendar_channels"].where(_calendar=cal["id"]):
+                ctx.store["calendar_channels"].delete(channel["id"])
             return Response(status_code=204)
         if request.method in ("PATCH", "PUT"):
             if role != "owner":
@@ -327,6 +330,10 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
                 if field in body:
                     cal[field] = body[field]
             cal["etag"] = '"' + ctx.ids.hex(16) + '"'
+            for entry in ctx.store["calendar_list"].where(id=cal["id"]):
+                for field in ("summary", "timeZone", "etag", "description", "location"):
+                    if field in cal:
+                        entry[field] = cal[field]
         return public(cal)
 
     @app.post(PREFIX + "/calendars/{calendar_id}/clear")
@@ -436,7 +443,11 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
                 ]
         else:
             rows = [
-                r for r in rows if query.get("showDeleted", "false") == "true" or r["status"] != "cancelled"
+                r
+                for r in rows
+                if query.get("showDeleted", "false") == "true"
+                or query.get("updatedMin")
+                or r["status"] != "cancelled"
             ]
         if low:
             rows = [
@@ -623,11 +634,31 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         event = _event_get(ctx, source, event_id)
         if event.get("organizer", {}).get("email") != source["id"]:
             raise google_error(403, "Only the organizer can move an event", reason="forbidden")
+        if "recurringEventId" in event or source["id"] == target["id"]:
+            raise google_error(400, "Invalid event move", reason="badRequest")
         replica = copy.deepcopy(event)
         replica["_calendar"] = target["id"]
         replica["organizer"] = {"email": target["id"]}
         revision(ctx, replica)
         ctx.store["calendar_events"].put_as(target["id"] + ":" + event_id, replica)
+        for instance in ctx.store["calendar_instances"].where(
+            _calendar=source["id"], recurringEventId=event_id
+        ):
+            target_instance = copy.deepcopy(instance)
+            target_instance["_calendar"] = target["id"]
+            target_instance["organizer"] = {"email": target["id"]}
+            revision(ctx, target_instance)
+            ctx.store["calendar_instances"].put_as(target["id"] + ":" + instance["id"], target_instance)
+            instance["status"] = "cancelled"
+            revision(ctx, instance)
+        for collection in ("calendar_events", "calendar_instances"):
+            for invitation in ctx.store[collection].values():
+                if invitation["_calendar"] not in (source["id"], target["id"]) and (
+                    invitation["id"] == event_id or invitation.get("recurringEventId") == event_id
+                ):
+                    invitation["organizer"] = {"email": target["id"]}
+                    revision(ctx, invitation)
+                    await notify(ctx, invitation["_calendar"])
         event["status"] = "cancelled"
         revision(ctx, event)
         await notify(ctx, source["id"])

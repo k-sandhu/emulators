@@ -41,7 +41,11 @@ def attendee_ids(ctx: ProviderContext, payload: dict[str, Any]) -> list[str]:
     if not isinstance(participants, dict) or not isinstance(participants.get("attendees", []), list):
         raise common.graph_error(400, "BadRequest", "participants.attendees must be an array.")
     for attendee in participants.get("attendees", []):
-        if not isinstance(attendee, dict) or not isinstance(attendee.get("identity", {}), dict) or not isinstance(attendee.get("identity", {}).get("user", {}), dict):
+        if (
+            not isinstance(attendee, dict)
+            or not isinstance(attendee.get("identity", {}), dict)
+            or not isinstance(attendee.get("identity", {}).get("user", {}), dict)
+        ):
             raise common.graph_error(400, "BadRequest", "Each attendee must contain a user identity or upn.")
         identifier = attendee.get("identity", {}).get("user", {}).get("id") or attendee.get("upn")
         if not identifier:
@@ -358,7 +362,13 @@ async def add_transcript(ctx: ProviderContext, payload: dict[str, Any]) -> dict[
         try:
             start = float(turn.get("offset_s", turn.get("start", 0)))
             duration = float(turn.get("duration_s", 4))
-            if not math.isfinite(start) or not math.isfinite(duration) or start < 0 or duration <= 0 or not isinstance(turn["text"], str):
+            if (
+                not math.isfinite(start)
+                or not math.isfinite(duration)
+                or start < 0
+                or duration <= 0
+                or not isinstance(turn["text"], str)
+            ):
                 raise ValueError
         except (ValueError, TypeError, KeyError):
             raise common.graph_error(400, "BadRequest", "Invalid transcript turn.") from None

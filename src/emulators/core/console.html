@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Emulators Console</title>
+<style>
+:root{--bg:#f6f7f9;--panel:#fff;--ink:#1d2330;--muted:#667085;--line:#e4e7ec;--accent:#2f6fde;--ok:#1a7f37;--bad:#c4320a;--code:#f2f4f7}
+@media (prefers-color-scheme: dark){:root{--bg:#0f1218;--panel:#171b23;--ink:#e6e9ef;--muted:#98a2b3;--line:#2a303b;--accent:#6ea0ff;--ok:#4ac26b;--bad:#ff7a59;--code:#1f2430}}
+*{box-sizing:border-box}body{margin:0;font:14px/1.45 system-ui,-apple-system,Segoe UI,sans-serif;background:var(--bg);color:var(--ink)}
+header{display:flex;align-items:center;gap:12px;padding:12px 16px;border-bottom:1px solid var(--line);background:var(--panel);position:sticky;top:0;z-index:2}
+header h1{font-size:16px;margin:0}header .meta{color:var(--muted);font-size:12px}header .grow{flex:1}
+button{font:inherit;border:1px solid var(--line);background:var(--panel);color:var(--ink);border-radius:6px;padding:5px 10px;cursor:pointer}
+button.primary{background:var(--accent);border-color:var(--accent);color:#fff}button:hover{filter:brightness(.97)}
+.layout{display:grid;grid-template-columns:220px 1fr;min-height:calc(100vh - 53px)}
+nav{border-right:1px solid var(--line);background:var(--panel);padding:8px}nav a{display:block;padding:7px 10px;border-radius:6px;color:var(--ink);text-decoration:none}
+nav a.active{background:var(--accent);color:#fff}nav small{display:block;color:var(--muted);font-size:11px}nav a.active small{color:#e8eefc}
+main{padding:16px;min-width:0}.tabs{display:flex;gap:6px;margin:8px 0 12px;flex-wrap:wrap}.tabs button.active{background:var(--ink);color:var(--panel)}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px;margin-bottom:12px}
+table{width:100%;border-collapse:collapse;font-size:13px}td,th{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line);vertical-align:top}
+th{color:var(--muted);font-weight:600}tr.click{cursor:pointer}tr.click:hover{background:var(--code)}
+pre{background:var(--code);padding:10px;border-radius:6px;overflow:auto;max-height:480px;margin:0;font-size:12px}
+.status-2{color:var(--ok)}.status-4,.status-5{color:var(--bad)}.pill{display:inline-block;padding:1px 8px;border-radius:99px;background:var(--code);font-size:12px}
+input,select,textarea{font:inherit;padding:5px 8px;border:1px solid var(--line);border-radius:6px;background:var(--panel);color:var(--ink)}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.muted{color:var(--muted)}
+@media (max-width:720px){.layout{grid-template-columns:1fr}nav{border-right:0;border-bottom:1px solid var(--line);display:flex;overflow:auto}nav a{white-space:nowrap}}
+</style>
+</head>
+<body>
+<header><h1>Emulators Console</h1><span class="meta" id="meta"></span><span class="grow"></span>
+<button id="resetAll">Reset all</button></header>
+<div class="layout"><nav id="nav"></nav><main id="main"><p class="muted">Loading…</p></main></div>
+<script>
+const base = location.pathname.replace(/\/_emulator\/ui\/?$/, "");
+const $ = (s) => document.querySelector(s);
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+let state = {providers: {}, current: null, tab: "overview"};
+async function api(path, opts) { const r = await fetch(base + path, opts); const t = await r.text(); try { return JSON.parse(t); } catch { return t; } }
+async function load() {
+  const idx = await api("/_emulator");
+  state.providers = idx.emulators; $("#meta").textContent = `seed ${idx.seed} · anchor ${idx.anchor.slice(0,10)}`;
+  $("#nav").innerHTML = Object.entries(idx.emulators).map(([n,p]) => `<a href="#${n}" data-n="${n}">${esc(n)}<small>${esc(p.title)}</small></a>`).join("");
+  document.querySelectorAll("nav a").forEach(a => a.onclick = (e) => { e.preventDefault(); select(a.dataset.n); });
+  select(location.hash.slice(1) || Object.keys(idx.emulators)[0]);
+}
+function select(name) { state.current = name; history.replaceState(null, "", "#" + name);
+  document.querySelectorAll("nav a").forEach(a => a.classList.toggle("active", a.dataset.n === name)); render(); }
+function tabs() { return `<div class="tabs">${["overview","state","requests","webhooks","faults","tokens"].map(t => `<button class="${t===state.tab?"active":""}" data-t="${t}">${t}</button>`).join("")}<span class="grow"></span><button id="resetOne">Reset ${esc(state.current)}</button></div>`; }
+async function render() {
+  const n = state.current, p = `/${n}/_emulator`;
+  let body = "";
+  if (state.tab === "overview") {
+    const info = await api(`${p}/info`);
+    body = `<div class="card"><h3>${esc(info.title)}</h3><p class="muted">${esc(info.description)}</p>
+      <p><b>Hosts:</b> ${info.hosts.map(h=>`<span class="pill">${esc(h)}</span>`).join(" ")}</p>
+      <p><b>Prefix base:</b> <code>${esc(location.origin + base + "/" + n)}</code> · <b>Port:</b> ${info.default_port} · <a href="${base}/${n}/_emulator/docs" target="_blank">OpenAPI</a></p></div>
+      <div class="card"><h4>Test credentials</h4><pre>${esc(JSON.stringify(info.credentials, null, 2))}</pre></div>
+      <div class="card"><h4>Actions</h4>${info.actions.length ? info.actions.map(a=>`<span class="pill">POST ${p}/actions/${esc(a)}</span>`).join(" ") : '<span class="muted">none</span>'}</div>
+      <div class="card"><h4>Seeded collections</h4><table>${Object.entries(info.collections).map(([k,v])=>`<tr><td>${esc(k)}</td><td>${v}</td></tr>`).join("")}</table></div>`;
+  } else if (state.tab === "state") {
+    const s = await api(`${p}/state`);
+    body = `<div class="card"><div class="row"><select id="coll">${Object.entries(s).map(([k,v])=>`<option value="${esc(k)}">${esc(k)} (${v})</option>`).join("")}</select><button id="show" class="primary">Show</button></div></div><div id="recs"></div>`;
+  } else if (state.tab === "requests") {
+    const j = await api(`${p}/requests?limit=200`);
+    body = `<div class="card"><div class="row"><button id="refresh">Refresh</button><button id="clearReq">Clear</button><span class="muted">${j.count} requests</span></div></div>
+      <div class="card"><table><tr><th>#</th><th>time</th><th>method</th><th>host + path</th><th>status</th><th>ms</th></tr>
+      ${j.requests.slice().reverse().map((r,i)=>`<tr class="click" data-i="${i}"><td>${r.seq}</td><td>${esc(r.time.slice(11,23))}</td><td>${esc(r.method)}</td><td>${esc(r.host)}${esc(r.path)}${r.query?"?"+esc(r.query):""}</td><td class="status-${String(r.status)[0]}">${r.status}${r.fault?' <span class="pill">fault</span>':""}</td><td>${r.duration_ms}</td></tr>`).join("")}</table></div><div id="detail"></div>`;
+    state.lastRequests = j.requests.slice().reverse();
+  } else if (state.tab === "webhooks") {
+    const w = await api(`${p}/webhooks`);
+    body = `<div class="card"><div class="row"><button id="refresh">Refresh</button><button id="flush">Flush (manual mode)</button><span class="muted">${w.count} deliveries</span></div></div>
+      <div class="card"><table><tr><th>created</th><th>event</th><th>url</th><th>status</th><th>attempts</th><th>response</th></tr>
+      ${w.deliveries.slice().reverse().map((d,i)=>`<tr class="click" data-w="${i}"><td>${esc(d.created_at)}</td><td>${esc(d.event_type)}</td><td>${esc(d.url)}</td><td>${esc(d.status)}</td><td>${d.attempts}</td><td>${d.response_status ?? esc(d.error ?? "")}</td></tr>`).join("")}</table></div><div id="detail"></div>`;
+    state.lastWebhooks = w.deliveries.slice().reverse();
+  } else if (state.tab === "faults") {
+    const f = await api(`${p}/faults`);
+    body = `<div class="card"><h4>Add a fault</h4><div class="row">
+      <input id="fPath" placeholder="path regex, e.g. /v1.0/me/messages" size="34"><input id="fMethod" placeholder="method" size="6">
+      <input id="fStatus" placeholder="status" size="5" value="429"><input id="fTimes" placeholder="times" size="5" value="1">
+      <input id="fDelay" placeholder="delay ms" size="7"><button id="addFault" class="primary">Add</button><button id="clearFaults">Clear all</button></div></div>
+      <div class="card"><pre>${esc(JSON.stringify(f.faults, null, 2))}</pre></div>`;
+  } else if (state.tab === "tokens") {
+    body = `<div class="card"><h4>Mint an access token</h4><div class="row"><input id="tUser" placeholder="user: p018 or maya.chen@halcyonadvisory.example" size="44">
+      <input id="tScopes" placeholder="scopes (space separated)" size="30"><label><input type="checkbox" id="tApp"> app-only</label><button id="mint" class="primary">Mint</button></div></div><div id="tok"></div>`;
+  }
+  $("#main").innerHTML = tabs() + body;
+  document.querySelectorAll(".tabs button[data-t]").forEach(b => b.onclick = () => { state.tab = b.dataset.t; render(); });
+  $("#resetOne").onclick = async () => { await api(`${p}/reset`, {method: "POST"}); render(); };
+  const on = (id, fn) => { const el = $(id); if (el) el.onclick = fn; };
+  on("#show", async () => { const c = $("#coll").value; const d = await api(`${p}/state/${encodeURIComponent(c)}?limit=50`);
+    $("#recs").innerHTML = `<div class="card"><p class="muted">${d.count} records (first 50)</p><pre>${esc(JSON.stringify(d.records, null, 2))}</pre></div>`; });
+  on("#refresh", render);
+  on("#clearReq", async () => { await api(`${p}/requests`, {method: "DELETE"}); render(); });
+  on("#flush", async () => { await api(`${p}/webhooks/flush`, {method: "POST"}); render(); });
+  on("#clearFaults", async () => { await api(`${p}/faults`, {method: "DELETE"}); render(); });
+  on("#addFault", async () => { const rule = {path: $("#fPath").value || ".*", method: $("#fMethod").value || null,
+      status: $("#fStatus").value ? Number($("#fStatus").value) : null, times: $("#fTimes").value ? Number($("#fTimes").value) : null,
+      delay_ms: Number($("#fDelay").value || 0)};
+    await api(`${p}/faults`, {method: "POST", headers: {"content-type": "application/json"}, body: JSON.stringify(rule)}); render(); });
+  on("#mint", async () => { const payload = {user: $("#tUser").value || null, scopes: $("#tScopes").value.split(/\s+/).filter(Boolean), app_only: $("#tApp").checked};
+    const t = await api(`${p}/tokens`, {method: "POST", headers: {"content-type": "application/json"}, body: JSON.stringify(payload)});
+    $("#tok").innerHTML = `<div class="card"><pre>${esc(JSON.stringify(t, null, 2))}</pre></div>`; });
+  document.querySelectorAll("tr[data-i]").forEach(tr => tr.onclick = () => { $("#detail").innerHTML = `<div class="card"><pre>${esc(JSON.stringify(state.lastRequests[tr.dataset.i], null, 2))}</pre></div>`; });
+  document.querySelectorAll("tr[data-w]").forEach(tr => tr.onclick = () => { $("#detail").innerHTML = `<div class="card"><pre>${esc(JSON.stringify(state.lastWebhooks[tr.dataset.w], null, 2))}</pre></div>`; });
+}
+$("#resetAll").onclick = async () => { await api("/_emulator/reset", {method: "POST"}); render(); };
+load();
+</script>
+</body>
+</html>

@@ -15,3 +15,5 @@ certs/
 .coverage
 htmlcov/
 node_modules/
+.tmp*/
+**/.tmp-*/

@@ -81,6 +81,9 @@ async def test_engagement_tracker_mutations_and_site_permissions(make_client: Ca
         url = site_url + f"/lists/{listing['id']}/items"
         seeded = (await client.get(url, headers=writer, params={"$expand": "fields"})).json()["value"]
         assert len(seeded) == len(client.hub.world.engagements)
+        first_title = seeded[0]["fields"]["Title"].replace("'", "''")
+        filtered = (await client.get(url, headers=writer, params={"$filter": f"fields/Title eq '{first_title}'"})).json()["value"]
+        assert filtered and filtered[0]["id"] == seeded[0]["id"] and "fields" not in filtered[0]
         assert set(seeded[0]["fields"]) >= {
             "Title",
             "Client",
@@ -121,6 +124,8 @@ async def test_engagement_tracker_mutations_and_site_permissions(make_client: Ca
         ).status_code == 400
         assert (await client.delete(url + f"/{item['id']}", headers=writer)).status_code == 204
         assert (await client.get(url + f"/{item['id']}", headers=writer)).status_code == 404
+        next_item = await client.post(url, headers=writer, json={"fields": {"Title": "Next engagement"}})
+        assert int(next_item.json()["id"]) > int(item["id"])
         external = bearer(await mint(client, BASE, user=client.hub.world.external_people[0].id))
         assert (await client.get(site_url, headers=external)).status_code == 404
         assert (await client.get(BASE + "/v1.0/sites/root", headers=external)).status_code == 404

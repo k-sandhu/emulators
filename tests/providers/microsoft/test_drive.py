@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import re
+import struct
 from collections.abc import Callable
 from datetime import timedelta
 from typing import Any
@@ -17,6 +18,7 @@ from emulators.providers.microsoft import common
 from emulators.providers.microsoft import drive_model as dm
 from emulators.providers.microsoft.quickxor import quickxor_hash
 from emulators.testing.helpers import bearer, mint
+from emulators.world import documents
 
 BASE = "https://graph.microsoft.com"
 
@@ -120,6 +122,10 @@ async def test_download_capability_range_expiry_versions_thumbnails(make_client:
         thumbs = (await client.get(root + f"/items/{item['id']}/thumbnails", headers=auth)).json()["value"]
         image = await client.get(thumbs[0]["small"]["url"], headers=auth)
         assert image.content.startswith(b"\x89PNG")
+        assert struct.unpack(">II", image.content[16:24]) == (96, 96)
+        assert (await client.get(root + f"/items/{item['id']}/thumbnails/0", headers=auth)).json()["small"][
+            "width"
+        ] == 96
         expanded = (
             await client.get(root + f"/items/{item['id']}", headers=auth, params={"$expand": "thumbnails"})
         ).json()
@@ -244,7 +250,9 @@ async def test_drive_acl_direct_share_read_only_and_revocation(make_client: Call
         assert (
             await client.patch(absolute, headers=other, json={"description": "Shared annotation"})
         ).status_code == 200
-        assert (await client.put(absolute + "/content", headers=other, content=b"shared writer update")).status_code == 200
+        assert (
+            await client.put(absolute + "/content", headers=other, content=b"shared writer update")
+        ).status_code == 200
         assert (
             await client.delete(absolute + f"/permissions/{permission['id']}", headers=owner)
         ).status_code == 204
@@ -374,18 +382,57 @@ async def test_group_invites_and_bad_json_have_graph_errors(make_client: Callabl
         auth = bearer(await mint(client, BASE, user="p018"))
         base = BASE + "/v1.0/me/drive"
         for body in (b"{broken", b"[]", b"null"):
-            invalid = await client.post(base + "/root/children", headers={**auth, "Content-Type": "application/json"}, content=body)
+            invalid = await client.post(
+                base + "/root/children", headers={**auth, "Content-Type": "application/json"}, content=body
+            )
             assert invalid.status_code == 400
             assert invalid.json()["error"]["code"] == "invalidRequest"
-        item = (await client.put(base + "/root:/group-share.txt:/content", headers=auth, content=b"group grant")).json()
+        item = (
+            await client.put(base + "/root:/group-share.txt:/content", headers=auth, content=b"group grant")
+        ).json()
         url = base + "/items/" + item["id"]
         group = client.hub.world.group("g-finance")
-        invitation = await client.post(url + "/invite", headers=auth, json={"recipients": [{"objectId": common.group_id(client.hub.world, group.id)}], "roles": ["read"]})
+        invitation = await client.post(
+            url + "/invite",
+            headers=auth,
+            json={
+                "recipients": [{"objectId": common.group_id(client.hub.world, group.id)}],
+                "roles": ["read"],
+            },
+        )
         assert invitation.status_code == 200, invitation.text
         permission = invitation.json()["value"][0]
         assert "group" in permission["grantedToV2"]
         assert (await client.get(url + "/permissions/" + permission["id"], headers=auth)).status_code == 200
         reader = bearer(await mint(client, BASE, user=group.member_ids[0]))
         did = item["parentReference"]["driveId"]
-        assert (await client.get(BASE + f"/v1.0/drives/{did}/items/{item['id']}", headers=reader)).status_code == 200
+        assert (
+            await client.get(BASE + f"/v1.0/drives/{did}/items/{item['id']}", headers=reader)
+        ).status_code == 200
         assert (await client.patch(url, headers=auth, json={"parentReference": "invalid"})).status_code == 400
+
+
+@pytest.mark.parametrize("kind", ["docx", "xlsx", "pptx"])
+async def test_uploaded_office_files_convert_from_actual_content(
+    make_client: Callable[..., Any], kind: str
+) -> None:
+    import io
+
+    from pypdf import PdfReader
+
+    async with make_client("microsoft") as client:
+        auth = bearer(await mint(client, BASE, user="p018"))
+        data, mime = documents.render(kind, "Uploaded contract", ["Distinct uploaded document text."])
+        uploaded = await client.put(
+            BASE + f"/v1.0/me/drive/root:/uploaded.{kind}:/content",
+            headers={**auth, "Content-Type": mime},
+            content=data,
+        )
+        assert uploaded.status_code == 201
+        redirect = await client.get(
+            BASE + f"/v1.0/me/drive/items/{uploaded.json()['id']}/content?format=pdf", headers=auth
+        )
+        assert redirect.status_code == 302, redirect.text
+        pdf = await client.get(redirect.headers["location"])
+        text = "".join(page.extract_text() for page in PdfReader(io.BytesIO(pdf.content)).pages)
+        assert "Distinct uploaded document text." in text

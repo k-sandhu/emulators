@@ -194,3 +194,41 @@ async def test_runtime_recurring_series_expands_across_dst(make_client: Callable
         )
         assert len(view.json()["value"]) == 3
         assert (await client.delete(f"/v1.0/me/events/{master['id']}")).status_code == 204
+
+
+async def test_calendar_view_delta_filters_range_and_tombstones_moved_events(
+    make_client: Callable[..., Any],
+) -> None:
+    async with make_client("microsoft", base_url=BASE) as client:
+        client.headers.update(bearer(await mint(client, BASE, user="p018")))
+        payload = {
+            "subject": "Delta range contract",
+            "start": {"dateTime": "2030-01-10T09:00:00", "timeZone": "UTC"},
+            "end": {"dateTime": "2030-01-10T10:00:00", "timeZone": "UTC"},
+        }
+        event = (await client.post("/v1.0/me/events", json=payload)).json()
+        delta = (
+            await client.get(
+                "/v1.0/me/calendarView/delta",
+                params={"startDateTime": "2030-01-10T00:00:00Z", "endDateTime": "2030-01-11T00:00:00Z"},
+            )
+        ).json()["@odata.deltaLink"]
+        await client.post(
+            "/v1.0/me/events",
+            json={
+                **payload,
+                "start": {"dateTime": "2030-01-12T09:00:00", "timeZone": "UTC"},
+                "end": {"dateTime": "2030-01-12T10:00:00", "timeZone": "UTC"},
+            },
+        )
+        assert (await client.get(delta)).json()["value"] == []
+        await client.patch(
+            f"/v1.0/me/events/{event['id']}",
+            json={
+                "start": {"dateTime": "2030-01-13T09:00:00", "timeZone": "UTC"},
+                "end": {"dateTime": "2030-01-13T10:00:00", "timeZone": "UTC"},
+            },
+        )
+        assert (await client.get(delta)).json()["value"] == [
+            {"id": event["id"], "@removed": {"reason": "deleted"}}
+        ]

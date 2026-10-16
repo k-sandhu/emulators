@@ -74,7 +74,9 @@ async def record_change(
     ctx.store.collection("drive_changes").put(change)
     for channel in ctx.store.collection("drive_channels"):
         actor = Principal(channel.get("_person"), channel.get("_person") is None, channel["_client"])
-        if channel.get("_file") == row["id"] and (actor.person_id in audience or (not drive and role_for(ctx, row, actor))):
+        if channel.get("_file") == row["id"] and (
+            actor.person_id in audience or (not drive and role_for(ctx, row, actor))
+        ):
             await notify(ctx, channel, state, changed)
         elif (
             channel.get("_changes")

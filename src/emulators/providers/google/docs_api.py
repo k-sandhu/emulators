@@ -96,7 +96,10 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         for item in data.get("requests", []):
             if "insertText" in item:
                 edit = item["insertText"]
-                offset = edit.get("location", {}).get("index", utf16_len(text)) - 1
+                location = edit.get("location", {}).get("index", utf16_len(text))
+                if not isinstance(location, int):
+                    raise google_error(400, "Invalid insertion index", legacy=False)
+                offset = location - 1
                 encoded = text.encode("utf-16-le")
                 if (
                     not isinstance(offset, int)

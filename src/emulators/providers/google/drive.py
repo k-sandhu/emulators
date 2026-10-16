@@ -211,6 +211,7 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
     @app.post("/drive/v3/files")
     async def create(request: Request) -> dict[str, Any]:
         actor = principal(request, ctx)
+        select({"kind": "drive#file"}, request.query_params.get("fields"), DEFAULT_FILE)
         metadata = await json_object(request)
         row = await create_file(ctx, actor, metadata)
         return select(file_shape(ctx, request, row, actor), request.query_params.get("fields"), DEFAULT_FILE)
@@ -253,6 +254,7 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
     @app.patch("/drive/v3/files/{fid}")
     async def update(fid: str, request: Request) -> dict[str, Any]:
         actor = principal(request, ctx)
+        select({"kind": "drive#file"}, request.query_params.get("fields"), DEFAULT_FILE)
         supports(request, get_file(ctx, actor, fid))
         row = await update_file(ctx, request, actor, fid, await json_object(request))
         return select(file_shape(ctx, request, row, actor), request.query_params.get("fields"), DEFAULT_FILE)
@@ -274,6 +276,15 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         metadata = await json_object(request)
         metadata.setdefault("name", "Copy of " + row["name"])
         metadata.setdefault("mimeType", row["mimeType"])
+        if "parents" not in metadata:
+            writable_parents = [
+                p
+                for p in row.get("parents", [])
+                if (parent := ctx.store.collection("drive_files").get(p))
+                and role_for(ctx, parent, actor) in ("owner", "organizer", "fileOrganizer", "writer")
+            ]
+            if writable_parents:
+                metadata["parents"] = writable_parents[:1]
         new = await create_file(
             ctx, actor, metadata, binary(ctx, row) if row["mimeType"] not in NATIVE else None
         )

@@ -9,7 +9,9 @@ from typing import Any
 
 import pytest
 import requests
+from google.auth.transport.requests import Request as GoogleRequest
 from google.oauth2.credentials import Credentials
+from google.oauth2.service_account import Credentials as ServiceCredentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseUpload
@@ -153,3 +155,50 @@ def test_calendar_discovery_recurrence_freebusy_and_settings(emulator_intercept:
     assert busy["calendars"]["primary"]["busy"]
     assert service.settings().get(setting="timezone").execute()["value"] == "America/Toronto"
     assert len(service.colors().get().execute()["event"]) == 11
+
+
+def test_workspace_service_account_impersonation(emulator_intercept: Any) -> None:
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    pem = key.private_bytes(
+        serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()
+    ).decode()
+    service = ServiceCredentials.from_service_account_info(
+        {
+            "type": "service_account",
+            "client_email": "workspace-test@halcyonadvisory.example",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "private_key": pem,
+            "private_key_id": "workspace-test",
+        },
+        scopes=[
+            "https://www.googleapis.com/auth/gmail.readonly",
+            "https://www.googleapis.com/auth/calendar.readonly",
+            "https://www.googleapis.com/auth/meetings.space.readonly",
+        ],
+    )
+    delegated = service.with_subject("maya.chen@halcyonadvisory.example")
+    delegated.refresh(GoogleRequest())
+    gmail = build("gmail", "v1", credentials=delegated, static_discovery=True)
+    assert (
+        gmail.users().getProfile(userId="me").execute()["emailAddress"] == "maya.chen@halcyonadvisory.example"
+    )
+    calendar = build("calendar", "v3", credentials=delegated, static_discovery=True)
+    assert (
+        calendar.calendars().get(calendarId="primary").execute()["id"] == "maya.chen@halcyonadvisory.example"
+    )
+    meet = requests.get(
+        "https://meet.googleapis.com/v2/conferenceRecords",
+        headers={"Authorization": "Bearer " + delegated.token},
+        timeout=10,
+    )
+    assert meet.status_code == 200 and meet.json()["conferenceRecords"]
+    service.refresh(GoogleRequest())
+    app_only = build("gmail", "v1", credentials=service, static_discovery=True)
+    with pytest.raises(HttpError) as denied:
+        app_only.users().getProfile(userId="me").execute()
+    assert denied.value.resp.status == 403
+    for api in (gmail, calendar, app_only):
+        api.close()

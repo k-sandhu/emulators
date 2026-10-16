@@ -69,7 +69,14 @@ async def handle(
                 raise common.graph_error(400, "invalidRequest", "Each recipient must be an object.")
             email = recipient.get("email")
             person = ctx.world.person_by_email(email) if isinstance(email, str) else None
-            group = next((g for g in ctx.world.groups if g.email == email or common.group_id(ctx.world, g.id) == recipient.get("objectId")), None)
+            group = next(
+                (
+                    g
+                    for g in ctx.world.groups
+                    if g.email == email or common.group_id(ctx.world, g.id) == recipient.get("objectId")
+                ),
+                None,
+            )
             if person is None and recipient.get("objectId"):
                 try:
                     person = ctx.world.person(dm.person_id(ctx, recipient["objectId"]))
@@ -81,6 +88,8 @@ async def handle(
                 )
             resolved.append((person.id, person.email) if person else (group.id, group.email))
         if payload.get("retainInheritedPermissions") is False:
+            if not any(r.get("_item") == item["id"] and item["_owner"] in r.get("_principals", []) and "owner" in r["roles"] for r in dm.permissions(ctx, item)):
+                dm.add_permission(ctx, item, item["_owner"], ["owner"])
             item["_restricted"] = True
         results = [
             dm.add_permission(

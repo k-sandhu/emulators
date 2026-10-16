@@ -264,7 +264,11 @@ def validate_event(record: dict[str, Any]) -> None:
     ):
         raise google_error(400, "The specified time range is empty.", reason="timeRangeEmpty")
     for rule in record.get("recurrence", []):
-        if not rule.startswith("RRULE:") or not re.search(r"FREQ=(DAILY|WEEKLY|MONTHLY|YEARLY)(;|$)", rule):
+        if (
+            not isinstance(rule, str)
+            or not rule.startswith("RRULE:")
+            or not re.search(r"FREQ=(DAILY|WEEKLY|MONTHLY|YEARLY)(;|$)", rule)
+        ):
             raise google_error(400, "Invalid recurrence rule", reason="badRequest")
         try:
             parts = dict(item.split("=", 1) for item in rule[6:].split(";"))
@@ -347,7 +351,11 @@ def expand(
             rows = [
                 dict(r, status="cancelled", _rev=max(r.get("_rev", 0), master.get("_rev", 0))) for r in rows
             ]
-        return rows
+        return [
+            r
+            for r in rows
+            if (not low or instant(r["end"]) > low) and (not high or instant(r["start"]) < high)
+        ]
     rule = dict(part.split("=", 1) for part in master["recurrence"][0][6:].split(";") if "=" in part)
     tz = ZoneInfo(master["start"].get("timeZone", "UTC"))
     start = instant(master["start"]).astimezone(tz)

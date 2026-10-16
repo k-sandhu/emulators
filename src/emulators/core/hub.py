@@ -24,7 +24,7 @@ from typing import Any
 import httpx
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import HTMLResponse, JSONResponse
 from starlette.routing import Mount, Route
 
 from emulators.core.app import build_provider_app
@@ -214,12 +214,18 @@ class EmulatorHub:
         async def health(request: Request) -> JSONResponse:
             return JSONResponse({"status": "ok", "providers": list(hub.providers)})
 
+        async def console(request: Request) -> HTMLResponse:
+            from importlib.resources import files
+
+            return HTMLResponse(files("emulators.core").joinpath("console.html").read_text(encoding="utf-8"))
+
         routes: list[Any] = [
             Route("/", index),
             Route("/_emulator", index),
             Route("/_emulator/health", health),
             Route("/_emulator/reset", reset_all, methods=["POST"]),
             Route("/_emulator/clock", clock, methods=["GET", "POST"]),
+            Route("/_emulator/ui", console),
         ]
         routes += [Mount(f"/{name}", app=app) for name, app in self.apps.items()]
         prefix_app = Starlette(routes=routes)

@@ -64,7 +64,7 @@ In the drive rows, `{D}` means any of `/me/drive`, `/users/{userId}/drive`,
 | GET | `{D}/root`, `{I}`, `{D}/root/children`, `{I}/children` | Real folder tree; default page 200; `$top`, `$orderby`, `$select`, `$expand=thumbnails`. |
 | GET | `{D}/root:/Clients/Northwind Logistics:`, `{D}/root:/...:/children`, `{D}/items/{id}:/sub/path:` | Case-insensitive path segments; percent-encoded names work. |
 | GET | `{I}/content` | 302 to an expiring, preauthenticated SharePoint URL. Download accepts byte Range and conditional ETag requests. |
-| GET | `{I}/content?format=pdf` | PDF rendition of seeded DOCX/XLSX/PPTX/PDF document text. |
+| GET | `{I}/content?format=pdf` | PDF rendition of seeded or uploaded DOCX/XLSX/PPTX document text; PDF passthrough. |
 | PUT | `{D}/root:/{name}:/content`, `{D}/items/{parent}:/{name}:/content`, `{I}/content` | Simple create/replace; `If-Match`; `@microsoft.graph.conflictBehavior=fail/replace/rename`. |
 | POST | `{D}/root:/{name}:/createUploadSession`, `{D}/items/{parent}:/{name}:/createUploadSession`, `{I}/createUploadSession` | Expiring SharePoint upload URL; sequential Content-Range fragments; 202 progress and final 200/201. |
 | GET, PUT, DELETE | returned upload URL | Inspect progress, upload fragments, cancel. No bearer token needed. Non-final fragments are multiples of 320 KiB; fragments must be under 60 MiB. |
@@ -176,8 +176,9 @@ and delta cursors. Immutable cached blob bytes remain reusable.
 * Copy jobs complete immediately. Upload sessions support sequential fragments and
   cancellation; deferred commit and automatic session cleanup are not implemented.
   Seeded historical versions have metadata only; upload replacement versions retain
-  actual prior bytes. PDF conversion uses seeded document text; arbitrary uploaded
-  Office file conversion and historically exact seeded versions are not implemented.
+  actual prior bytes. PDF conversion extracts document text rather than reproducing
+  Office page layout, embedded graphics, formulas or slide styling. Historically exact
+  seeded version bytes are not available.
 * Thumbnails are synthetic PNG previews. Recent uses modification time rather than
   personal view telemetry. sharedWithMe includes direct person/group shares and does
   not reproduce Microsoft's complete remote-item ranking and discovery rules.

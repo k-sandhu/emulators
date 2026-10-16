@@ -5,9 +5,12 @@ from __future__ import annotations
 import io
 from collections.abc import Iterator
 
+import httpx
 import pytest
 import stripe
+from fastapi import FastAPI, Request
 
+from emulators.core.hub import EmulatorHub
 from emulators.providers.stripe.wire import SECRET_KEY
 
 pytestmark = pytest.mark.sdk
@@ -169,3 +172,44 @@ def test_modern_stripe_client_and_test_clock() -> None:
         == 1792195200
     )
     assert client.v1.test_helpers.test_clocks.delete(clock.id).deleted
+
+
+def test_webhook_signature_verified_by_official_sdk(emulators: EmulatorHub) -> None:
+    received: list[tuple[bytes, str]] = []
+    receiver = FastAPI()
+
+    @receiver.post("/stripe")
+    async def hook(request: Request) -> dict:
+        received.append((await request.body(), request.headers["stripe-signature"]))
+        return {}
+
+    emulators.webhook_transport = httpx.ASGITransport(app=receiver)
+    endpoint = stripe.WebhookEndpoint.create(
+        url="https://consumer.example/stripe", enabled_events=["customer.created"]
+    )
+    customer = stripe.Customer.create(email="signed-webhook@halcyonadvisory.example")
+    payload, signature = received[-1]
+    event = stripe.Webhook.construct_event(payload, signature, endpoint.secret)
+    assert event.type == "customer.created" and event.data.object.id == customer.id
+    stripe.WebhookEndpoint.delete(endpoint.id)
+    emulators.webhook_transport = None
+
+
+def test_connect_oauth_read_only_and_refresh(emulators: EmulatorHub) -> None:
+    ctx = emulators.context("stripe")
+    code = ctx.tokens.issue_code(
+        client_id="ca_sdk",
+        user_id=ctx.world.org.stripe_account_id,
+        scopes=["read_only"],
+        redirect_uri="https://halcyonadvisory.example/oauth",
+    )
+    token = stripe.OAuth.token(grant_type="authorization_code", code=code.token, client_secret=SECRET_KEY)
+    assert token.stripe_user_id == ctx.world.org.stripe_account_id
+    assert stripe.Customer.list(api_key=token.access_token, limit=1).data
+    with pytest.raises(stripe.PermissionError):
+        stripe.Customer.create(api_key=token.access_token, name="Denied")
+    refreshed = stripe.OAuth.token(
+        grant_type="refresh_token", refresh_token=token.refresh_token, client_secret=SECRET_KEY
+    )
+    with pytest.raises(stripe.PermissionError):
+        stripe.Customer.create(api_key=refreshed.access_token, name="Denied")

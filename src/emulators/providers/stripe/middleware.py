@@ -11,6 +11,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from emulators.core.auth import basic_credentials, bearer_token
 from emulators.core.errors import EmulatorError
 from emulators.core.provider import ProviderContext
 from emulators.providers.stripe.common import BaseAPI
@@ -67,12 +68,15 @@ class StripeMiddleware:
             parsed = body.hex()
         fingerprint = hashlib.sha256(
             json.dumps(
-                [scope["path"], scope.get("query_string", b"").decode(), parsed], sort_keys=True
+                ["/v1/" + scope["path"].split("/v1/", 1)[-1], decode(scope.get("query_string", b"")), parsed],
+                sort_keys=True,
             ).encode()
         ).hexdigest()
         namespace = hashlib.sha256(
             (
-                request.headers.get("authorization", "") + "|" + request.headers.get("stripe-account", "")
+                (bearer_token(request) or (basic_credentials(request) or ("", ""))[0])
+                + "|"
+                + request.headers.get("stripe-account", "")
             ).encode()
         ).hexdigest()
         storage_key = namespace + ":" + key

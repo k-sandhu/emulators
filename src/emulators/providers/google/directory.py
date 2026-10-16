@@ -34,14 +34,29 @@ def clean(record: dict[str, Any]) -> dict[str, Any]:
 
 def admin(request: Request, ctx: ProviderContext, *, public: bool = False) -> None:
     actor = principal(request, ctx)
-    area = next((scope for segment, scope in (("/users", "user"), ("/groups", "group"), ("/orgunits", "orgunit"), ("/resources/calendars", "resource.calendar"), ("/domains", "domain")) if segment in request.url.path), "customer")
+    area = next(
+        (
+            scope
+            for segment, scope in (
+                ("/users", "user"),
+                ("/groups", "group"),
+                ("/orgunits", "orgunit"),
+                ("/resources/calendars", "resource.calendar"),
+                ("/domains", "domain"),
+            )
+            if segment in request.url.path
+        ),
+        "customer",
+    )
     scopes = {"https://www.googleapis.com/auth/admin.directory." + area}
     if area == "group" and ("/members" in request.url.path or "/hasMember" in request.url.path):
         scopes.add("https://www.googleapis.com/auth/admin.directory.group.member")
     if request.method == "GET":
         scopes |= {scope + ".readonly" for scope in list(scopes)}
     if actor.scopes and not scopes.intersection(actor.scopes):
-        raise google_error(403, "Request had insufficient authentication scopes.", reason="insufficientPermissions")
+        raise google_error(
+            403, "Request had insufficient authentication scopes.", reason="insufficientPermissions"
+        )
     record = next(
         (r for r in ctx.store.collection("directory_users") if r.get("_person") == actor.person_id), None
     )
@@ -863,7 +878,7 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
                         "kind": "admin#directory#resources#calendars#CalendarResource",
                         "resourceId": rid,
                         "resourceName": f"{city} - {name} ({capacity})",
-                        "resourceEmail": f"{rid}@resource.calendar.google.com",
+                        "resourceEmail": f"{rid}@resources.halcyonadvisory.example",
                         "resourceDescription": f"{name} at {office.name}",
                         "resourceType": "Conference Room",
                         "resourceCategory": "CONFERENCE_ROOM",
