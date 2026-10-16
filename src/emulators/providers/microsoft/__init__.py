@@ -9,6 +9,7 @@ may define ``seed(ctx)`` and ``register(app, ctx)``; both are called in ``MODULE
 from __future__ import annotations
 
 import importlib
+import uuid
 from typing import Any
 
 from fastapi import FastAPI
@@ -62,6 +63,30 @@ class MicrosoftProvider(Provider):
 
     def error_body(self, status: int, code: str, message: str) -> Any:
         return common.error_body(code, message)
+
+    def error_body_for(self, scope: dict[str, Any] | None, status: int, code: str, message: str) -> Any:
+        # login.microsoftonline.com speaks OAuth (AADSTS) errors, not Graph's envelope.
+        headers = dict((scope or {}).get("headers") or [])
+        host = (
+            (headers.get(b"x-forwarded-host") or headers.get(b"host") or b"").decode("latin-1").split(":")[0]
+        )
+        if host in ("login.microsoftonline.com", "login.windows.net") or "/oauth2/" in (scope or {}).get(
+            "path", ""
+        ):
+            error = {429: "temporarily_unavailable", 503: "temporarily_unavailable"}.get(
+                status, "invalid_request"
+            )
+            return {
+                "error": error,
+                "error_description": f"AADSTS90000: {message}",
+                "error_codes": [90000],
+                "error_uri": "https://login.microsoftonline.com/error?code=90000",
+            }
+        return common.error_body(code, message)
+
+    def error_headers_for(self, scope: dict[str, Any] | None, status: int) -> dict[str, str]:
+        rid = str(uuid.uuid4())
+        return {"request-id": rid, "client-request-id": rid}
 
     def seed(self, ctx: ProviderContext) -> None:
         for module in _modules():
