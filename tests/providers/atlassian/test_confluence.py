@@ -304,7 +304,7 @@ async def test_restrictions_operations_and_ancestor_filtering(
 async def test_content_property_crud_and_optimistic_version(
     client: httpx.AsyncClient, auth: dict[str, str], resource: str
 ) -> None:
-    parent = (await create_page(client, auth))["id"] if resource == "pages" else KB
+    parent = (await create_page(client, auth))["id"] if resource == "pages" else CLIENTS
     if resource == "blogposts":
         parent = (
             await client.post(
@@ -315,7 +315,7 @@ async def test_content_property_crud_and_optimistic_version(
     response = await client.post(
         path, headers=auth, json={"key": "connector.checkpoint", "value": {"cursor": 7}}
     )
-    assert response.status_code == 200
+    assert response.status_code == (201 if resource == "spaces" else 200)
     prop = response.json()
     assert prop["version"]["number"] == 1
     assert (await client.get(path, headers=auth, params={"key": "connector.checkpoint"})).json()["results"][

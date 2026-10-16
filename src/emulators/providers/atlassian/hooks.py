@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from urllib.parse import urlsplit
 
+import httpx
 from fastapi import Request
 
 from emulators.core.clock import parse_instant
@@ -21,7 +22,13 @@ def configure_webhook(ctx: ProviderContext, payload: Record) -> Record:
     """Subscribe a receiver to page_created/page_updated or Jira issue events."""
     url = payload.get("url", "")
     events = payload.get("events", sorted(EVENTS))
-    if not isinstance(url, str) or urlsplit(url).scheme not in ("http", "https") or not urlsplit(url).netloc:
+    try:
+        valid_url = (
+            isinstance(url, str) and urlsplit(url).scheme in ("http", "https") and bool(httpx.URL(url).host)
+        )
+    except (ValueError, httpx.InvalidURL):
+        valid_url = False
+    if not valid_url:
         raise EmulatorError(400, error_body(400, "An HTTP(S) url is required."))
     if (
         not isinstance(events, list)
@@ -29,11 +36,13 @@ def configure_webhook(ctx: ProviderContext, payload: Record) -> Record:
         or any(not isinstance(e, str) or e not in EVENTS for e in events)
     ):
         raise EmulatorError(400, error_body(400, "Unsupported webhook event."))
+    if not isinstance(payload.get("secret", ""), str):
+        raise EmulatorError(400, error_body(400, "secret must be a string."))
     record = {
         "id": ctx.ids.prefixed("hook", 16),
         "url": url,
         "events": events,
-        "secret": str(payload.get("secret", "")),
+        "secret": payload.get("secret", ""),
     }
     ctx.store["_subscriptions"].put(record)
     return {k: v for k, v in record.items() if k != "secret"}
@@ -99,9 +108,20 @@ async def emit(
     body = json.dumps(payload, separators=(",", ":")).encode()
     for sub in ctx.store["_subscriptions"]:
         if event in sub["events"]:
+            headers = {"X-Hub-Signature": "sha256=" + hmac_sha256_hex(sub["secret"], body)}
+            if event.startswith("jira:"):
+                headers.update(
+                    {
+                        "X-Atlassian-Webhook-Identifier": ctx.ids.guid(),
+                        "X-Atlassian-Webhook-Flow": "Primary",
+                    }
+                )
+                trace = request.headers.get("X-Atlassian-Webhook-Trace")
+                if trace and len(trace) <= 1024 and all(32 <= ord(c) <= 126 for c in trace):
+                    headers["X-Atlassian-Webhook-Trace"] = trace
             await ctx.webhooks.deliver(
                 sub["url"],
                 body,
                 event_type=event,
-                headers={"X-Hub-Signature": "sha256=" + hmac_sha256_hex(sub["secret"], body)},
+                headers=headers,
             )

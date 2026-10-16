@@ -15,7 +15,17 @@ from emulators.core.auth import Grant
 from emulators.core.provider import ProviderContext
 from emulators.world.documents import render
 
-from .common import Record, api_url, clean, fail, operations, site_url
+from .common import (
+    Record,
+    api_url,
+    clean,
+    cursor_binding,
+    cursor_token,
+    fail,
+    gateway_prefix,
+    operations,
+    site_url,
+)
 from .seed import adf, storage_body
 
 
@@ -44,11 +54,40 @@ def adf_text(node: object) -> list[str]:
     return []
 
 
+def validate_adf(request: Request, value: object) -> None:
+    if (
+        not isinstance(value, dict)
+        or value.get("type") != "doc"
+        or type(value.get("version")) is not int
+        or value.get("version") != 1
+        or not isinstance(value.get("content"), list)
+    ):
+        fail(request, 400, "Operation value must be an Atlassian Document (ADF).")
+    pending = [(value, 0)]
+    count = 0
+    while pending:
+        node, depth = pending.pop()
+        count += 1
+        if not isinstance(node, dict) or not isinstance(node.get("type"), str) or depth > 64 or count > 10000:
+            fail(request, 400, "Invalid or overly complex ADF node.")
+        if node["type"] == "text" and (not isinstance(node.get("text"), str) or not node["text"]):
+            fail(request, 400, "ADF text nodes require non-empty text.")
+        if "attrs" in node and not isinstance(node["attrs"], dict):
+            fail(request, 400, "ADF attrs must be an object.")
+        if "content" in node:
+            if not isinstance(node["content"], list):
+                fail(request, 400, "ADF content must be an array.")
+            pending.extend((child, depth + 1) for child in node["content"])
+
+
 def write_body(request: Request, body: object) -> Record:
     if not isinstance(body, dict):
         fail(request, 400, "body must be an object.")
     if "representation" not in body:
-        body = body.get("storage") or body.get("atlas_doc_format") or {}
+        nested = [body[key] for key in ("storage", "atlas_doc_format") if key in body]
+        if len(nested) != 1 or not isinstance(nested[0], dict):
+            fail(request, 400, "Exactly one body representation object is required.")
+        body = nested[0]
     representation, value = body.get("representation"), body.get("value")
     if not isinstance(value, str) or representation not in ("storage", "atlas_doc_format"):
         fail(request, 400, "body requires a storage or atlas_doc_format representation and string value.")
@@ -62,15 +101,9 @@ def write_body(request: Request, body: object) -> Record:
         }
     try:
         document = json.loads(value)
-        if (
-            not isinstance(document, dict)
-            or document.get("type") != "doc"
-            or document.get("version") != 1
-            or not isinstance(document.get("content"), list)
-        ):
-            raise ValueError
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, RecursionError):
         fail(request, 400, "Invalid Atlassian document format.")
+    validate_adf(request, document)
     return {
         "atlas_doc_format": {"representation": "atlas_doc_format", "value": value},
         "storage": {"representation": "storage", "value": storage_body("", adf_text(document))},
@@ -90,12 +123,23 @@ def body_shape(request: Request, page: Record, representation: str | None = None
     return {rep: copy.deepcopy(page["body"][rep])}
 
 
+def validate_body_format(request: Request) -> None:
+    """Validate even when the requested collection has no results."""
+    rep = request.query_params.get("body-format")
+    if rep is not None and rep not in ("storage", "atlas_doc_format", "view"):
+        fail(request, 400, "Invalid body-format.")
+
+
 def optional_field(
     request: Request, resource: str, parent_id: str, name: str, results: list[Record]
 ) -> Record:
+    path = gateway_prefix(request) + f"/wiki/api/v2/{resource}/{parent_id}/{name}"
+    meta: Record = {"hasMore": len(results) > 50}
+    if meta["hasMore"]:
+        meta["cursor"] = cursor_token(50, cursor_binding(request, path, []))
     return {
         "results": results[:50],
-        "meta": {"hasMore": len(results) > 50},
+        "meta": meta,
         "_links": {"self": api_url(request, f"/wiki/api/v2/{resource}/{parent_id}/{name}")},
     }
 
@@ -104,6 +148,9 @@ def page_shape(
     request: Request, ctx: ProviderContext, page: Record, grant: Grant, *, single: bool = False
 ) -> Record:
     result = clean(page)
+    if page.get("_type") == "blogpost":
+        for key in ("ownerId", "lastOwnerId", "parentId", "parentType", "position", "subtype"):
+            result.pop(key, None)
     result["body"] = body_shape(request, page)
     space = ctx.store["spaces"].get(page["spaceId"])
     result["_links"] = {
@@ -118,15 +165,18 @@ def page_shape(
         resource = "blogposts" if page.get("_type") == "blogpost" else "pages"
         for name, values in (
             ("labels", page["_labels"]),
-            ("versions", [h["version"] for h in reversed(page["_history"])]),
+            ("versions", [h["version"] for h in page["_history"]]),
             ("operations", operations(ctx, page, grant)),
             (
                 "properties",
-                [
-                    clean(p)
-                    for p in ctx.store["properties"]
-                    if p["_resource"] == resource and p["_parent"] == page["id"]
-                ],
+                sorted(
+                    [
+                        clean(p)
+                        for p in ctx.store["properties"]
+                        if p["_resource"] == resource and p["_parent"] == page["id"]
+                    ],
+                    key=lambda p: p["key"],
+                ),
             ),
         ):
             if request.query_params.get("include-" + name) == "true":
@@ -138,7 +188,9 @@ def space_shape(request: Request, ctx: ProviderContext, space: Record) -> Record
     result = clean(space)
     result["_links"] = {"webui": "/spaces/" + space["key"], "base": site_url(request, ctx, "/wiki")}
     rep = request.query_params.get("description-format")
-    if rep == "view":
+    if rep is None:
+        result.pop("description", None)
+    elif rep == "view":
         result["description"] = {
             "view": {
                 "value": "<p>" + html.escape(space["description"]["plain"]["value"]) + "</p>",

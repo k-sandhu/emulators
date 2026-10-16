@@ -3,23 +3,29 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+import secrets
+from collections.abc import Awaitable, Callable
+from typing import Any, NoReturn
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from emulators.core.middleware import FaultRule
-from emulators.core.provider import FAULT_DEFAULTS, Provider, ProviderContext
+from emulators.core.provider import Provider, ProviderContext
 
 from .auth import build_auth, mint_token
 from .common import API_TOKEN, CLOUD_ID, error_body, family
 from .confluence import build_downloads, build_v2
+from .delivery import AtlassianWebhooks
 from .hooks import configure_webhook
 from .jira import build_jira
 from .legacy import build_v1
 from .seed import seed
+
+
+def invalid_json_constant(value: str) -> NoReturn:
+    raise ValueError(f"Invalid JSON constant: {value}")
 
 
 class AtlassianProvider(Provider):
@@ -48,28 +54,49 @@ class AtlassianProvider(Provider):
     def error_body(self, status: int, code: str, message: str) -> Any:
         return error_body(status, message)
 
-    def fault_response(self, rule: FaultRule) -> tuple[int, dict[str, str], bytes]:
-        status, headers, body = super().fault_response(rule)
-        path = rule.path.replace("\\", "")
-        kind = (
-            "jira"
-            if "/rest/api/3" in path or "/ex/jira/" in path
-            else "v1"
-            if "/wiki/rest/" in path
-            else "v2"
-        )
-        if rule.body is None and kind != "v2":
-            message = FAULT_DEFAULTS.get(status, ("Error", "Injected fault."))[1]
-            body = json.dumps(error_body(status, message, kind)).encode()
+    def error_body_for(self, scope: dict[str, Any] | None, status: int, code: str, message: str) -> Any:
+        return error_body(status, message, family(Request(scope)) if scope else "v2")
+
+    def error_headers_for(self, scope: dict[str, Any] | None, status: int) -> dict[str, str]:
+        headers = {"X-AREQUESTID": secrets.token_hex(12), "Atl-Traceid": secrets.token_hex(16)}
         if status == 429:
-            headers = {
-                "X-RateLimit-Limit": "1000",
-                "X-RateLimit-Remaining": "0",
-                **headers,
-            }
-        return status, headers, body
+            headers.update({"X-RateLimit-Limit": "1000", "X-RateLimit-Remaining": "0"})
+        return headers
 
     def build(self, app: FastAPI, ctx: ProviderContext) -> None:
+        dispatcher = ctx.webhooks
+        ctx.webhooks = AtlassianWebhooks(
+            ctx.name,
+            ctx.store,
+            ctx.clock,
+            ctx.ids.fork("webhooks"),
+            mode=dispatcher.mode,
+            transport_factory=dispatcher.transport_factory,
+            max_attempts=dispatcher.max_attempts,
+            timeout_s=dispatcher.timeout_s,
+        )
+
+        @app.middleware("http")
+        async def response_headers(request: Request, call_next: Callable[[Request], Awaitable[Any]]) -> Any:
+            if request.method in ("POST", "PUT", "PATCH") and "json" in request.headers.get(
+                "content-type", ""
+            ):
+                try:
+                    # The decoder can exhaust its stack before FastAPI validates a body.
+                    raw = await request.body()
+                    if raw:
+                        json.loads(raw, parse_constant=invalid_json_constant)
+                except (ValueError, UnicodeError, RecursionError):
+                    return JSONResponse(
+                        error_body(400, "Invalid JSON request body.", family(request)),
+                        status_code=400,
+                        headers=self.error_headers_for(request.scope, 400),
+                    )
+            response = await call_next(request)
+            for key, value in self.error_headers_for(request.scope, response.status_code).items():
+                response.headers.setdefault(key, value)
+            return response
+
         @app.exception_handler(StarletteHTTPException)
         async def http_error(request: Request, exc: StarletteHTTPException) -> JSONResponse:
             return JSONResponse(

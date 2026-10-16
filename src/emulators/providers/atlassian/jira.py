@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 from datetime import date
 from typing import Any
 from urllib.parse import quote
@@ -32,9 +33,14 @@ from .common import (
 from .hooks import emit
 from .query import QueryError, parse_query
 from .seed import ISSUE_TYPES, PRIORITIES, jira_user, status_shape
-from .shapes import adf_text
+from .shapes import adf_text, validate_adf
 
 TRANSITIONS = {"11": "To Do", "21": "In Progress", "31": "Done"}
+COMMENT_ROLES = {
+    "Administrators": ("owner",),
+    "Developers": ("owner", "editor"),
+    "Users": ("owner", "editor", "viewer", "commenter"),
+}
 
 
 def project_role(ctx: ProviderContext, project: Record, grant: Grant) -> str | None:
@@ -97,8 +103,43 @@ def comment_wire(request: Request, issue: Record, comment: Record) -> Record:
     return result
 
 
+def can_read_comment(ctx: ProviderContext, issue: Record, comment: Record, grant: Grant) -> bool:
+    restriction = comment.get("visibility")
+    if not restriction:
+        return True
+    user = person_record(ctx, principal(ctx, grant))
+    if restriction["type"] == "group":
+        group = ctx.store["groups"].get(restriction["identifier"])
+        return bool(group and user and user["_world_id"] in group["_members"])
+    project = ctx.store["projects"].get(issue["fields"]["project"]["id"])
+    return project_role(ctx, project, grant) in COMMENT_ROLES.get(restriction["value"], ())
+
+
+def comment_visibility(request: Request, ctx: ProviderContext, value: Any) -> Record | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict) or value.get("type") not in ("group", "role"):
+        fail(request, 400, "visibility requires a group or role restriction.")
+    identifier = value.get("identifier", value.get("value"))
+    if not isinstance(identifier, str) or not identifier:
+        fail(request, 400, "visibility requires an identifier or value.")
+    if value["type"] == "group":
+        group = ctx.store["groups"].get(identifier) or ctx.store["groups"].first(name=identifier)
+        if not group:
+            fail(request, 400, "Unknown comment visibility group.")
+        return {"type": "group", "identifier": group["id"], "value": group["name"]}
+    if identifier not in COMMENT_ROLES:
+        fail(request, 400, "Unknown comment visibility role.")
+    return {"type": "role", "identifier": identifier, "value": identifier}
+
+
 def issue_wire(
-    request: Request, ctx: ProviderContext, issue: Record, fields: list[str] | None = None
+    request: Request,
+    ctx: ProviderContext,
+    issue: Record,
+    fields: list[str] | None = None,
+    *,
+    grant: Grant | None = None,
 ) -> Record:
     result: Record = {
         "id": issue["id"],
@@ -110,8 +151,14 @@ def issue_wire(
         values[name] = user_wire(request, values.get(name))
     values["project"] = project_wire(request, values["project"])
     if "parent" in values:
-        values["parent"]["self"] = api_url(request, "/rest/api/3/issue/" + values["parent"]["id"])
+        parent = ctx.store["issues"].get(values["parent"]["id"])
+        if grant is not None and (not parent or not visible(ctx, parent, grant)):
+            values.pop("parent")
+        else:
+            values["parent"]["self"] = api_url(request, "/rest/api/3/issue/" + values["parent"]["id"])
     comments = ctx.store["jira_comments"].where(_issue=issue["id"])
+    if grant is not None:
+        comments = [c for c in comments if can_read_comment(ctx, issue, c, grant)]
     values["comment"] = {
         "comments": [comment_wire(request, issue, c) for c in comments[:50]],
         "self": api_url(request, "/rest/api/3/issue/" + issue["id"] + "/comment"),
@@ -164,13 +211,37 @@ def search_shape(issue: Record) -> Record:
 
 
 def valid_adf(request: Request, value: Any) -> None:
-    if value is not None and (
-        not isinstance(value, dict)
-        or value.get("type") != "doc"
-        or value.get("version") != 1
-        or not isinstance(value.get("content"), list)
-    ):
-        fail(request, 400, "Operation value must be an Atlassian Document (ADF).")
+    if value is not None:
+        validate_adf(request, value)
+
+
+def edit_operations(request: Request, payload: Record, original: Record) -> Record:
+    """Validate intermediate label sets before processing later operations."""
+    fields, update = payload.get("fields", {}), payload.get("update", {})
+    if not isinstance(fields, dict) or not isinstance(update, dict) or set(fields) & set(update):
+        fail(request, 400, "fields and update must be objects with disjoint keys.")
+    fields = copy.deepcopy(fields)
+    for field, actions in update.items():
+        if not isinstance(actions, list):
+            fail(request, 400, "update operations must be arrays.")
+        value = copy.deepcopy(original.get(field))
+        for action in actions:
+            if not isinstance(action, dict) or len(action) != 1:
+                fail(request, 400, "Invalid update operation.")
+            op, item = next(iter(action.items()))
+            if op == "set":
+                value = item
+            elif field == "labels" and op in ("add", "remove") and isinstance(item, str):
+                if not isinstance(value, list):
+                    fail(request, 400, "labels must be an array before add/remove operations.")
+                if op == "add" and item not in value:
+                    value.append(item)
+                elif op == "remove" and item in value:
+                    value.remove(item)
+            else:
+                fail(request, 400, "Unsupported update operation.")
+        fields[field] = value
+    return fields
 
 
 def resolve_project(
@@ -250,12 +321,16 @@ def validate_fields(
             if name == "issuetype":
                 result[name]["subtask"] = False
         elif name == "labels":
-            if not isinstance(value, list) or any(not isinstance(v, str) or not v or " " in v for v in value):
+            if not isinstance(value, list) or any(
+                not isinstance(v, str) or not v or any(c.isspace() for c in v) for v in value
+            ):
                 fail(request, 400, "labels must be an array of strings without spaces.")
             result[name] = list(dict.fromkeys(value))
         elif name == "duedate":
             if value is not None:
                 try:
+                    if not isinstance(value, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+                        raise ValueError
                     date.fromisoformat(value)
                 except (ValueError, TypeError):
                     fail(request, 400, "duedate must use yyyy-MM-dd.")
@@ -324,6 +399,14 @@ def build_jira(ctx: ProviderContext) -> APIRouter:
             )
         return result
 
+    @router.get("/project/{project_id}")
+    async def project(request: Request, project_id: str) -> Record:
+        grant = jira_auth(request, ctx)
+        record = ctx.store["projects"].get(project_id) or ctx.store["projects"].first(key=project_id)
+        if not record or not project_role(ctx, record, grant):
+            fail(request, 404, "Project does not exist or you do not have permission to see it.")
+        return project_wire(request, record)
+
     async def search_result(request: Request, payload: Record) -> Record:
         grant = jira_auth(request, ctx)
         jql = payload.get("jql", "")
@@ -349,7 +432,10 @@ def build_jira(ctx: ProviderContext) -> APIRouter:
             fail(request, 400, "Invalid nextPageToken.")
         start = cursor_offset(request, token, binding)
         result = {
-            "issues": [issue_wire(request, ctx, r["_issue"], fields) for r in matches[start : start + limit]],
+            "issues": [
+                issue_wire(request, ctx, r["_issue"], fields, grant=grant)
+                for r in matches[start : start + limit]
+            ],
             "isLast": start + limit >= len(matches),
         }
         if not result["isLast"]:
@@ -372,13 +458,13 @@ def build_jira(ctx: ProviderContext) -> APIRouter:
         grant = jira_auth(request, ctx)
         record = get_issue(request, ctx, grant, issue_key)
         fields = query_values(request, "fields") if "fields" in request.query_params else None
-        return issue_wire(request, ctx, record, fields)
+        return issue_wire(request, ctx, record, fields, grant=grant)
 
     @router.post("/issue")
     async def create_issue(request: Request, payload: dict[str, Any]) -> JSONResponse:
         grant = jira_auth(request, ctx)
         user = person_record(ctx, principal(ctx, grant))
-        fields = payload.get("fields")
+        fields = edit_operations(request, payload, {"labels": []})
         if not isinstance(fields, dict) or not fields.get("summary") or not fields.get("issuetype"):
             fail(request, 400, "fields.summary, fields.project and fields.issuetype are required.")
         project = resolve_project(request, ctx, grant, fields.get("project"))
@@ -415,28 +501,7 @@ def build_jira(ctx: ProviderContext) -> APIRouter:
     async def update_issue(request: Request, issue_key: str, payload: dict[str, Any]) -> Response:
         grant = jira_auth(request, ctx)
         issue = get_issue(request, ctx, grant, issue_key, edit=True)
-        fields, update = payload.get("fields", {}), payload.get("update", {})
-        if not isinstance(fields, dict) or not isinstance(update, dict) or set(fields) & set(update):
-            fail(request, 400, "fields and update must be objects with disjoint keys.")
-        fields = copy.deepcopy(fields)
-        for field, actions in update.items():
-            if not isinstance(actions, list):
-                fail(request, 400, "update operations must be arrays.")
-            value = copy.deepcopy(issue["fields"].get(field))
-            for action in actions:
-                if not isinstance(action, dict) or len(action) != 1:
-                    fail(request, 400, "Invalid update operation.")
-                op, item = next(iter(action.items()))
-                if op == "set":
-                    value = item
-                elif field == "labels" and op in ("add", "remove") and isinstance(item, str):
-                    if op == "add" and item not in value:
-                        value.append(item)
-                    elif op == "remove" and item in value:
-                        value.remove(item)
-                else:
-                    fail(request, 400, "Unsupported update operation.")
-            fields[field] = value
+        fields = edit_operations(request, payload, issue["fields"])
         values = validate_fields(request, ctx, grant, fields, issue["fields"])
         if values.get("parent", {}).get("id") == issue["id"]:
             fail(request, 400, "An issue cannot be its own parent.")
@@ -462,7 +527,7 @@ def build_jira(ctx: ProviderContext) -> APIRouter:
             changelog=changes,
         )
         if request.query_params.get("returnIssue") == "true":
-            return JSONResponse(issue_wire(request, ctx, issue))
+            return JSONResponse(issue_wire(request, ctx, issue, grant=grant))
         return Response(status_code=204)
 
     @router.get("/issue/{issue_key}/transitions")
@@ -535,6 +600,11 @@ def build_jira(ctx: ProviderContext) -> APIRouter:
         start = integer(request, request.query_params.get("startAt"), "startAt", 0, 2147483647, 0)
         limit = integer(request, request.query_params.get("maxResults"), "maxResults", 50, 100)
         comments = ctx.store["jira_comments"].where(_issue=issue["id"])
+        comments = [c for c in comments if can_read_comment(ctx, issue, c, grant)]
+        order = request.query_params.get("orderBy", "created")
+        if order not in ("created", "+created", "-created"):
+            fail(request, 400, "Invalid comment orderBy.")
+        comments.sort(key=lambda c: c["created"], reverse=order.startswith("-"))
         return {
             "startAt": start,
             "maxResults": limit,
@@ -550,6 +620,7 @@ def build_jira(ctx: ProviderContext) -> APIRouter:
         if body is None:
             fail(request, 400, "body is required.")
         valid_adf(request, body)
+        visibility = comment_visibility(request, ctx, payload.get("visibility"))
         user = person_record(ctx, principal(ctx, grant))
         sequence = ctx.store.meta.get("jira_comment_sequence", 0) + 1
         ctx.store.meta["jira_comment_sequence"] = sequence
@@ -563,10 +634,29 @@ def build_jira(ctx: ProviderContext) -> APIRouter:
             "created": when,
             "updated": when,
         }
+        if visibility is not None:
+            comment["visibility"] = visibility
         ctx.store["jira_comments"].put(comment)
         issue["fields"]["updated"] = when
         await emit(ctx, "jira:issue_updated", issue_wire(request, ctx, issue), user["id"], request=request)
         return JSONResponse(comment_wire(request, issue, comment), status_code=201)
+
+    @router.get("/issue/{issue_key}/comment/{comment_id}")
+    async def comment(request: Request, issue_key: str, comment_id: str) -> Record:
+        grant = jira_auth(request, ctx)
+        issue = get_issue(request, ctx, grant, issue_key)
+        record = ctx.store["jira_comments"].get(comment_id)
+        if not record or record["_issue"] != issue["id"] or not can_read_comment(ctx, issue, record, grant):
+            fail(request, 404, "Comment not found.")
+        return comment_wire(request, issue, record)
+
+    @router.get("/user")
+    async def user(request: Request) -> Record:
+        jira_auth(request, ctx, users=True)
+        record = ctx.store["users"].get(request.query_params.get("accountId"))
+        if not record:
+            fail(request, 404, "User not found.")
+        return user_wire(request, jira_user(ctx, record["id"]))
 
     @router.get("/user/search")
     async def users(request: Request) -> list[Record]:

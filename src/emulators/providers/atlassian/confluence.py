@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import copy
+import json
+import re
+from datetime import datetime
 from typing import Any
 from urllib.parse import quote
 
@@ -10,18 +13,20 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, Response
 
 from emulators.core.auth import Grant
-from emulators.core.clock import isoformat_z
+from emulators.core.clock import isoformat_z, parse_instant
 from emulators.core.provider import ProviderContext
 
 from .auth import confluence_auth
 from .common import (
     Record,
+    absolute,
     ancestors,
     can_view,
     clean,
     fail,
     get_page,
     integer,
+    local_path,
     numeric_id,
     operations,
     page_response,
@@ -32,7 +37,15 @@ from .common import (
 )
 from .hooks import emit
 from .seed import new_page
-from .shapes import attachment_bytes, attachment_shape, body_shape, page_shape, space_shape, write_body
+from .shapes import (
+    attachment_bytes,
+    attachment_shape,
+    body_shape,
+    page_shape,
+    space_shape,
+    validate_body_format,
+    write_body,
+)
 
 
 def get_space(
@@ -59,12 +72,23 @@ def sort_records(
 def filtered_pages(
     request: Request, ctx: ProviderContext, grant: Grant, content_type: str = "page"
 ) -> list[Record]:
-    statuses = query_values(request, "status") or ["current", "archived"]
-    if any(s not in ("current", "archived", "draft", "trashed", "deleted") for s in statuses):
+    validate_body_format(request)
+    statuses = query_values(request, "status") or (
+        ["current"] if content_type == "blogpost" else ["current", "archived"]
+    )
+    allowed = (
+        ("current", "deleted", "trashed")
+        if content_type == "blogpost"
+        else ("current", "archived", "deleted", "trashed")
+    )
+    if any(s not in allowed for s in statuses):
         fail(request, 400, "Invalid content status.")
     space_ids = query_values(request, "space-id")
     ids = query_values(request, "id")
     title = request.query_params.get("title")
+    subtype = request.query_params.get("subtype")
+    if content_type == "page" and subtype not in (None, "page", "live"):
+        fail(request, 400, "Invalid subtype.")
     pages = [
         p
         for p in ctx.store["pages"]
@@ -73,6 +97,7 @@ def filtered_pages(
         and (not space_ids or p["spaceId"] in space_ids)
         and (not ids or p["id"] in ids)
         and (title is None or p["title"] == title)
+        and (subtype is None or p.get("subtype", "page") == subtype)
         and can_view(ctx, p, grant)
     ]
     return sort_records(
@@ -98,7 +123,7 @@ def validate_parent(
     if not parent_id:
         return
     parent = get_page(request, ctx, grant, parent_id)
-    if parent["status"] not in ("current", "archived") or parent["spaceId"] != space_id:
+    if parent["status"] != "current" or parent["spaceId"] != space_id:
         fail(request, 400, "The parent must be a current page in the same space.")
     if page_id and page_id in [parent["id"], *(a["id"] for a in ancestors(ctx, parent))]:
         fail(request, 400, "A page cannot be its own ancestor.")
@@ -109,12 +134,48 @@ def unique_title(
 ) -> None:
     if any(
         p["spaceId"] == space_id
+        and p.get("_type") == "page"
         and p["title"].casefold() == title.casefold()
         and p["id"] != except_id
         and p["status"] in ("current", "archived")
         for p in ctx.store["pages"]
     ):
         fail(request, 400, "A page with this title already exists in this space.")
+
+
+def blog_created_at(request: Request, value: Any) -> datetime:
+    if not isinstance(value, str) or not re.fullmatch(
+        r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}(?:Z|[+-]\d{2}:?\d{2})", value
+    ):
+        fail(request, 400, "createdAt must use yyyy-MM-ddTHH:mm:ss.SSSZ.")
+    try:
+        return parse_instant(value)
+    except ValueError:
+        fail(request, 400, "Invalid createdAt.")
+
+
+def property_payload(request: Request, payload: Record, *, updating: bool = False) -> None:
+    if (not updating or "key" in payload) and (
+        not isinstance(payload.get("key"), str) or not 1 <= len(payload["key"]) <= 255
+    ):
+        fail(request, 400, "key must contain between 1 and 255 characters.")
+    if "value" not in payload:
+        fail(request, 400, "value is required.")
+    try:
+        value = json.dumps(payload["value"], ensure_ascii=False, allow_nan=False).encode()
+    except (ValueError, TypeError, UnicodeError, RecursionError):
+        fail(request, 400, "value must be valid JSON.")
+    if len(value) > 32768:
+        fail(request, 400, "Property value exceeds 32 KB.")
+    if updating:
+        version = payload.get("version")
+        if (
+            not isinstance(version, dict)
+            or type(version.get("number")) is not int
+            or not 1 <= version["number"] <= 2147483647
+            or not isinstance(version.get("message", ""), str)
+        ):
+            fail(request, 400, "version requires an integer number and optional string message.")
 
 
 def build_content(router: APIRouter, ctx: ProviderContext, resource: str, content_type: str) -> None:
@@ -128,20 +189,35 @@ def build_content(router: APIRouter, ctx: ProviderContext, resource: str, conten
     async def create_content(request: Request, payload: dict[str, Any]) -> Record:
         grant = confluence_auth(request, ctx)
         user = person_record(ctx, principal(ctx, grant))
-        sid = str(payload.get("spaceId", ""))
+        sid = payload.get("spaceId")
+        if not isinstance(sid, str) or not sid:
+            fail(request, 400, "spaceId must be a non-empty string.")
         space = get_space(request, ctx, grant, sid, edit=True)
         status, title = payload.get("status", "current"), payload.get("title", "")
-        if status not in ("current", "draft") or not isinstance(title, str) or not title.strip():
-            fail(request, 400, "A non-empty title and status current or draft are required.")
+        if content_type == "page" and payload.get("subtype") not in (None, "live"):
+            fail(request, 400, "Invalid subtype.")
+        if (
+            status not in ("current", "draft")
+            or not isinstance(title, str)
+            or (status == "current" and not title.strip())
+            or len(title) > 255
+        ):
+            fail(request, 400, "A title up to 255 characters and status current or draft are required.")
         body = write_body(request, payload.get("body", {"representation": "storage", "value": ""}))
         parent_id = payload.get("parentId")
+        if parent_id is not None and (not isinstance(parent_id, str) or not parent_id.isdecimal()):
+            fail(request, 400, "parentId must be a numeric string.")
+        if request.query_params.get("root-level") == "true" and parent_id is not None:
+            fail(request, 400, "root-level and parentId cannot be supplied together.")
         if content_type == "page" and not parent_id and request.query_params.get("root-level") != "true":
             parent_id = space["homepageId"]
-        if parent_id is not None and not isinstance(parent_id, str):
-            fail(request, 400, "parentId must be a string.")
         validate_parent(request, ctx, grant, parent_id, sid)
+        created = ctx.clock.now()
+        if content_type == "blogpost" and "createdAt" in payload:
+            created = blog_created_at(request, payload["createdAt"])
         with ctx.store.lock:
-            unique_title(request, ctx, sid, title)
+            if content_type == "page" and status == "current":
+                unique_title(request, ctx, sid, title)
             sequence = ctx.store.meta.get("page_sequence", 0) + 1
             ctx.store.meta["page_sequence"] = sequence
             page_id = numeric_id("created-page", sequence)
@@ -151,13 +227,18 @@ def build_content(router: APIRouter, ctx: ProviderContext, resource: str, conten
                 space_id=sid,
                 title=title,
                 owner_id=user["_world_id"],
-                created=ctx.clock.now(),
+                created=created,
                 modified=ctx.clock.now(),
                 paragraphs=[],
                 parent_id=parent_id,
                 content_type=content_type,
             )
             page["status"], page["body"] = status, body
+            if content_type == "page" and payload.get("subtype") == "live":
+                page["subtype"] = "live"
+            if request.query_params.get("private") == "true":
+                page["_read"] = [user["_world_id"]]
+                page["_update"] = [user["_world_id"]]
             page["_history"][0]["body"] = copy.deepcopy(body)
         if content_type == "page":
             await emit(ctx, "page_created", page, user["id"], request=request)
@@ -170,6 +251,10 @@ def build_content(router: APIRouter, ctx: ProviderContext, resource: str, conten
         statuses = query_values(request, "status") or (
             ["draft"] if request.query_params.get("get-draft") == "true" else ["current", "archived"]
         )
+        if any(
+            s not in ("current", "archived", "trashed", "deleted", "historical", "draft") for s in statuses
+        ):
+            fail(request, 400, "Invalid content status.")
         if page["status"] not in statuses:
             fail(request, 404, f"No content found with id: {page_id}")
         if "version" in request.query_params:
@@ -177,7 +262,11 @@ def build_content(router: APIRouter, ctx: ProviderContext, resource: str, conten
             historical = next((h for h in page["_history"] if h["version"]["number"] == number), None)
             if not historical:
                 fail(request, 404, "Version not found.")
-            page = {**page, **copy.deepcopy(historical)}
+            page = {
+                **page,
+                **copy.deepcopy(historical),
+                "status": "historical" if number != page["version"]["number"] else page["status"],
+            }
         return page_shape(request, ctx, page, grant, single=True)
 
     @router.put("/" + resource + "/{page_id}")
@@ -189,27 +278,44 @@ def build_content(router: APIRouter, ctx: ProviderContext, resource: str, conten
             payload.get("id") != page_id
             or not isinstance(payload.get("title"), str)
             or not payload["title"].strip()
+            or len(payload["title"]) > 255
         ):
             fail(request, 400, "Matching id and non-empty title are required.")
-        if payload.get("status") not in ("current", "draft", "archived"):
+        if payload.get("status") not in ("current", "draft"):
             fail(request, 400, "A valid status is required.")
         body = write_body(request, payload.get("body"))
         version = payload.get("version")
         if not isinstance(version, dict) or type(version.get("number")) is not int:
             fail(request, 400, "version.number is required.")
-        sid = str(payload.get("spaceId", page["spaceId"]))
+        if not isinstance(version.get("message", ""), str) or not isinstance(
+            version.get("minorEdit", False), bool
+        ):
+            fail(request, 400, "Invalid version message or minorEdit.")
+        sid = payload.get("spaceId", page["spaceId"])
+        if not isinstance(sid, str) or sid != page["spaceId"]:
+            fail(request, 400, "Moving content to another space is not supported by this endpoint.")
         get_space(request, ctx, grant, sid, edit=True)
         parent_id = payload.get("parentId", page.get("parentId"))
         if parent_id is not None and not isinstance(parent_id, str):
             fail(request, 400, "parentId must be a string.")
         validate_parent(request, ctx, grant, parent_id, sid, page_id)
         new_owner = payload.get("ownerId", page["ownerId"])
-        if not person_record(ctx, new_owner):
+        if not isinstance(new_owner, str) or not ctx.store["users"].get(new_owner):
             fail(request, 400, "Invalid ownerId.")
+        created = (
+            blog_created_at(request, payload["createdAt"])
+            if content_type == "blogpost" and "createdAt" in payload
+            else None
+        )
         with ctx.store.lock:
-            if version["number"] != page["version"]["number"] + 1:
+            if page["status"] in ("trashed", "deleted") and payload["status"] == "current":
+                page["status"] = "current"
+                return page_shape(request, ctx, page, grant, single=True)
+            expected = 1 if payload["status"] == "draft" else page["version"]["number"] + 1
+            if version["number"] != expected:
                 fail(request, 409, "Version must be incremented by one.")
-            unique_title(request, ctx, sid, payload["title"], page_id)
+            if content_type == "page" and payload["status"] == "current":
+                unique_title(request, ctx, sid, payload["title"], page_id)
             updated = {
                 "number": version["number"],
                 "message": str(version.get("message", "")),
@@ -224,15 +330,19 @@ def build_content(router: APIRouter, ctx: ProviderContext, resource: str, conten
                     "spaceId": sid,
                     "body": body,
                     "version": updated,
-                    "lastOwnerId": page["ownerId"],
+                    "lastOwnerId": page["ownerId"] if new_owner != page["ownerId"] else page["lastOwnerId"],
                     "ownerId": new_owner,
                 }
             )
+            if created is not None:
+                page["createdAt"] = isoformat_z(created, timespec="milliseconds")
             if parent_id:
                 page.update({"parentId": parent_id, "parentType": "page"})
             else:
                 page.pop("parentId", None)
                 page.pop("parentType", None)
+            if payload["status"] == "draft":
+                page["_history"] = []
             page["_history"].append(
                 {"version": copy.deepcopy(updated), "title": page["title"], "body": copy.deepcopy(body)}
             )
@@ -257,7 +367,9 @@ def build_properties(router: APIRouter, ctx: ProviderContext, resource: str) -> 
     def authorize(request: Request, parent_id: str, edit: bool = False) -> Grant:
         grant = confluence_auth(request, ctx, "space" if resource == "spaces" else "page")
         if resource == "spaces":
-            get_space(request, ctx, grant, parent_id, edit=edit)
+            space = get_space(request, ctx, grant, parent_id)
+            if edit and space_role(ctx, space, grant) != "owner":
+                fail(request, 403, "Space administration permission is required.")
         else:
             get_page(
                 request,
@@ -285,31 +397,51 @@ def build_properties(router: APIRouter, ctx: ProviderContext, resource: str) -> 
             and p["_parent"] == parent_id
             and ("key" not in request.query_params or p["key"] == request.query_params["key"])
         ]
+        if resource != "spaces":
+            records = sort_records(
+                request,
+                records,
+                {
+                    "key": lambda p: p["key"],
+                },
+                "key",
+            )
         return page_response(request, ctx, records)
 
-    @router.post("/" + resource + "/{parent_id}/properties")
-    async def create_property(request: Request, parent_id: str, payload: dict[str, Any]) -> Record:
+    @router.post("/" + resource + "/{parent_id}/properties", status_code=201 if resource == "spaces" else 200)
+    async def create_property(
+        request: Request, parent_id: str, payload: dict[str, Any], response: Response
+    ) -> Record:
         grant = authorize(request, parent_id, True)
+        property_payload(request, payload)
         key = payload.get("key")
-        if not isinstance(key, str) or not key or "value" not in payload:
-            fail(request, 400, "key and value are required.")
         if any(
             p["_resource"] == resource and p["_parent"] == parent_id and p["key"] == key
             for p in ctx.store["properties"]
         ):
             fail(request, 400, "Property key already exists.")
+        sequence = ctx.store.meta.get("property_sequence", 0) + 1
+        ctx.store.meta["property_sequence"] = sequence
         prop = {
-            "id": numeric_id("property", resource, parent_id, key),
+            "id": numeric_id("created-property", sequence),
             "key": key,
             "value": payload["value"],
             "version": {
                 "number": 1,
                 "createdAt": isoformat_z(ctx.clock.now()),
-                "authorId": principal(ctx, grant),
+                "createdBy" if resource == "spaces" else "authorId": person_record(
+                    ctx, principal(ctx, grant)
+                )["id"],
+                "message": "",
             },
             "_resource": resource,
             "_parent": parent_id,
         }
+        if resource == "spaces":
+            prop.update(
+                {"createdAt": prop["version"]["createdAt"], "createdBy": prop["version"]["createdBy"]}
+            )
+            response.headers["Location"] = absolute(request, local_path(request)) + "/" + prop["id"]
         ctx.store["properties"].put(prop)
         return clean(prop)
 
@@ -320,25 +452,39 @@ def build_properties(router: APIRouter, ctx: ProviderContext, resource: str) -> 
 
     @router.put("/" + resource + "/{parent_id}/properties/{property_id}")
     async def update_property(
-        request: Request, parent_id: str, property_id: str, payload: dict[str, Any]
+        request: Request, parent_id: str, property_id: str, payload: dict[str, Any], response: Response
     ) -> Record:
         grant = authorize(request, parent_id, True)
         prop = find(request, parent_id, property_id)
-        if "value" not in payload or not isinstance(payload.get("version"), dict):
-            fail(request, 400, "value and version are required.")
+        property_payload(request, payload, updating=True)
         with ctx.store.lock:
             if payload["version"].get("number") != prop["version"]["number"] + 1:
                 fail(request, 409, "Version must be incremented by one.")
+            key = payload.get("key", prop["key"])
+            if any(
+                p["id"] != property_id
+                and p["_parent"] == parent_id
+                and p["_resource"] == resource
+                and p["key"] == key
+                for p in ctx.store["properties"]
+            ):
+                fail(request, 400, "Property key already exists.")
             prop.update(
                 {
+                    "key": key,
                     "value": payload["value"],
                     "version": {
                         "number": prop["version"]["number"] + 1,
                         "createdAt": isoformat_z(ctx.clock.now()),
-                        "authorId": principal(ctx, grant),
+                        "createdBy" if resource == "spaces" else "authorId": person_record(
+                            ctx, principal(ctx, grant)
+                        )["id"],
+                        "message": payload["version"].get("message", ""),
                     },
                 }
             )
+        if resource == "spaces":
+            response.headers["Location"] = absolute(request, local_path(request))
         return clean(prop)
 
     @router.delete("/" + resource + "/{parent_id}/properties/{property_id}")
@@ -359,6 +505,8 @@ def build_v2(ctx: ProviderContext) -> APIRouter:
     @router.get("/spaces")
     async def list_spaces(request: Request) -> JSONResponse:
         grant = confluence_auth(request, ctx, "space")
+        if request.query_params.get("description-format") not in (None, "plain", "view"):
+            fail(request, 400, "Invalid description-format.")
         keys, ids = query_values(request, "keys"), query_values(request, "ids")
         space_type, status = request.query_params.get("type"), request.query_params.get("status")
         if space_type not in (None, "global", "personal") or status not in (
@@ -481,6 +629,7 @@ def build_v2(ctx: ProviderContext) -> APIRouter:
     @router.get("/pages/{page_id}/versions")
     async def versions(request: Request, page_id: str) -> JSONResponse:
         grant = confluence_auth(request, ctx)
+        validate_body_format(request)
         page = get_page(request, ctx, grant, page_id)
         histories = sort_records(
             request,

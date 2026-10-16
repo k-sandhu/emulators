@@ -16,9 +16,9 @@ API = "https://api.atlassian.com"
 AUTH = "https://auth.atlassian.com"
 
 
-async def test_oauth_code_gateway_and_rotating_refresh(client: httpx.AsyncClient) -> None:
+async def test_oauth_code_gateway_and_rotating_refresh(client: httpx.AsyncClient, hub: EmulatorHub) -> None:
     redirect = "https://consumer.example/oauth/callback"
-    scope = "read:confluence-content.all read:confluence-space.summary read:page:confluence read:jira-work offline_access"
+    scope = "read:me read:confluence-content.all read:confluence-space.summary read:page:confluence read:jira-work offline_access"
     consent = await client.get(
         AUTH + "/authorize",
         params={
@@ -83,7 +83,29 @@ async def test_oauth_code_gateway_and_rotating_refresh(client: httpx.AsyncClient
         AUTH + "/oauth/token",
         json={"grant_type": "refresh_token", "client_id": "lumen", "refresh_token": tokens["refresh_token"]},
     )
-    assert replay.status_code == 400 and replay.json()["error"] == "invalid_grant"
+    assert replay.status_code == 200 and replay.json()["refresh_token"] != tokens["refresh_token"]
+    hub.clock.advance(timedelta(seconds=601))
+    try:
+        rejected = await client.post(
+            AUTH + "/oauth/token",
+            json={
+                "grant_type": "refresh_token",
+                "client_id": "lumen",
+                "refresh_token": tokens["refresh_token"],
+            },
+        )
+        assert rejected.status_code == 400 and rejected.json()["error"] == "invalid_grant"
+        revoked_family = await client.post(
+            AUTH + "/oauth/token",
+            json={
+                "grant_type": "refresh_token",
+                "client_id": "lumen",
+                "refresh_token": refreshed.json()["refresh_token"],
+            },
+        )
+        assert revoked_family.status_code == 400
+    finally:
+        hub.clock.advance(timedelta(seconds=-601))
 
 
 async def test_authorize_picker_binding_pkce_and_no_client_credentials(client: httpx.AsyncClient) -> None:
@@ -182,7 +204,7 @@ async def test_scopes_inactive_users_and_app_permissions(client: httpx.AsyncClie
         headers=bearer(token),
         json={"key": "service-checkpoint", "value": 1},
     )
-    assert prop.status_code == 200 and prop.json()["version"]["authorId"].startswith("712020:")
+    assert prop.status_code == 201 and prop.json()["version"]["createdBy"].startswith("712020:")
 
 
 async def test_expiry_follows_emulator_clock(client: httpx.AsyncClient, hub: EmulatorHub) -> None:
@@ -247,7 +269,7 @@ async def test_granular_metadata_comment_and_property_scopes(client: httpx.Async
     ):
         auth = bearer(await mint(client, SITE, user="p001", scopes=[scope]))
         assert (await client.get(f"/wiki/api/v2/pages/{page_id}/{endpoint}", headers=auth)).status_code == 200
-    path = "/wiki/api/v2/spaces/38039918718755833/properties"
+    path = "/wiki/api/v2/spaces/68980425353704209/properties"
     write_only = bearer(await mint(client, SITE, user="p001", scopes=["write:space:confluence"]))
     assert (
         await client.post(path, headers=write_only, json={"key": "scope-test", "value": 1})
@@ -255,4 +277,4 @@ async def test_granular_metadata_comment_and_property_scopes(client: httpx.Async
     auth = bearer(
         await mint(client, SITE, user="p001", scopes=["read:space:confluence", "write:space:confluence"])
     )
-    assert (await client.post(path, headers=auth, json={"key": "scope-test", "value": 1})).status_code == 200
+    assert (await client.post(path, headers=auth, json={"key": "scope-test", "value": 1})).status_code == 201

@@ -118,7 +118,7 @@ def new_page(
         "position": len(ctx.store["pages"]),
         "authorId": author,
         "ownerId": author,
-        "lastOwnerId": author,
+        "lastOwnerId": None,
         "createdAt": isoformat_z(created, timespec="milliseconds"),
         "body": body,
         "_type": content_type,
@@ -127,6 +127,8 @@ def new_page(
         "_labels": [],
         "_history": [],
     }
+    if content_type == "page":
+        page["subtype"] = "page"
     if parent_id:
         page.update({"parentId": parent_id, "parentType": "page"})
     for number in range(1, versions + 1):
@@ -250,7 +252,14 @@ def seed_confluence(ctx: ProviderContext) -> None:
                 "id": prop_id,
                 "key": "halcyon.area",
                 "value": space.id,
-                "version": {"number": 1, "createdAt": isoformat_z(anchor)},
+                "createdAt": isoformat_z(anchor),
+                "createdBy": account_id(space.owner_id),
+                "version": {
+                    "number": 1,
+                    "createdAt": isoformat_z(anchor),
+                    "createdBy": account_id(space.owner_id),
+                    "message": "",
+                },
                 "_resource": "spaces",
                 "_parent": sid,
             }
@@ -263,8 +272,9 @@ def seed_confluence(ctx: ProviderContext) -> None:
             space_id=sid,
             title=doc.title,
             owner_id=doc.owner_id,
-            created=doc.created,
-            modified=doc.modified,
+            # Some world edits are later on the anchor day, after this seed's instant.
+            created=min(doc.created, anchor),
+            modified=min(doc.modified, anchor),
             modified_by=doc.modified_by_id,
             paragraphs=list(doc.paragraphs),
             versions=doc.versions,
@@ -426,6 +436,8 @@ def seed_jira(ctx: ProviderContext) -> None:
             if key == "OPS"
             else space_roles(ctx, ctx.world.space("clients"))
         )
+        if key == "OPS":
+            roles[ctx.world.space("it").owner_id] = "owner"
         ctx.store["projects"].put(
             {
                 "id": numeric_id("project", key),

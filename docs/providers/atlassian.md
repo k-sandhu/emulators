@@ -48,8 +48,9 @@ IDs also work as login hints. PKCE plain/S256 is supported by the shared token s
 
 Access tokens are registered RS256 JWTs with a 3600-second lifetime. Codes are single-use, bound
 to client and redirect URI, and expire in ten minutes. `offline_access` requests receive a refresh
-token; successful refresh invalidates the previous refresh token and issues a new one. Refresh
-tokens expire after 90 days. Client credentials is not a supported 3LO grant. Unknown clients are
+token; successful refresh rotates it, with a ten-minute reuse interval for concurrent exchanges.
+Reuse outside that interval invalidates the refresh-token family. Refresh tokens expire after
+90 days of inactivity. Client credentials is not a supported 3LO grant. Unknown clients are
 accepted in the default lenient mode. Strict mode accepts the seeded client credentials above.
 
 Useful classic scopes are `read:confluence-content.all`, `read:confluence-space.summary`,
@@ -61,10 +62,13 @@ Ancestors use `read:content.metadata:confluence` and footer comments use `read:c
 Space-property mutations accept `read:space:confluence` plus `write:space:confluence`; page-property
 mutations accept `read:page:confluence` plus `write:page:confluence`.
 An authenticated token without a required scope receives 403.
+`GET /me` specifically requires `read:me`; product read scopes alone do not grant profile access.
 
 ### Site Basic authentication
 
-Use any active world employee's **email + `halcyon-api-token`**, for example:
+Use any active world employee's email with the synthetic API token returned by
+`GET /_emulator/info` at `credentials.api_token`. OAuth test client credentials are also returned
+in that response. Example identities:
 
 | Email | Access examples |
 | --- | --- |
@@ -112,7 +116,7 @@ space and issue permissions; they do not bypass restrictions. User-profile endpo
 | GET | `/spaces/{id}` | Homepage and optional permission assignments |
 | GET | `/spaces/{id}/pages` | `depth=root|all`; page filters and sort |
 | GET | `/spaces/{id}/permissions` | User/group principals and vendor operation shapes |
-| GET, POST | `/pages` | ID/space/title/status filters; create returns 200 |
+| GET, POST | `/pages` | ID/space/title/status/subtype filters; create returns 200; `private=true` enforced |
 | GET, PUT, DELETE | `/pages/{id}` | Read, optimistic update, trash, draft deletion or purge |
 | GET | `/pages/{id}/children` | ChildPage shape, including `childPosition` |
 | GET | `/pages/{id}/direct-children` | Adds the content `type` |
@@ -127,23 +131,39 @@ space and issue permissions; they do not bypass restrictions. User-profile endpo
 | GET | `/pages/{id}/footer-comments` | Colleague comments and optional body representation |
 | GET, POST | `/blogposts` | Seeded area updates and creation |
 | GET, PUT, DELETE | `/blogposts/{id}` | Versioned read/update/delete |
-| GET, POST | `/{pages|spaces|blogposts}/{id}/properties` | Key filter; arbitrary JSON values |
+| GET, POST | `/{pages|spaces|blogposts}/{id}/properties` | Key filter; JSON values up to 32 KB; space creation returns 201 |
 | GET, PUT, DELETE | `/{pages|spaces|blogposts}/{id}/properties/{propertyId}` | Optimistic version updates |
 | POST | `/users-bulk` | `{"accountIds":[...]}`, maximum 250 IDs |
 
 Collection pagination defaults to 25 with a maximum of 250, returning `_links.next` and `Link:
 <...>; rel="next"`. Follow the returned URL with the same credentials. Invalid cursors and limits
 return 400. Page lists support `sort=-modified-date` and comma-separated or repeated `space-id`,
-`id`, and `status` parameters. Default statuses are current and archived. A draft is visible only
+`id`, and `status` parameters. Default page statuses are current and archived; blog posts default
+to current. Cursors are bound to the caller, endpoint and query. A draft is visible only
 to its owner; single-page reads use `get-draft=true` or an explicit `status`. Trashed content needs
 `status=trashed`.
+Collection status filters exclude drafts; retrieve drafts by ID instead. Invalid status enums
+return 400.
 
 Page bodies support `body-format=storage|atlas_doc_format|view`. Without a requested representation,
 `body` is empty. Single reads support `version`, `include-version=false`, `include-versions`,
 `include-labels`, `include-properties` and `include-operations`. Updates require matching `id`,
-`title`, `status`, `body`, and `version.number=current+1`; stale versions return 409. Creation also
+`title`, `status=current|draft`, `body`, and `version.number=current+1`; draft updates use version 1.
+Stale versions return 409. Draft creation can omit the title. Restoring trashed/deleted content
+to current preserves its title, body and version. Historical reads report `status=historical`.
+Ownership transfers update `lastOwnerId`; ordinary edits preserve it. Creation also
 accepts a nested body object. New pages default beneath the space homepage, unless `parentId` or
-`root-level=true` is supplied. Cross-space parents and hierarchy cycles return 400.
+`root-level=true` is supplied. Combining `root-level=true` with `parentId`, cross-space moves or
+parents, and hierarchy cycles returns 400. Published `private=true` pages/blogs are visible only
+to their creator, including in lists, search and descendants. Blog responses omit page-only
+hierarchy/ownership fields and honor the `createdAt` date on creation and updates.
+
+Space property writes require space administration permission, return `createdBy` (including
+inside `version`), and preserve the original `createdAt`/`createdBy` on update. Creation returns
+201 with a fetchable `Location` header in all routing modes. Content property keys are limited
+to 255 characters; updates support key changes and version messages. Page/blog property lists
+support `sort=key|-key`. Expanded collections with more than 50 entries include a usable
+`meta.cursor` alongside their continuation endpoint.
 
 `GET /wiki/download/attachments/{pageId}/{filename}` returns real generated Office/PDF/CSV/PNG bytes
 with MIME type, content length, disposition and a content hash ETag. Rendering happens on first
@@ -153,13 +173,15 @@ attachment metadata/download access; bytes are cached in `ctx.store.blobs`.
 
 | Method | Path | Notes |
 | --- | --- | --- |
-| GET | `/content/search` | CQL content results, expansions, `start`/`limit`, next link |
+| GET | `/content/search` | CQL content results, expansions, cursor/limit and next link |
 | GET | `/search` | CQL search results with content, excerpt highlighting, container and modification date |
 | GET | `/content/{id}` | `expand=body.storage,version,ancestors,space,restrictions.read.restrictions.user,history.lastUpdated` |
 | GET | `/content/{id}/restriction/byOperation` | Read/update user restrictions |
 | GET | `/content/{id}/restriction/byOperation/{read|update}` | One operation's restrictions |
 | GET | `/content/{id}/child/attachment` | v1 attachment metadata and binary links |
 | GET | `/space` | Visible spaces, `spaceKey`, type and offset pagination |
+| GET | `/space/{key}` | Visible space details; follows returned self links |
+| GET | `/user` | Lookup by `accountId`; follows user self links |
 | GET | `/user/current` | Confluence user shape |
 
 CQL supports parentheses, `AND`, `OR`, `NOT`, `=`, `!=`, comparisons, `IN`, `NOT IN`, `~`, `!~`,
@@ -175,6 +197,12 @@ type=page AND ancestor=28580455262078844 AND label=client-engagement
 
 Unsupported or malformed clauses produce 400, including unknown fields in an `OR` branch.
 Space membership and inherited read restrictions filter results before pagination.
+Both search routes emit cursor next/previous links; `start` remains accepted for offset-based
+connectors. Search `limit=0` returns an empty page without a continuation link. `/search` honors
+`excerpt=none|indexed|highlight|indexed_unescaped|highlight_unescaped`.
+Queries are capped at 20,000 characters, 1,024 tokens and 32 nested expressions; out-of-range
+dates and numeric literals return 400. Content IDs compare numerically; Jira issue keys sort
+by project key and numeric issue number.
 
 ### Jira REST v3 (`/rest/api/3`)
 
@@ -182,13 +210,16 @@ Space membership and inherited read restrictions filter results before paginatio
 | --- | --- | --- |
 | GET | `/myself` | Current delegated Jira user |
 | GET | `/project/search` | Visible OPS/ENG projects, `query`, `startAt`, `maxResults` (50 default, 100 maximum) |
+| GET | `/project/{idOrKey}` | Visible project details and fetchable self links |
 | GET, POST | `/search/jql` | Enhanced bounded JQL; `nextPageToken` pagination |
 | GET | `/issue/{keyOrId}` | All supported fields by default; `fields` projection/exclusion |
 | POST | `/issue` | Returns 201 and `{id,key,self}` |
 | PUT | `/issue/{keyOrId}` | `fields` and `update`; 204, or 200 with `returnIssue=true` |
 | GET, POST | `/issue/{keyOrId}/transitions` | To Do / In Progress / Done; POST returns 204 |
 | GET, POST | `/issue/{keyOrId}/comment` | ADF comments; GET uses offset pagination, POST returns 201 |
+| GET | `/issue/{keyOrId}/comment/{id}` | Comment details, including visibility checks |
 | GET | `/user/search` | Active employees by `query` or `accountId`; offset pagination |
+| GET | `/user` | User lookup by `accountId` |
 
 Enhanced search defaults to **IDs only**, unlike single-issue reads. Request `fields` explicitly
 or use `*all`, `*navigable` and exclusions such as `-description`. It defaults to 50 results with
@@ -207,6 +238,12 @@ Issue fields include summary, ADF description, status/category, assignee, report
 labels, created/updated, due date, issue type, project and an epic parent. Writable fields are
 validated atomically. `update` supports `set`, plus label `add` and `remove`. Change status through
 transitions (`11` To Do, `21` In Progress, `31` Done). Invalid and unavailable transitions return 400.
+Creation also honors `update` field operations. Malformed intermediate label sets, nested ADF,
+non-integer JSON page sizes and non-`yyyy-MM-dd` due dates return 400 without partial writes.
+Restricted comments support world groups by name/ID and the synthetic project roles
+Administrators (owners), Developers (editors/owners), and Users (all project members). Visibility
+is enforced before pagination in comment lists and in embedded comments on issue reads/search.
+Comment lists support `orderBy=created|+created|-created`. Hidden parent-issue details are omitted.
 
 ## Seeded data and permissions
 
@@ -243,7 +280,8 @@ ACLs become explicit read/update restrictions. Read restrictions propagate throu
 space membership is still required. Invisible pages, attachments and issues return 404 and are
 excluded from lists/search. Operations reflect caller edit rights.
 
-OPS allows active staff; ENG uses the CLIENTS space's roles. Selected fieldwork issues have
+OPS allows active staff, with the TECH space owner as its administrator; ENG uses the CLIENTS
+space's roles. Selected fieldwork issues have
 engagement-team/partner issue security. For example, p026 can view ENG-1 but cannot view ENG-3;
 p001 can view both. ENG viewer roles cannot mutate issues.
 
@@ -262,11 +300,16 @@ Confluence payloads have `userAccountId`, `accountType`, `timestamp` and a page 
 ID, version, space key, content type, self URL and millisecond creation/modification dates.
 Jira payloads have `webhookEvent`, `timestamp`, user and issue objects, with a changelog for field
 updates/transitions. Adding a Jira comment also emits `jira:issue_updated`.
+Jira deliveries have a stable `X-Atlassian-Webhook-Identifier`, `X-Atlassian-Webhook-Flow: Primary`,
+and `X-Atlassian-Webhook-Retry` on retries. Printable request trace headers are propagated.
+Connection failures, HTTP 408/409/425/429 and 5xx responses receive up to five retries; other
+failure statuses stop immediately. Retries preserve the exact payload and signature.
 
 The other provider action is `mint_token`, described above. Standard reset/snapshot/fault/journal
 actions remain available. Reset restores seeded content, revokes issued tokens and removes
 subscriptions. Fault-injected 429 responses include `Retry-After`, `X-RateLimit-Limit` and
-`X-RateLimit-Remaining`. Product-specific fault path patterns choose the corresponding envelope.
+`X-RateLimit-Remaining`. The actual request path selects the Jira/v1/v2 envelope, including
+generic fault patterns. Responses include `X-AREQUESTID` and `Atl-Traceid` identifiers.
 
 ## Known gaps
 
@@ -276,7 +319,8 @@ subscriptions. Fault-injected 429 responses include `Retry-After`, `X-RateLimit-
 * Seeded historical versions carry the source document's current text; runtime updates retain
   exact previous bodies/titles. Full rich-text conversion, macro rendering, collaborative drafts,
   automatic reconciliation, rich ADF validation and full Confluence publish/delete workflows are
-  not modeled. Draft creation currently requires a title. Trashing/purging acts on the named page.
+  not modeled. Only one draft/published representation is stored at a time. Live-doc subtype
+  flags use ordinary page versioning. Trashing/purging acts on the named page.
 * CQL/JQL text matching uses case-insensitive substring/wildcard matching, not a Lucene index.
   Advanced functions, full query-language grammars and locale-specific relevance/date handling
   are not supported. Search only includes current content. Other optional filters/expansions not
@@ -289,18 +333,21 @@ subscriptions. Fault-injected 429 responses include `Retry-After`, `X-RateLimit-
 * No Forge/Connect installation JWT validation, production consent UI, scope implication graph,
   organization administration, multi-tenant provisioning or automatic rate-limit accounting.
   The control-plane app-only service-principal convention is an emulator facility.
+  Jira authentication currently implements classic scopes; granular Jira scope sets are not modeled.
 * Webhook registration is a control-plane action, not Jira's public registration API. Confluence
   deliveries use the requested HMAC convention rather than Connect authorization JWTs. Subscriptions
   have no JQL filters or expiry. Only the four listed mutation event types are generated.
-* The shared fault callback receives no request path. A fault pattern containing `/rest/api/3`,
-  `/ex/jira/` or `/wiki/rest/` selects the proper family; generic patterns default to Confluence v2.
-  Supply an explicit `body` when a generic fault must use a Jira/v1 error envelope.
+  Retry delays are accelerated to 0.5–2 seconds in async mode (immediate in sync/manual mode);
+  Jira's production 5–15 minute backoff, tenant failure throttling and concurrency limits are not
+  simulated. Confluence's synthetic subscriptions retain the shared dispatcher's retry policy.
 
 ## Verification and references
 
 ```text
 uv run pytest tests/providers/atlassian -q
 EMULATORS_PROVIDERS=atlassian uv run pytest tests/sdk/test_atlassian_http.py -q
+uv run pytest tests/e2e -q
+uv run pytest -q
 uv run ruff check src/emulators/providers/atlassian tests/providers/atlassian tests/sdk/test_atlassian_http.py
 uv run ruff format --check src/emulators/providers/atlassian tests/providers/atlassian tests/sdk/test_atlassian_http.py
 ```
@@ -308,18 +355,24 @@ uv run ruff format --check src/emulators/providers/atlassian tests/providers/atl
 The HTTP contract suite uses unchanged httpx site and OAuth gateway requests through the real
 local server and `emulator_intercept`. No additional vendor SDK dependency is needed.
 
-Validation snapshot for this implementation:
-
-* Focused provider and live HTTP contract suites: **74 passed** (72 provider, 2 HTTP contract).
-* Ruff lint and formatting checks: clean on the provider and its tests.
-* Full repository run during concurrent provider work: **2119 passed, 8 failed, 1 skipped**.
-  Failures were confined to Google: three Calendar tests, one Drive query test, three Gmail tests,
-  and `tests/sdk/test_google_workspace_sdk.py::test_workspace_service_account_impersonation`.
-  The skip was the optional `mutagen.mp4` media check. No Google/core/dependency files were changed
-  as part of the Atlassian implementation.
+The fidelity audit adds adversarial regression tests for every fix, malformed HTTP bodies across
+all write routes, private content, comment restrictions, OAuth rotation/PKCE, cursor bindings,
+property administration, webhook retries and real-host live HTTP clients. A separate throwaway
+in-process probe exercised 991 write-input variants with zero remaining crashes. Seeding remains
+deterministic and below two seconds; seeded version timestamps do not exceed the world anchor.
+No Atlassian vendor SDK is installed in this environment; the live suite uses httpx through
+`emulator_intercept`. Focused audit validation: 290 provider tests, 3 live HTTP contract tests and
+10 end-to-end flows pass; scoped Ruff checks and the docs/tests secret-pattern scan are clean.
+The full repository audit run passed 3,486 tests with one skip for the unavailable optional
+`mutagen.mp4` media dependency. The latest focused run includes the final property-ID and
+pagination/status regressions above. Two unrelated SDK advisories were emitted by MSAL and Slack.
 
 Wire references: [Confluence v2 OpenAPI](https://dac-static.atlassian.com/cloud/confluence/openapi-v2.v3.json),
 [Confluence v1 content restrictions](https://developer.atlassian.com/cloud/confluence/rest/v1/api-group-content-restrictions/),
 [Confluence 3LO](https://developer.atlassian.com/cloud/confluence/oauth-2-3lo-apps/),
 [Jira v3 OpenAPI](https://developer.atlassian.com/cloud/jira/platform/swagger-v3.v3.json),
 and [Atlassian webhook payloads](https://developer.atlassian.com/cloud/confluence/modules/webhook/).
+Additional audit references: [Space property schema/status/permissions](https://developer.atlassian.com/cloud/confluence/rest/v2/api-group-space-properties/),
+[Jira comment visibility](https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-issue-comments/),
+[Jira webhook retries and headers](https://developer.atlassian.com/cloud/jira/platform/webhooks/),
+and [3LO profile scope and refresh-token leeway](https://developer.atlassian.com/cloud/jira/platform/oauth-2-3lo-apps/).

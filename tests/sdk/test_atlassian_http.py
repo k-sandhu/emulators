@@ -15,9 +15,8 @@ AUTH = "https://auth.atlassian.com"
 
 
 def test_site_basic_connector_tree_and_incremental_search(emulator_intercept: object) -> None:
-    with httpx.Client(
-        auth=("eleanor.whitfield@halcyonadvisory.example", "halcyon-api-token"), timeout=30
-    ) as client:
+    credentials = httpx.get(SITE + "/_emulator/info").json()["credentials"]
+    with httpx.Client(auth=(credentials["email"], credentials["api_token"]), timeout=30) as client:
         response = client.get(SITE + "/wiki/api/v2/spaces", params={"keys": "CLIENTS"})
         response.raise_for_status()
         space = response.json()["results"][0]
@@ -94,3 +93,36 @@ def test_oauth_cloud_gateway_confluence_and_jira(emulator_intercept: object) -> 
         assert search.json()["isLast"] is False
         one = search.json()["issues"][0]
         client.get(one["self"]).raise_for_status()
+
+
+def test_live_private_content_and_space_property_admin_contract(emulator_intercept: object) -> None:
+    with httpx.Client(timeout=30) as client:
+        credentials = client.get(SITE + "/_emulator/info").json()["credentials"]
+        client.auth = (credentials["email"], credentials["api_token"])
+        kb = client.get(SITE + "/wiki/api/v2/spaces?keys=KB").json()["results"][0]
+        page = client.post(
+            SITE + "/wiki/api/v2/pages?private=true",
+            json={
+                "spaceId": kb["id"],
+                "title": "Private HTTP audit",
+                "body": {
+                    "representation": "storage",
+                    "value": "<p>Confidential guidance.</p>",
+                },
+            },
+        )
+        page.raise_for_status()
+        client.auth = ("maya.chen@halcyonadvisory.example", credentials["api_token"])
+        assert client.get(SITE + "/wiki/api/v2/pages/" + page.json()["id"]).status_code == 404
+        # Discover the administrator by the seeded space's author, rather than assuming roles.
+        administrator = client.post(SITE + "/_emulator/tokens", json={"user": kb["authorId"]})
+        administrator.raise_for_status()
+        client.auth = None
+        client.headers["Authorization"] = "Bearer " + administrator.json()["access_token"]
+        cloud = credentials["cloud_id"]
+        path = API + f"/ex/confluence/{cloud}/wiki/api/v2/spaces/{kb['id']}/properties"
+        prop = client.post(path, json={"key": "http.audit", "value": {"ok": True}})
+        assert prop.status_code == 201
+        assert prop.json()["createdBy"] == kb["authorId"] and "authorId" not in prop.json()["version"]
+        assert prop.headers["location"].startswith(path + "/")
+        assert client.get(prop.headers["location"]).json()["value"] == {"ok": True}

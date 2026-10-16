@@ -22,6 +22,7 @@ SITE = "halcyonadvisory.atlassian.net"
 CLOUD_ID = stable_guid("atlassian", "halcyonadvisory", "cloud")
 API_TOKEN = "halcyon-api-token"
 DEFAULT_SCOPES = [
+    "read:me",
     "read:confluence-content.all",
     "read:confluence-space.summary",
     "search:confluence",
@@ -46,6 +47,8 @@ def numeric_id(*parts: object) -> str:
 
 def error_body(status: int, message: str, family: str = "v2") -> Record:
     title = HTTPStatus(status).phrase
+    if family == "oauth":
+        return {"error": "invalid_request", "error_description": message}
     if family == "jira":
         return {"errorMessages": [message], "errors": {}}
     if family == "v1":
@@ -76,6 +79,8 @@ def error_body(status: int, message: str, family: str = "v2") -> Record:
 
 
 def family(request: Request) -> str:
+    if request.url.path.endswith(("/oauth/token", "/authorize")):
+        return "oauth"
     if "/rest/api/3" in request.url.path or "/ex/jira/" in request.url.path:
         return "jira"
     return "v1" if "/wiki/rest/" in request.url.path else "v2"
@@ -121,8 +126,12 @@ def integer(
     request: Request, value: Any, name: str, default: int, maximum: int = 250, minimum: int = 1
 ) -> int:
     try:
+        if isinstance(value, (bool, float, list, dict)):
+            raise ValueError
+        if isinstance(value, str) and not re.fullmatch(r"[+-]?\d+", value):
+            raise ValueError
         result = int(value) if value is not None else default
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, OverflowError):
         fail(request, 400, f"Invalid {name}.")
     if not minimum <= result <= maximum:
         fail(request, 400, f"{name} must be between {minimum} and {maximum}.")
@@ -145,10 +154,14 @@ def cursor_offset(request: Request, token: str | None, binding: str) -> int:
         fail(request, 400, "Invalid cursor.")
 
 
+def cursor_binding(request: Request, path: str, pairs: list[tuple[str, str]]) -> str:
+    return path + "?" + urlencode(sorted(pairs)) + ":" + getattr(request.state, "principal", "")
+
+
 def page_response(request: Request, ctx: ProviderContext, records: list[Record]) -> JSONResponse:
     limit = integer(request, request.query_params.get("limit"), "limit", 25)
     pairs = [(k, v) for k, v in request.query_params.multi_items() if k != "cursor"]
-    binding = local_path(request) + "?" + urlencode(sorted(pairs))
+    binding = cursor_binding(request, local_path(request), pairs)
     offset = cursor_offset(request, request.query_params.get("cursor"), binding)
     links = {"base": site_url(request, ctx, "/wiki")}
     headers: dict[str, str] = {}

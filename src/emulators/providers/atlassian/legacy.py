@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import html
 import re
 from urllib.parse import urlencode
 
@@ -18,6 +19,8 @@ from .common import (
     ancestors,
     api_url,
     can_view,
+    cursor_offset,
+    cursor_token,
     fail,
     get_page,
     integer,
@@ -178,24 +181,53 @@ def offset_page(
     request: Request, ctx: ProviderContext, records: list[Record], *, total: bool = False
 ) -> Record:
     start = integer(request, request.query_params.get("start"), "start", 0, 2147483647, 0)
-    limit = integer(request, request.query_params.get("limit"), "limit", 25)
+    cursor_mode = request.url.path.endswith(("/content/search", "/search"))
+    limit = integer(request, request.query_params.get("limit"), "limit", 25, minimum=0 if cursor_mode else 1)
     pairs = [(k, v) for k, v in request.query_params.multi_items() if k not in ("start", "limit")]
+    binding = ""
+    if cursor_mode:
+        pairs = [(k, v) for k, v in pairs if k != "cursor"]
+        binding = (
+            local_path(request)
+            + "?"
+            + urlencode(sorted([*pairs, ("limit", str(limit))]))
+            + ":"
+            + getattr(request.state, "principal", "")
+        )
+        if "cursor" in request.query_params:
+            start = cursor_offset(request, request.query_params["cursor"], binding)
     links = {
         "base": site_url(request, ctx, "/wiki"),
         "context": "/wiki",
         "self": absolute(request, local_path(request)),
     }
-    if start + limit < len(records):
+    if limit and start + limit < len(records):
         links["next"] = (
             absolute(request, local_path(request))
             + "?"
-            + urlencode([*pairs, ("start", start + limit), ("limit", limit)])
+            + urlencode(
+                [
+                    *pairs,
+                    ("cursor", cursor_token(start + limit, binding))
+                    if cursor_mode
+                    else ("start", start + limit),
+                    ("limit", limit),
+                ]
+            )
         )
-    if start:
+    if limit and start:
         links["prev"] = (
             absolute(request, local_path(request))
             + "?"
-            + urlencode([*pairs, ("start", max(0, start - limit)), ("limit", limit)])
+            + urlencode(
+                [
+                    *pairs,
+                    ("cursor", cursor_token(max(0, start - limit), binding))
+                    if cursor_mode
+                    else ("start", max(0, start - limit)),
+                    ("limit", limit),
+                ]
+            )
         )
     result = {
         "results": records[start : start + limit],
@@ -257,12 +289,25 @@ def build_v1(ctx: ProviderContext) -> APIRouter:
             items = [v1_content(request, ctx, r["_page"], grant, expand) for r in matches]
         else:
             items = []
+            excerpt_mode = request.query_params.get("excerpt", "highlight")
+            if excerpt_mode not in (
+                "highlight",
+                "indexed",
+                "none",
+                "highlight_unescaped",
+                "indexed_unescaped",
+            ):
+                fail(request, 400, "Invalid excerpt mode.")
             for record in matches:
                 page = record["_page"]
                 content_expand = ",".join(part.removeprefix("content.") for part in expand.split(","))
                 content = v1_content(request, ctx, page, grant, content_expand)
                 excerpt = plain_text(page["body"]["storage"]["value"])[:400]
-                for term in query.text_terms:
+                if excerpt_mode == "none":
+                    excerpt = ""
+                elif not excerpt_mode.endswith("_unescaped"):
+                    excerpt = html.escape(excerpt)
+                for term in query.text_terms if excerpt_mode.startswith("highlight") else []:
                     if term:
                         excerpt = re.sub(
                             re.escape(term),
@@ -306,7 +351,11 @@ def build_v1(ctx: ProviderContext) -> APIRouter:
             history = next((h for h in page["_history"] if h["version"]["number"] == number), None)
             if not history:
                 fail(request, 404, "Version not found.")
-            page = {**page, **copy.deepcopy(history)}
+            page = {
+                **page,
+                **copy.deepcopy(history),
+                "status": "historical" if number != page["version"]["number"] else page["status"],
+            }
         return v1_content(request, ctx, page, grant, request.query_params.get("expand", ""))
 
     @router.get("/content/{page_id}/restriction/byOperation")
@@ -355,6 +404,22 @@ def build_v1(ctx: ProviderContext) -> APIRouter:
             and ("type" not in request.query_params or s["type"] == request.query_params["type"])
         ]
         return offset_page(request, ctx, items)
+
+    @router.get("/space/{space_key}")
+    async def space(request: Request, space_key: str) -> Record:
+        grant = confluence_auth(request, ctx, "space")
+        record = ctx.store["spaces"].first(key=space_key)
+        if not record or not space_role(ctx, record, grant):
+            fail(request, 404, "Space not found.")
+        return v1_space(request, ctx, record)
+
+    @router.get("/user")
+    async def user(request: Request) -> Record:
+        confluence_auth(request, ctx, "user")
+        record = ctx.store["users"].get(request.query_params.get("accountId"))
+        if not record:
+            fail(request, 404, "User not found.")
+        return user_shape(request, ctx, record)
 
     @router.get("/user/current")
     async def current_user(request: Request) -> Record:

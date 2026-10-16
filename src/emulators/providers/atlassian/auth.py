@@ -61,11 +61,18 @@ def issue_access(
 def mint_token(ctx: ProviderContext, payload: Record) -> Record:
     """Mint a registered RS256 access token using world ids, account ids or emails."""
     value = payload.get("user")
+    if value is not None and (not isinstance(value, str) or not value):
+        raise OAuthError("invalid_request", "user must be a non-empty string.")
     user = person_record(ctx, value) if value else None
     if value and not user:
         raise OAuthError("invalid_request", "Unknown user.")
     try:
-        expires = int(payload.get("expires_in", 3600))
+        expires_value = payload.get("expires_in", 3600)
+        if isinstance(expires_value, (bool, float, dict, list)):
+            raise ValueError
+        expires = int(expires_value)
+        if not -2147483648 <= expires <= 2147483647:
+            raise ValueError
     except (TypeError, ValueError, OverflowError):
         raise OAuthError("invalid_request", "expires_in must be an integer.") from None
     scopes = payload.get("scopes", DEFAULT_SCOPES)
@@ -73,7 +80,13 @@ def mint_token(ctx: ProviderContext, payload: Record) -> Record:
         scopes = scopes.split()
     if not isinstance(scopes, list) or any(not isinstance(scope, str) for scope in scopes):
         raise OAuthError("invalid_request", "scopes must be a list of strings.")
-    app_only = bool(payload.get("app_only", user is None))
+    app_only = payload.get("app_only", user is None)
+    if not isinstance(app_only, bool):
+        raise OAuthError("invalid_request", "app_only must be a boolean.")
+    if not isinstance(payload.get("client_id", "emulator-client"), str) or not payload.get(
+        "client_id", "emulator-client"
+    ):
+        raise OAuthError("invalid_request", "client_id must be a string.")
     if not app_only and not user:
         raise OAuthError("invalid_request", "Delegated tokens require a user.")
     grant = issue_access(
@@ -103,7 +116,7 @@ def authenticate(request: Request, ctx: ProviderContext, *, scopes: tuple[str, .
         if (
             user
             and user["email"].casefold() == basic[0].casefold()
-            and secrets.compare_digest(basic[1], API_TOKEN)
+            and secrets.compare_digest(basic[1].encode(), API_TOKEN.encode())
         ):
             grant = Grant("", "access", "api-token", user["id"], DEFAULT_SCOPES, ctx.clock.now(), None)
     else:
@@ -116,6 +129,7 @@ def authenticate(request: Request, ctx: ProviderContext, *, scopes: tuple[str, .
             fail(request, 401, "Account is not active.")
     if scopes and not grant.has_scope(*scopes):
         fail(request, 403, "The token does not have the required scopes.")
+    request.state.principal = grant.user_id or grant.client_id
     return grant
 
 
@@ -188,6 +202,10 @@ def build_auth(app: FastAPI, ctx: ProviderContext) -> None:
             raise OAuthError("invalid_request", "audience, redirect_uri and response_type=code are required.")
         if client["redirect_uris"] and redirect_uri not in client["redirect_uris"]:
             raise OAuthError("invalid_request", "The redirect URI is not registered.")
+        if q.get("code_challenge_method") not in (None, "plain", "S256") or (
+            "code_challenge_method" in q and not q.get("code_challenge")
+        ):
+            raise OAuthError("invalid_request", "Invalid PKCE challenge or method.")
         scopes = q.get("scope", "").split()
         hint = q.get("login_hint")
         if not hint:
@@ -222,6 +240,17 @@ def build_auth(app: FastAPI, ctx: ProviderContext) -> None:
 
     @app.post("/oauth/token")
     async def token(payload: dict[str, Any]) -> Record:
+        for key in (
+            "client_id",
+            "client_secret",
+            "grant_type",
+            "code",
+            "redirect_uri",
+            "code_verifier",
+            "refresh_token",
+        ):
+            if key in payload and (not isinstance(payload[key], str) or not payload[key]):
+                raise OAuthError("invalid_request", f"{key} must be a non-empty string.")
         client = ctx.tokens.authenticate_client(payload.get("client_id"), payload.get("client_secret"))
         grant_type = payload.get("grant_type")
         with ctx.store.lock:
@@ -236,12 +265,30 @@ def build_auth(app: FastAPI, ctx: ProviderContext) -> None:
                     code_verifier=payload.get("code_verifier"),
                 )
             elif grant_type == "refresh_token":
-                original = ctx.tokens.resolve(payload.get("refresh_token"), "refresh")
-                if not original or original.client_id != client["id"]:
+                original = ctx.tokens.get(payload.get("refresh_token"), "refresh")
+                if (
+                    not original
+                    or original.client_id != client["id"]
+                    or (original.expires_at is not None and original.expires_at <= ctx.clock.now())
+                ):
                     raise OAuthError("invalid_grant", "Invalid refresh token.")
+                rotated_at = original.extra.get("rotated_at")
+                if original.revoked and (rotated_at is None or ctx.clock.timestamp() - rotated_at > 600):
+                    # Reuse after the leeway revokes the entire refresh-token family.
+                    family_id = original.extra.get("family", original.token)
+                    for record in ctx.store["_grants"]:
+                        if record.get("extra", {}).get("family") == family_id:
+                            record["revoked"] = True
+                    raise OAuthError("invalid_grant", "Invalid refresh token.")
+                if not original.revoked:
+                    record = ctx.store["_grants"].get(original.token)
+                    record["extra"]["rotated_at"] = ctx.clock.timestamp()
                 ctx.tokens.revoke(original.token)
             else:
                 raise OAuthError("unsupported_grant_type", "Use authorization_code or refresh_token.")
+            user = person_record(ctx, original.user_id)
+            if not user or user["accountStatus"] != "active":
+                raise OAuthError("invalid_grant", "Account is not active.")
             grant = issue_access(
                 ctx, user_id=original.user_id, scopes=original.scopes, client_id=client["id"]
             )
@@ -253,7 +300,10 @@ def build_auth(app: FastAPI, ctx: ProviderContext) -> None:
             }
             if "offline_access" in grant.scopes:
                 refresh = ctx.tokens.issue_refresh(
-                    client_id=client["id"], user_id=grant.user_id, scopes=grant.scopes
+                    client_id=client["id"],
+                    user_id=grant.user_id,
+                    scopes=grant.scopes,
+                    extra={"family": original.extra.get("family", original.token)},
                 )
                 result["refresh_token"] = refresh.token
             return result
@@ -273,7 +323,7 @@ def build_auth(app: FastAPI, ctx: ProviderContext) -> None:
 
     @app.get("/me")
     async def me(request: Request) -> Record:
-        grant = authenticate(request, ctx)
+        grant = authenticate(request, ctx, scopes=("read:me",))
         user = person_record(ctx, grant.user_id)
         if grant.app_only or not user:
             fail(request, 403, "This resource requires a user grant.")

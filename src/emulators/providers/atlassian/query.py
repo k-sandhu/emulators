@@ -51,6 +51,22 @@ JQL_FIELDS = {
     "text",
 }
 TEMPORAL = {"created", "lastmodified", "updated", "due", "duedate"}
+
+
+def ordered_value(field: str, value: Any) -> Any:
+    if field in ("id", "content", "parent", "ancestor") and str(value).isdigit():
+        try:
+            return int(value)
+        except ValueError:
+            raise QueryError("Numeric value is out of range.") from None
+    if field in ("key", "issuekey") and (match := re.fullmatch(r"(.+)-(\d+)", str(value))):
+        try:
+            return match[1].casefold(), int(match[2])
+        except ValueError:
+            raise QueryError("Issue key is out of range.") from None
+    return str(value).casefold()
+
+
 TOKEN = re.compile(
     r"""\s*(?:("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')|(!=|>=|<=|!~|=|>|<|~)|([(),])|([^\s(),=!<>~]+))"""
 )
@@ -116,16 +132,21 @@ class Query:
             if a is None or b is None:
                 return False
         else:
-            a, b = str(a).casefold(), str(b).casefold()
+            a, b = ordered_value(field, a), ordered_value(field, b)
         if op == "=":
             return a == b
         if op == "~":
             pattern = re.escape(str(b).strip('"')).replace(r"\*", ".*").replace(r"\?", ".")
             return bool(re.search(pattern, str(a), re.IGNORECASE))
+        if type(a) is not type(b):
+            return False
         return {">": lambda: a > b, ">=": lambda: a >= b, "<": lambda: a < b, "<=": lambda: a <= b}[op]()
 
     def apply(self, records: list[Record]) -> list[Record]:
-        result = [r for r in records if self.matches(r)]
+        try:
+            result = [r for r in records if self.matches(r)]
+        except (RecursionError, OverflowError):
+            raise QueryError("Query is too complex or its dates are out of range.") from None
         for field, descending in reversed(self.order):
 
             def key(record: Record, field: str = field) -> tuple[bool, Any]:
@@ -134,9 +155,9 @@ class Query:
                     value = value[0] if value else None
                 if field in TEMPORAL:
                     value = date_value(value, self.now)
-                return value is not None, value if isinstance(value, datetime) else str(
-                    value or ""
-                ).casefold()
+                return value is not None, value if isinstance(value, datetime) else ordered_value(
+                    field, value or ""
+                )
 
             result.sort(key=key, reverse=descending)
         return result
@@ -146,10 +167,13 @@ def duration(value: str) -> timedelta:
     match = re.fullmatch(r"([+-]?\d+)([mhdw]?)", value, re.IGNORECASE)
     if not match:
         raise QueryError("Invalid relative date.")
-    number = int(match[1])
-    return timedelta(
-        seconds=number * {"m": 60, "h": 3600, "d": 86400, "w": 604800, "": 86400}[match[2].lower()]
-    )
+    try:
+        number = int(match[1])
+        return timedelta(
+            seconds=number * {"m": 60, "h": 3600, "d": 86400, "w": 604800, "": 86400}[match[2].lower()]
+        )
+    except (ValueError, OverflowError):
+        raise QueryError("Relative date is out of range.") from None
 
 
 def date_value(value: Any, now: datetime) -> datetime | None:
@@ -162,7 +186,7 @@ def date_value(value: Any, now: datetime) -> datetime | None:
         if re.fullmatch(r"[+-]?\d+[mhdw]", text, re.IGNORECASE):
             return now + duration(text)
         return parse_instant(text.replace("/", "-"))
-    except ValueError:
+    except (ValueError, OverflowError):
         return None
 
 
@@ -183,6 +207,8 @@ class Parser:
             self.tokens.append((value, quoted is not None))
             position = match.end()
         self.index = 0
+        if len(self.tokens) > 1024:
+            raise QueryError("Query is too complex.")
         self.depth = 0
         self.fields = CQL_FIELDS if dialect == "cql" else JQL_FIELDS
         self.query = Query(None, [], [], now, user)
@@ -303,6 +329,10 @@ class Parser:
             self.expect(")")
             if name == "currentuser" and argument:
                 raise QueryError("currentUser() takes no arguments.")
+            if name == "currentuser" and field not in ("creator", "lastmodifier", "assignee", "reporter"):
+                raise QueryError("currentUser() requires a user field.")
+            if name != "currentuser" and field not in TEMPORAL:
+                raise QueryError("Date functions require a date field.")
             if name != "currentuser" and argument:
                 duration(argument)
             return name, argument
