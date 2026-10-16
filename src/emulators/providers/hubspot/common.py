@@ -160,14 +160,14 @@ def fetch(
         definition = ctx.store[f"properties:{kind}"].get(id_property)
         if definition is None or not definition.get("hasUniqueValue"):
             fail(400, f"Property {id_property} is not a unique property.")
-        record = next(
-            (
-                r
-                for r in ctx.store[kind]
-                if str(r["properties"].get(id_property, "")).casefold() == record_id.casefold()
-            ),
-            None,
-        )
+        matches = [
+            r
+            for r in ctx.store[kind]
+            if str(r["properties"].get(id_property, "")).casefold() == record_id.casefold()
+        ]
+        record = next((r for r in matches if bool(r["archived"]) == archived), None)
+        if record is None:
+            record = matches[0] if matches else None
     else:
         record = ctx.store[kind].get(record_id)
     if record is None or bool(record["archived"]) != archived or not visible(ctx, grant, kind, record):

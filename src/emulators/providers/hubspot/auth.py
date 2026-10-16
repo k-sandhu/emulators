@@ -20,15 +20,28 @@ from .common import APP_ID, PORTAL_ID, all_scopes, fail, owner_for
 def mint_token(ctx: ProviderContext, payload: dict[str, Any]) -> dict[str, Any]:
     """Mint a scoped OAuth access token, or an app token with app_only=true."""
     user = payload.get("user")
+    if user is not None and not isinstance(user, str):
+        fail(400, "user must be a string.")
     owner = owner_for(ctx, user) if user else None
     if user and (owner is None or owner["archived"]):
         fail(400, "The requested user does not have an active HubSpot seat.")
-    ttl = int(payload.get("expires_in", 1800))
+    ttl = payload.get("expires_in", 1800)
+    if isinstance(ttl, bool) or not isinstance(ttl, int) or abs(ttl) > 10 * 365 * 86400:
+        fail(400, "expires_in must be an integer number of seconds.")
+    scopes = payload.get("scopes", all_scopes())
+    if not isinstance(scopes, list) or any(not isinstance(s, str) for s in scopes):
+        fail(400, "scopes must be an array of strings.")
+    app_only = payload.get("app_only", not user)
+    if not isinstance(app_only, bool):
+        fail(400, "app_only must be a boolean.")
+    client_id = payload.get("client_id", "emulator-client")
+    if not isinstance(client_id, str) or not client_id:
+        fail(400, "client_id must be a non-empty string.")
     grant = ctx.tokens.issue_access(
-        client_id=payload.get("client_id", "emulator-client"),
+        client_id=client_id,
         user_id=owner["_world_id"] if owner else None,
-        app_only=bool(payload.get("app_only", not user)),
-        scopes=payload.get("scopes", all_scopes()),
+        app_only=app_only,
+        scopes=scopes,
         ttl=timedelta(seconds=ttl),
         token="CJ" + secrets.token_urlsafe(150),
     )
@@ -67,11 +80,12 @@ def build(app: FastAPI, ctx: ProviderContext) -> None:
             fail(400, exc.description)
         if client["redirect_uris"] and redirect not in client["redirect_uris"]:
             fail(400, "redirect_uri does not match the application's registered redirect URIs.")
-        scopes = list(
-            dict.fromkeys((params.get("scope", "oauth") + " " + params.get("optional_scope", "")).split())
-        )
-        if any(s not in all_scopes() for s in scopes):
+        required = params.get("scope", "oauth").split()
+        if any(s not in all_scopes() for s in required):
             fail(400, "The requested scope is not supported by this account.")
+        # Optional scopes are best-effort: unsupported ones are dropped, not fatal.
+        optional = [s for s in params.get("optional_scope", "").split() if s in all_scopes()]
+        scopes = list(dict.fromkeys([*required, *optional]))
         hint = params.get("login_hint")
         if not hint:
             accounts = [

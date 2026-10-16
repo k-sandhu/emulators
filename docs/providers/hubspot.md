@@ -29,7 +29,7 @@ OAuth authorization uses
 `https://app.hubspot.com/oauth/authorize?client_id=...&redirect_uri=...&scope=...&state=...`.
 `login_hint` accepts a seated employee's world ID, email, owner ID, or numeric user
 ID and automatically approves; omitting it displays an account picker. `optional_scope`
-is supported. Authorization codes are single use and bind the client and redirect URI.
+values that this account does not support are dropped rather than rejected, matching HubSpot's best-effort optional scopes; unsupported required `scope` values return 400. Authorization codes are single use and bind the client and redirect URI.
 Unknown OAuth clients are accepted by the shared core's default lenient client policy;
 registered redirect URI allowlists are enforced.
 
@@ -94,28 +94,46 @@ aliases (`0-1`, `0-2`, `0-3`, etc.) are accepted.
 | POST | `/crm/v3/objects/{object}/batch/create` | Up to 100; 201; preserves `objectWriteTraceId` |
 | POST | `/crm/v3/objects/{object}/batch/update` | Up to 100; 200 |
 | POST | `/crm/v3/objects/{object}/batch/archive` | Up to 100; successful archive returns 204 |
-| POST | `/crm/v3/objects/{object}/batch/upsert` | Each input requires `idProperty`, `id`, properties; includes `new` |
+| POST | `/crm/v3/objects/{object}/batch/upsert` | `idProperty` per input (omitted means `hs_object_id`, which only updates); includes `new` |
 | POST | `/crm/v3/objects/{object}/search` | OR groups of AND filters, query, sort, offset cursor; default 10, maximum 200 |
 | GET | `/crm/v4/objects/{from}/{id}/associations/{to}` | Directional labels; default/max limit 500; numeric cursor |
 | PUT | `/crm/v4/objects/{from}/{id}/associations/default/{to}/{toId}` | Unlabeled relation; 200 with COMPLETE batch envelope |
 | PUT | `/crm/v4/objects/{from}/{id}/associations/{to}/{toId}` | Array of association category/type specifications; 201 |
 | DELETE | `/crm/v4/objects/{from}/{id}/associations/{to}/{toId}` | Removes both directions; 204 |
-| POST | `/crm/v4/associations/{from}/{to}/batch/read` | Up to 1000 source IDs; COMPLETE or 207 with partial errors |
-| GET, POST | `/crm/v4/associations/{from}/{to}/labels` | Built-in labels; custom labels with optional `inverseLabel` |
+| POST | `/crm/v4/associations/{from}/{to}/batch/read` | Up to 1000 source IDs; COMPLETE or 207 with partial errors; `toObjectId` values are integers |
+| POST | `/crm/v4/associations/{from}/{to}/batch/create` | Labeled batch create `{from, to, types}`; 201 or 207 |
+| POST | `/crm/v4/associations/{from}/{to}/batch/associate/default` | Unlabeled batch create `{from, to}`; 200 or 207 |
+| POST | `/crm/v4/associations/{from}/{to}/batch/archive` | Remove all associations for `{from, to: [...]}` pairs; 204 |
+| POST | `/crm/v4/associations/{from}/{to}/batch/labels/archive` | Remove only the specified association types; 204 |
+| POST | `/crm/v3/associations/{from}/{to}/batch/read` | Legacy name-typed (`contact_to_company`) batch read; 200 or 207 |
+| POST | `/crm/v3/associations/{from}/{to}/batch/create` | Legacy batch create `{from, to, type}`; 201 or 207 |
+| POST | `/crm/v3/associations/{from}/{to}/batch/archive` | Legacy batch remove by type name; 204 |
+| GET, POST | `/crm/v4/associations/{from}/{to}/labels` | Built-in labels; create a custom label with optional `inverseLabel` (200) |
 | GET, POST | `/crm/v3/properties/{object}` | Read catalog or create a custom definition; 201 for create |
-| GET, DELETE | `/crm/v3/properties/{object}/{name}` | Read definition or archive custom property; 204 |
+| GET, PATCH, DELETE | `/crm/v3/properties/{object}/{name}` | Read, update (label/options/group; name/type/fieldType immutable), or archive a custom property; 204 |
 | GET, POST | `/crm/v3/properties/{object}/groups` | Read/create property groups |
-| GET | `/crm/v3/properties/{object}/groups/{name}` | Read a group |
+| GET, PATCH, DELETE | `/crm/v3/properties/{object}/groups/{name}` | Read, rename, or archive a group |
 | GET | `/crm/v3/pipelines/{object}` | Deals and tickets |
 | GET | `/crm/v3/pipelines/{object}/{pipeline}` | Default Sales Pipeline, custom Advisory Engagements, Support Pipeline |
 | GET | `/crm/v3/pipelines/{object}/{pipeline}/stages` | Stage labels, probabilities, and open/closed metadata |
 | GET | `/crm/v3/pipelines/{object}/{pipeline}/stages/{stage}` | Individual stage |
 | GET | `/crm/v3/owners` | Default limit 100, maximum 500; email, archived, after filters |
-| GET | `/crm/v3/owners/{id}` | Owner ID or `idProperty=userId`; departments appear in teams |
+| GET | `/crm/v3/owners/{id}` | Owner ID or `idProperty=userId`; list also filters by `email` and `userId`; departments appear in teams |
 | GET | `/account-info/v3/details` | Portal, currency, timezone, UTC offset, hosting location |
 | GET | `/account-info/v3/api-usage/daily/private-apps` | Usage summary with `currentUsage`, `usageLimit`, `fetchStatus` |
 
 Batch errors return 207 with `status: COMPLETE`, successes, `errors`, and `numErrors`.
+Batch **create** is atomic unless multi-status is opted into by giving every input a
+unique `objectWriteTraceId`, as HubSpot requires; without it the first failure aborts
+the request and nothing is created. Batch update and upsert inputs may carry their own
+`idProperty`. Every vendor API response (including errors and injected faults) carries
+`X-HubSpot-Correlation-Id` — matching the error body's `correlationId` — and
+`X-HubSpot-RateLimit-*` headers. Creating a deal or ticket without a pipeline uses the
+default pipeline (`default` / `0`); companies require at least one of `name` or
+`domain`. Deal `hs_deal_stage_probability`, `hs_is_closed`, and `hs_is_closed_won` are
+HubSpot-calculated (read-only) and follow stage changes. Activities created without
+`hs_timestamp` default it to the creation time. A `PATCH` that changes no values is a
+no-op: no `updatedAt` bump, no history entry, and no property-change webhook.
 Search supports `EQ`, `NEQ`, `LT`, `LTE`, `GT`, `GTE`, `BETWEEN`, `IN`, `NOT_IN`,
 `HAS_PROPERTY`, `NOT_HAS_PROPERTY`, `CONTAINS_TOKEN`, and `NOT_CONTAINS_TOKEN`.
 Up to five groups, six filters per group, and 18 filters in total are accepted.
@@ -135,7 +153,7 @@ including different response envelopes for default and labeled associations. Com
 directional IDs include contact→company 1, company→contact 2, deal→contact 3,
 contact→deal 4, deal→company 5, and company→deal 6. Default unlabeled
 contact→company uses 279; its inverse uses 280. Primary relationships also carry the
-unlabeled association. Activity/contact/company/deal and ticket associations are seeded.
+unlabeled association. Labeled and unlabeled types share the legacy v3 type name (`contact_to_company`), so object-response association expansions contain one entry per associated record. Activity/contact/company/deal and ticket associations are seeded.
 
 ## Seeded data
 
@@ -210,12 +228,14 @@ OAuth token path segments and credential form fields are redacted in the request
 - This provider targets the requested legacy OAuth v1, CRM v3, and associations v4
   contracts. Date-based APIs, OAuth v3, API keys, account switching, and PKCE are absent.
 - Quotes, custom CRM object schemas, merge/GDPR deletion, files, marketing APIs, and
-  legacy engagement/association APIs are not implemented.
-- Pipelines are read-only. Property/group updates, group archive, custom association
-  label update/delete, association batch writes, and association limit administration
+  legacy engagement APIs are not implemented (v3 association batch endpoints are).
+- Pipelines are read-only. Custom association label update/delete, property batch endpoints,
+  and association limit administration
   are absent. The property catalog contains fields used by this projection rather
-  than every HubSpot default field. Supported association pairs are the seeded CRM
+  than every HubSpot default field (common `hs_lead_status` and calculated deal properties are included). Supported association pairs are the seeded CRM
   and activity pairs; there is no arbitrary object-pair schema.
+- Contacts upsert by `email` is a partial update here; real HubSpot does not support
+  partial upserts with `email` as the `idProperty` and expects all properties to be sent.
 - Search is synchronous and uses a local token matcher rather than HubSpot's delayed
   search index. Association-property search filters and sensitive-data scopes are absent.
 - Archive is immediate; deleted IDs must exist. Archived unique values can be reused.

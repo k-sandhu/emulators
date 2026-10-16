@@ -69,7 +69,7 @@ def test_connector_contacts_companies_deals_sync(emulator_intercept: Any) -> Non
         associations = client.get(BASE + f"/crm/v4/objects/contacts/{contact_id}/associations/companies")
         associations.raise_for_status()
         assert len(associations.json()["results"]) == 1
-        assert isinstance(associations.json()["results"][0]["toObjectId"], str)
+        assert isinstance(associations.json()["results"][0]["toObjectId"], int)
 
 
 def test_connector_oauth_refresh_and_schema_discovery(emulator_intercept: Any) -> None:

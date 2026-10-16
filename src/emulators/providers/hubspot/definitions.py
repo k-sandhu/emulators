@@ -42,7 +42,7 @@ FIELDS: dict[str, dict[str, list[str]]] = {
             "zip",
             "country",
         ],
-        "enumeration": ["lifecyclestage"],
+        "enumeration": ["lifecyclestage", "hs_lead_status"],
     },
     "companies": {
         "string": [
@@ -59,13 +59,14 @@ FIELDS: dict[str, dict[str, list[str]]] = {
             "country",
         ],
         "number": ["numberofemployees", "annualrevenue"],
-        "enumeration": ["lifecyclestage"],
+        "enumeration": ["lifecyclestage", "hs_lead_status"],
     },
     "deals": {
         "string": ["dealname", "description", "dealtype", "hs_next_step"],
         "number": ["amount", "hs_deal_stage_probability"],
         "datetime": ["closedate"],
         "enumeration": ["pipeline", "dealstage"],
+        "bool": ["hs_is_closed", "hs_is_closed_won"],
     },
     "tickets": {
         "string": ["subject", "content", "source_type"],
@@ -103,7 +104,18 @@ FIELDS: dict[str, dict[str, list[str]]] = {
         "enumeration": ["hs_call_status", "hs_call_direction"],
     },
 }
+CALCULATED = {"hs_deal_stage_probability", "hs_is_closed", "hs_is_closed_won"}
 OPTIONS = {
+    "hs_lead_status": [
+        "NEW",
+        "OPEN",
+        "IN_PROGRESS",
+        "OPEN_DEAL",
+        "UNQUALIFIED",
+        "ATTEMPTED_TO_CONTACT",
+        "CONNECTED",
+        "BAD_TIMING",
+    ],
     "lifecyclestage": [
         "subscriber",
         "lead",
@@ -161,11 +173,17 @@ def property_shape(
         "groupName": GROUPS.get(kind, f"{kind}information"),
         "description": "",
         "options": [
-            {"label": v.replace("_", " ").title(), "value": v, "displayOrder": i, "hidden": False}
+            {
+                "label": v.replace("_", " ").title(),
+                "value": v,
+                "displayOrder": i,
+                "hidden": False,
+                "description": "",
+            }
             for i, v in enumerate(values)
         ],
         "displayOrder": -1,
-        "calculated": False,
+        "calculated": name in CALCULATED,
         "hasUniqueValue": name in ("hs_object_id", "email"),
         "hubspotDefined": not custom,
         "hidden": False,
@@ -175,9 +193,33 @@ def property_shape(
             "archivable": custom,
             "readOnlyDefinition": not custom,
             "readOnlyValue": name
-            in ("hs_object_id", "createdate", "hs_createdate", "lastmodifieddate", "hs_lastmodifieddate"),
+            in (
+                "hs_object_id",
+                "createdate",
+                "hs_createdate",
+                "lastmodifieddate",
+                "hs_lastmodifieddate",
+                *CALCULATED,
+            ),
         },
         **extra,
+    }
+
+
+def deal_calculated(ctx: ProviderContext, pipeline: str, stage: str) -> dict[str, str]:
+    """HubSpot-calculated deal values, derived from the pipeline stage."""
+    record = ctx.store["pipelines:deals"].get(pipeline)
+    probability = "0.0"
+    closed = False
+    if record:
+        for item in record["stages"]:
+            if item["id"] == stage:
+                probability = str(item["metadata"].get("probability", "0.0"))
+                closed = item["metadata"].get("isClosed") == "true"
+    return {
+        "hs_deal_stage_probability": probability,
+        "hs_is_closed": str(closed).lower(),
+        "hs_is_closed_won": str(closed and float(probability) == 1.0).lower(),
     }
 
 
@@ -256,14 +298,27 @@ def seed_definitions(ctx: ProviderContext) -> None:
                     options = ctx.store[f"pipelines:{kind}"].ids()
                 elif name in ("dealstage", "hs_pipeline_stage"):
                     options = [s["id"] for p in ctx.store[f"pipelines:{kind}"] for s in p["stages"]]
-                ctx.store[f"properties:{kind}"].put(
-                    property_shape(name, kind, type_, options=options), key="name"
-                )
+                definition = property_shape(name, kind, type_, options=options)
+                definition.update(createdAt=created, updatedAt=created)
+                if kind in ("deals", "tickets") and name in (
+                    "pipeline",
+                    "hs_pipeline",
+                    "dealstage",
+                    "hs_pipeline_stage",
+                ):
+                    labels = (
+                        {p["id"]: p["label"] for p in ctx.store[f"pipelines:{kind}"]}
+                        if name in ("pipeline", "hs_pipeline")
+                        else {
+                            s["id"]: s["label"] for p in ctx.store[f"pipelines:{kind}"] for s in p["stages"]
+                        }
+                    )
+                    for option in definition["options"]:
+                        option["label"] = labels.get(option["value"], option["label"])
+                ctx.store[f"properties:{kind}"].put(definition, key="name")
         if kind in ("contacts", "companies"):
-            ctx.store[f"properties:{kind}"].put(
-                property_shape("client_since", kind, "date", custom=True), key="name"
-            )
-            ctx.store[f"properties:{kind}"].put(
+            for custom in (
+                property_shape("client_since", kind, "date", custom=True),
                 property_shape(
                     "preferred_meeting_platform",
                     kind,
@@ -271,6 +326,7 @@ def seed_definitions(ctx: ProviderContext) -> None:
                     custom=True,
                     options=["teams", "zoom", "meet"],
                 ),
-                key="name",
-            )
+            ):
+                custom.update(createdAt=created, updatedAt=created)
+                ctx.store[f"properties:{kind}"].put(custom, key="name")
         assert all(ctx.store[f"properties:{kind}"].get(p) for p in DEFAULTS[kind])

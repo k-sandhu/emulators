@@ -36,6 +36,7 @@ from .common import (
     stamp,
     visible,
 )
+from .definitions import deal_calculated
 
 
 def automatic(kind: str) -> list[str]:
@@ -72,10 +73,14 @@ def shape(
             dst = object_type(target)
             rows = associations.related(ctx, grant, kind, record["id"], dst)
             expanded = []
+            seen: set[tuple[str, str]] = set()
             for row in rows:
                 for t in row["associationTypes"]:
                     definition = ctx.store["_association_types"].get(f"{t['category']}:{t['typeId']}")
-                    expanded.append({"id": str(row["toObjectId"]), "type": definition["name"]})
+                    entry = (str(row["toObjectId"]), definition["name"])
+                    if entry not in seen:
+                        seen.add(entry)
+                        expanded.append({"id": entry[0], "type": entry[1]})
             if expanded:
                 mapped[dst] = {"results": expanded}
         if mapped:
@@ -216,20 +221,30 @@ def write(
             fail(403, "The user can only write objects they own.", category="FORBIDDEN")
     combined = {**(existing["properties"] if existing else {}), **properties}
     if existing is None:
+        # HubSpot uses the default pipeline when none is specified.
+        if kind == "deals" and not combined.get("pipeline"):
+            combined["pipeline"] = properties["pipeline"] = "default"
+        if kind == "tickets" and not combined.get("hs_pipeline"):
+            combined["hs_pipeline"] = properties["hs_pipeline"] = "0"
         required = {
-            "companies": ["name"],
-            "deals": ["dealname", "pipeline", "dealstage"],
-            "tickets": ["subject", "hs_pipeline", "hs_pipeline_stage"],
+            "deals": ["dealname", "dealstage"],
+            "tickets": ["subject", "hs_pipeline_stage"],
             "products": ["name"],
             "line_items": ["name"],
         }.get(kind, [])
-        if any(not combined.get(p) for p in required) or (
-            kind == "contacts" and not any(combined.get(p) for p in ("email", "firstname", "lastname"))
+        if (
+            any(not combined.get(p) for p in required)
+            or (kind == "companies" and not any(combined.get(p) for p in ("name", "domain")))
+            or (kind == "contacts" and not any(combined.get(p) for p in ("email", "firstname", "lastname")))
         ):
             fail(400, "Required properties were not set.")
     validate_pipeline(ctx, kind, combined)
+    if kind == "deals":
+        combined.update(deal_calculated(ctx, combined.get("pipeline", ""), combined.get("dealstage", "")))
     links = create_links(ctx, grant, kind, payload.get("associations", []))
     now = stamp(ctx.clock.now())
+    if existing is None and kind in ACTIVITIES and not combined.get("hs_timestamp"):
+        combined["hs_timestamp"] = now
     if existing is None:
         with ctx.store.lock:
             counter = ctx.store.meta.get("object_counter", 900_000_000_000_000) + 1
@@ -244,18 +259,30 @@ def write(
         }
         record = {
             "id": rid,
-            "properties": {**properties, **auto},
+            "properties": {**combined, **auto},
             "createdAt": now,
             "updatedAt": now,
             "archived": False,
             "_history": {},
         }
+        effective = dict(combined)
     else:
         record = existing
-        record["properties"].update(properties)
-        record["properties"].update(hs_lastmodifieddate=now, lastmodifieddate=now)
-        record["updatedAt"] = now
-    changed = {**properties, **{p: record["properties"][p] for p in automatic(kind)}}
+        effective = {
+            name: combined[name]
+            for name in combined
+            if name in properties or name in ("hs_deal_stage_probability", "hs_is_closed", "hs_is_closed_won")
+        }
+        effective = {
+            name: value for name, value in effective.items() if record["properties"].get(name) != value
+        }
+        if not effective and not links:
+            return record, {}
+        if effective:
+            record["properties"].update(effective)
+            record["properties"].update(hs_lastmodifieddate=now, lastmodifieddate=now)
+            record["updatedAt"] = now
+    changed = {**effective, **{p: record["properties"][p] for p in automatic(kind)}} if effective else {}
     for prop, value in changed.items():
         if existing and prop in ("hs_object_id", "createdate", "hs_createdate"):
             continue
@@ -271,7 +298,7 @@ def write(
     ctx.store[kind].put(record)
     for dst, did, definitions in links:
         associations.add(ctx, kind, record["id"], dst, did, definitions)
-    return record, properties
+    return record, effective
 
 
 def paging(request: Request, kind: str, cursor: str) -> dict[str, Any]:
@@ -286,6 +313,7 @@ def paging(request: Request, kind: str, cursor: str) -> dict[str, Any]:
 
 def build(app: FastAPI, ctx: ProviderContext) -> None:
     @app.get("/crm/v3/objects/{objectType}")
+    @app.get("/crm/v3/objects/{objectType}/", include_in_schema=False)
     async def list_objects(request: Request, objectType: str) -> dict[str, Any]:
         kind = object_type(objectType)
         grant = require(request, ctx, scopes_for(kind))
@@ -352,6 +380,12 @@ def build(app: FastAPI, ctx: ProviderContext) -> None:
         items = inputs(payload)
         started = stamp(ctx.clock.now())
         results, errors, changes = [], [], []
+        created_ids: list[str] = []
+        # Multi-status batch create is opt-in: every input needs a unique trace id.
+        trace_ids = [item.get("objectWriteTraceId") for item in items]
+        multi_status = operation != "create" or (
+            all(isinstance(t, str) and t for t in trace_ids) and len(set(trace_ids)) == len(trace_ids)
+        )
         for item in items:
             try:
                 if operation in ("read", "update", "archive"):
@@ -360,30 +394,48 @@ def build(app: FastAPI, ctx: ProviderContext) -> None:
                         grant,
                         kind,
                         str(item.get("id", "")),
-                        payload.get("idProperty"),
+                        item.get("idProperty", payload.get("idProperty")),
                         flag(request.query_params.get("archived")) if operation == "read" else False,
                     )
                 elif operation == "upsert":
-                    id_property = item.get("idProperty")
-                    definition = ctx.store[f"properties:{kind}"].get(id_property)
-                    if not id_property or not definition or not definition.get("hasUniqueValue"):
-                        fail(400, "Upsert requires a unique idProperty on each input.")
-                    record = next(
-                        (
-                            r
-                            for r in ctx.store[kind]
-                            if not r["archived"]
-                            and r["properties"].get(id_property, "").casefold()
-                            == str(item.get("id", "")).casefold()
-                        ),
-                        None,
-                    )
-                    if record and not visible(ctx, grant, kind, record):
-                        fail(404, "Object not found.")
-                    if not item.get("id"):
+                    id_property = item.get("idProperty") or "hs_object_id"
+                    if not isinstance(id_property, str) or not item.get("id"):
                         fail(400, "Upsert id is required.")
-                    if isinstance(item.get("properties"), dict):
-                        item = {**item, "properties": {**item["properties"], id_property: str(item["id"])}}
+                    definition = ctx.store[f"properties:{kind}"].get(id_property)
+                    if not definition or not definition.get("hasUniqueValue"):
+                        fail(400, "Upsert requires a unique idProperty on each input.")
+                    if id_property == "hs_object_id":
+                        record = ctx.store[kind].get(str(item["id"]))
+                        if record is not None and (
+                            record["archived"] or not visible(ctx, grant, kind, record)
+                        ):
+                            record = None
+                        if record is None:
+                            fail(404, f"Object not found. objectId={item['id']}")
+                    else:
+                        record = next(
+                            (
+                                r
+                                for r in ctx.store[kind]
+                                if not r["archived"]
+                                and r["properties"].get(id_property, "").casefold()
+                                == str(item["id"]).casefold()
+                            ),
+                            None,
+                        )
+                        if record and not visible(ctx, grant, kind, record):
+                            fail(404, "Object not found.")
+                        if isinstance(item.get("properties"), dict):
+                            supplied = item["properties"].get(id_property)
+                            if (
+                                supplied is not None
+                                and str(supplied).casefold() != str(item["id"]).casefold()
+                            ):
+                                fail(400, "Upsert id does not match the idProperty value.")
+                            item = {
+                                **item,
+                                "properties": {**item["properties"], id_property: str(item["id"])},
+                            }
                 else:
                     record = None
                 if operation == "archive":
@@ -411,8 +463,19 @@ def build(app: FastAPI, ctx: ProviderContext) -> None:
                     if "objectWriteTraceId" in item:
                         rendered["objectWriteTraceId"] = item["objectWriteTraceId"]
                     results.append(rendered)
+                    if new:
+                        created_ids.append(record["id"])
                     changes.append((kind, record["id"], "creation" if new else "propertyChange", props))
             except EmulatorError as exc:
+                if not multi_status:
+                    for created_id in created_ids:
+                        ctx.store[kind].delete(created_id)
+                        for edge in list(ctx.store["associations"]):
+                            if (edge["from"] == kind and edge["fromId"] == created_id) or (
+                                edge["to"] == kind and edge["toId"] == created_id
+                            ):
+                                ctx.store["associations"].delete(edge["id"])
+                    raise
                 errors.append(
                     {
                         **exc.body,

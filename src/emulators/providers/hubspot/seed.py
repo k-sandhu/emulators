@@ -9,7 +9,7 @@ from emulators.core.provider import ProviderContext
 
 from .associations import add, default_type, seed_types
 from .common import OBJECT_IDS, PRIVATE_TOKEN, all_scopes, numeric_id, stamp
-from .definitions import seed_definitions
+from .definitions import deal_calculated, seed_definitions
 
 STAGE_MAP = {
     "Qualification": "qualifiedtobuy",
@@ -132,6 +132,7 @@ def seed(ctx: ProviderContext) -> None:
             "website": client.website,
             "description": client.description,
             "lifecyclestage": "opportunity" if client.status == "Prospect" else "customer",
+            "hs_lead_status": "CONNECTED",
             "hubspot_owner_id": numeric_id("owners", client.owner_id),
             "client_since": client.client_since.isoformat(),
             "preferred_meeting_platform": client.preferred_platform,
@@ -158,6 +159,7 @@ def seed(ctx: ProviderContext) -> None:
                             "state",
                             "country",
                             "lifecyclestage",
+                            "hs_lead_status",
                             "hubspot_owner_id",
                             "client_since",
                             "preferred_meeting_platform",
@@ -183,6 +185,7 @@ def seed(ctx: ProviderContext) -> None:
                     "annualrevenue": lead.annual_revenue,
                     "numberofemployees": lead.employees,
                     "lifecyclestage": "lead",
+                    "hs_lead_status": "NEW",
                     "hubspot_owner_id": numeric_id("owners", lead.owner_id),
                 },
                 lead.created,
@@ -202,6 +205,7 @@ def seed(ctx: ProviderContext) -> None:
                 "state": lead.state,
                 "country": lead.country,
                 "lifecyclestage": "lead",
+                "hs_lead_status": "NEW",
                 "hubspot_owner_id": numeric_id("owners", lead.owner_id),
             },
             lead.created,
@@ -220,7 +224,7 @@ def seed(ctx: ProviderContext) -> None:
                 "dealstage": STAGE_MAP[deal.stage],
                 "hubspot_owner_id": numeric_id("owners", deal.owner_id),
                 "hs_next_step": deal.next_step,
-                "hs_deal_stage_probability": str(deal.probability / 100),
+                **deal_calculated(ctx, "default", STAGE_MAP[deal.stage]),
                 "dealtype": "newbusiness" if deal.type == "New Business" else "existingbusiness",
             },
             deal.created,
@@ -257,7 +261,7 @@ def seed(ctx: ProviderContext) -> None:
             {
                 "name": item.name,
                 "description": item.description,
-                "price": item.rate,
+                "price": format(item.rate, ".2f"),
                 "hs_sku": item.sku,
                 "hs_product_type": "service",
             },
@@ -278,8 +282,8 @@ def seed(ctx: ProviderContext) -> None:
                 "name": item.name,
                 "description": item.description,
                 "quantity": 1,
-                "price": deal.amount,
-                "amount": deal.amount,
+                "price": format(deal.amount, ".2f"),
+                "amount": format(deal.amount, ".2f"),
                 "hs_product_id": numeric_id("products", item.id),
                 "hs_sku": item.sku,
                 "hubspot_owner_id": numeric_id("owners", deal.owner_id),
@@ -306,7 +310,7 @@ def seed(ctx: ProviderContext) -> None:
                 else "SCHEDULED",
                 "hubspot_owner_id": numeric_id("owners", world.client(meeting.client_id).owner_id),
             },
-            meeting.start,
+            min(meeting.start, world.anchor),
         )
         activity_links(ctx, "meetings", meeting.id, meeting.client_id)
     for thread in world.email_threads:

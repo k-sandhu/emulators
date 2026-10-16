@@ -172,18 +172,15 @@ async def test_default_labeled_inline_reverse_batch_and_remove_associations(
     )
     assert labeled.status_code == 201 and labeled.json()["labels"] == ["Primary"]
     links = (await client.get(base + "/companies")).json()["results"]
-    assert links[0]["toObjectId"] == did
+    assert links[0]["toObjectId"] == int(did)
     assert {t["typeId"] for t in links[0]["associationTypes"]} == {1, 279}
     inverse = (await client.get(f"/crm/v4/objects/companies/{did}/associations/contacts")).json()["results"]
-    match = next(r for r in inverse if r["toObjectId"] == sid)
+    match = next(r for r in inverse if r["toObjectId"] == int(sid))
     assert {t["typeId"] for t in match["associationTypes"]} == {2, 280}
     expanded = (
         await client.get(f"/crm/v3/objects/companies/{did}", params={"associations": "contacts"})
     ).json()["associations"]["contacts"]["results"]
-    assert {r["type"] for r in expanded if r["id"] == sid} == {
-        "company_to_contact",
-        "company_to_contact_unlabeled",
-    }
+    assert [r for r in expanded if r["id"] == sid] == [{"id": sid, "type": "company_to_contact"}]
     batch = await client.post(
         "/crm/v4/associations/contacts/companies/batch/read", json={"inputs": [{"id": sid}]}
     )
@@ -208,7 +205,7 @@ async def test_default_labeled_inline_reverse_batch_and_remove_associations(
     inline_links = (
         await client.get(f"/crm/v4/objects/contacts/{inline.json()['id']}/associations/companies")
     ).json()["results"]
-    assert inline_links[0]["toObjectId"] == did
+    assert inline_links[0]["toObjectId"] == int(did)
     assert (await client.delete(base + "/companies/" + did)).status_code == 204
     assert (await client.get(base + "/companies")).json()["results"] == []
     bad_direction = await client.put(
@@ -222,7 +219,7 @@ async def test_custom_association_labels_and_pagination(client: httpx.AsyncClien
         "/crm/v4/associations/contacts/companies/labels",
         json={"name": "decision_maker", "label": "Decision maker", "inverseLabel": "Decision maker at"},
     )
-    assert labels.status_code == 201
+    assert labels.status_code == 200
     forward, reverse = labels.json()["results"]
     contact = (await client.get("/crm/v3/objects/contacts")).json()["results"][0]
     companies = (await client.get("/crm/v3/objects/companies")).json()["results"][:2]
@@ -290,5 +287,5 @@ async def test_primary_company_replacement_preserves_unlabeled_relationship(
     ]
     assert len(links) == 2
     primary = [r["toObjectId"] for r in links if any(t["typeId"] == 1 for t in r["associationTypes"])]
-    assert primary == [companies[-1]["id"]]
+    assert primary == [int(companies[-1]["id"])]
     assert all(any(t["typeId"] == 279 for t in r["associationTypes"]) for r in links)

@@ -84,7 +84,7 @@ def validate(ctx: ProviderContext, kind: str, payload: dict[str, Any]) -> None:
                 fail(400, "Invalid property or search operator.")
             if operator in ("IN", "NOT_IN"):
                 if not isinstance(item.get("values"), list) or any(
-                    not isinstance(v, str) for v in item["values"]
+                    isinstance(v, bool) or not isinstance(v, (str, int, float)) for v in item["values"]
                 ):
                     fail(400, "IN and NOT_IN require an array of string values.")
                 for value in item["values"]:
@@ -92,6 +92,12 @@ def validate(ctx: ProviderContext, kind: str, payload: dict[str, Any]) -> None:
             elif operator not in ("HAS_PROPERTY", "NOT_HAS_PROPERTY"):
                 if "value" not in item or (operator == "BETWEEN" and "highValue" not in item):
                     fail(400, "Filter value or highValue is missing.")
+                if any(
+                    isinstance(item[key], bool) or not isinstance(item[key], (str, int, float))
+                    for key in ("value", "highValue")
+                    if key in item
+                ):
+                    fail(400, "Filter values must be strings.")
                 comparable(ctx, kind, name, item["value"])
                 if operator == "BETWEEN":
                     comparable(ctx, kind, name, item["highValue"])

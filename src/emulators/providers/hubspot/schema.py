@@ -101,11 +101,15 @@ def build(app: FastAPI, ctx: ProviderContext) -> None:
         if ctx.store[f"groups:{kind}"].get(payload["groupName"]) is None:
             fail(400, "Property group does not exist.")
         options = payload.get("options", [])
-        if not isinstance(options, list) or any(
-            not isinstance(o, dict)
-            or not isinstance(o.get("label"), str)
-            or not isinstance(o.get("value"), str)
-            for o in options
+        if (
+            not isinstance(options, list)
+            or any(
+                not isinstance(o, dict)
+                or not isinstance(o.get("label"), str)
+                or not isinstance(o.get("value"), str)
+                for o in options
+            )
+            or len({o["value"] for o in options if isinstance(o, dict)}) != len(options)
         ):
             fail(400, "Invalid property options.")
         if payload["type"] == "enumeration" and not options:
@@ -140,6 +144,95 @@ def build(app: FastAPI, ctx: ProviderContext) -> None:
         record = ctx.store[f"properties:{kind}"].get(property_name)
         if record is None or record["archived"] != flag(request.query_params.get("archived")):
             fail(404, "Property not found.")
+        return record
+
+    @app.patch("/crm/v3/properties/{objectType}/groups/{group_name}")
+    async def update_group(request: Request, objectType: str, group_name: str) -> dict[str, Any]:
+        kind = object_type(objectType)
+        require(request, ctx, schema_scopes(kind, "write"))
+        record = ctx.store[f"groups:{kind}"].get(group_name)
+        if record is None or record["archived"]:
+            fail(404, "Property group not found.")
+        payload = await body(request)
+        if "label" in payload and (not isinstance(payload["label"], str) or not payload["label"]):
+            fail(400, "label must be a non-empty string.")
+        if "displayOrder" in payload and (
+            isinstance(payload["displayOrder"], bool) or not isinstance(payload["displayOrder"], int)
+        ):
+            fail(400, "displayOrder must be an integer.")
+        record.update({k: payload[k] for k in ("label", "displayOrder") if k in payload})
+        return record
+
+    @app.delete("/crm/v3/properties/{objectType}/groups/{group_name}", status_code=204)
+    async def archive_group(request: Request, objectType: str, group_name: str) -> Response:
+        kind = object_type(objectType)
+        require(request, ctx, schema_scopes(kind, "write"))
+        record = ctx.store[f"groups:{kind}"].get(group_name)
+        if record is None or record["archived"]:
+            fail(404, "Property group not found.")
+        record["archived"] = True
+        return Response(status_code=204)
+
+    @app.patch("/crm/v3/properties/{objectType}/{property_name}")
+    async def update_property(request: Request, objectType: str, property_name: str) -> dict[str, Any]:
+        kind = object_type(objectType)
+        require(request, ctx, schema_scopes(kind, "write"))
+        record = ctx.store[f"properties:{kind}"].get(property_name)
+        if record is None or record["archived"]:
+            fail(404, "Property not found.")
+        payload = await body(request)
+        for key in ("name", "type", "fieldType"):
+            if key in payload and payload[key] != record[key]:
+                fail(400, f"Property {key} cannot be changed.")
+        if "groupName" in payload and ctx.store[f"groups:{kind}"].get(payload["groupName"]) is None:
+            fail(400, "Property group does not exist.")
+        if "label" in payload and (not isinstance(payload["label"], str) or not payload["label"]):
+            fail(400, "label must be a non-empty string.")
+        for key in ("hasUniqueValue", "hidden", "formField"):
+            if key in payload and not isinstance(payload[key], bool):
+                fail(400, f"{key} must be a boolean.")
+        if "displayOrder" in payload and (
+            isinstance(payload["displayOrder"], bool) or not isinstance(payload["displayOrder"], int)
+        ):
+            fail(400, "displayOrder must be an integer.")
+        if "options" in payload:
+            options = payload["options"]
+            if (
+                not isinstance(options, list)
+                or any(
+                    not isinstance(o, dict)
+                    or not isinstance(o.get("label"), str)
+                    or not isinstance(o.get("value"), str)
+                    for o in options
+                )
+                or len({o["value"] for o in options if isinstance(o, dict)}) != len(options)
+                or (record["type"] == "enumeration" and not options)
+            ):
+                fail(400, "Invalid property options.")
+            payload = {
+                **payload,
+                "options": [
+                    {"displayOrder": i, "hidden": False, "description": "", **o}
+                    for i, o in enumerate(options)
+                ],
+            }
+        record.update(
+            {
+                k: payload[k]
+                for k in (
+                    "label",
+                    "groupName",
+                    "description",
+                    "options",
+                    "hasUniqueValue",
+                    "hidden",
+                    "formField",
+                    "displayOrder",
+                )
+                if k in payload
+            }
+        )
+        record["updatedAt"] = stamp(ctx.clock.now())
         return record
 
     @app.delete("/crm/v3/properties/{objectType}/{property_name}", status_code=204)
@@ -200,6 +293,7 @@ def build(app: FastAPI, ctx: ProviderContext) -> None:
                 if r["archived"] == archived
                 and int(r["id"]) > after
                 and (not q.get("email") or r["email"].casefold() == q["email"].casefold())
+                and (not q.get("userId") or str(r.get("userId")) == q["userId"])
             ],
             key=lambda r: int(r["id"]),
         )
