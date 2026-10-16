@@ -30,6 +30,8 @@ STATUS_BY_CODE = {
     403: "PERMISSION_DENIED",
     404: "NOT_FOUND",
     409: "ALREADY_EXISTS",
+    410: "GONE",
+    412: "FAILED_PRECONDITION",
     429: "RESOURCE_EXHAUSTED",
     500: "INTERNAL",
     503: "UNAVAILABLE",
@@ -82,8 +84,9 @@ def error_body(
     domain: str = "global",
     location: str | None = None,
     legacy: bool = True,
+    status: str | None = None,
 ) -> dict[str, Any]:
-    status = STATUS_BY_CODE.get(code, "UNKNOWN")
+    status = status or STATUS_BY_CODE.get(code, "UNKNOWN")
     error: dict[str, Any] = {"code": code, "message": message}
     if legacy:
         item: dict[str, Any] = {"message": message, "domain": domain, "reason": reason or status.lower()}

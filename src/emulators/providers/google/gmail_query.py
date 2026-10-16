@@ -13,7 +13,9 @@ from emulators.providers.google.common import google_error
 TOKEN = re.compile(r'-|[(){}]|(?:[^\s(){}"]|"[^"]*")+')
 
 
-def compile_query(query: str, now: datetime, labels: dict[str, str]) -> Callable[[dict[str, Any]], bool]:
+def compile_query(
+    query: str, now: datetime, labels: dict[str, str], email: str = ""
+) -> Callable[[dict[str, Any]], bool]:
     tokens = TOKEN.findall(query)
     index = 0
 
@@ -28,7 +30,12 @@ def compile_query(query: str, now: datetime, labels: dict[str, str]) -> Callable
                 in (r.get("_subject", "") + " " + r.get("_body", "") + " " + r.get("_from", "")).casefold()
             )
         if operator in ("from", "to", "cc", "bcc", "subject"):
+            if operator in ("from", "to") and value == "me":
+                value = email.casefold()
             return lambda r: value in r.get("_" + operator, "").casefold()
+        if operator == "category":
+            label = "CATEGORY_" + ("PERSONAL" if value == "primary" else value.upper())
+            return lambda r: label in r["labelIds"]
         if operator in ("label", "in"):
             mapped = {
                 "inbox": "INBOX",
@@ -90,7 +97,10 @@ def compile_query(query: str, now: datetime, labels: dict[str, str]) -> Callable
             return lambda r: r["sizeEstimate"] < size if operator == "smaller" else r["sizeEstimate"] > size
         if operator == "rfc822msgid":
             return lambda r: value.strip("<>") == r.get("_rfcId", "").strip("<>").casefold()
-        return lambda _: False
+        value = term.strip('"').casefold()
+        return lambda r: (
+            value in " ".join(r.get(k, "") for k in ("_subject", "_body", "_from", "_to", "_cc")).casefold()
+        )
 
     def atom() -> Callable[[dict[str, Any]], bool]:
         nonlocal index

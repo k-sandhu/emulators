@@ -7,9 +7,9 @@ from typing import Any
 
 from fastapi import Request
 
-from emulators.core.clock import isoformat_z
+from emulators.core.clock import isoformat_z, parse_instant
 from emulators.core.provider import ProviderContext
-from emulators.providers.google.common import Principal, google_error
+from emulators.providers.google.common import Principal, google_error, person_ref
 from emulators.providers.google.drive_access import get_file, store_binary
 from emulators.providers.google.drive_changes import record_change, visibility
 from emulators.providers.google.drive_seed import FOLDER, NATIVE, new_file, root_id
@@ -71,6 +71,10 @@ async def create_file(
     data: bytes | None = None,
     content_type: str | None = None,
 ) -> dict[str, Any]:
+    from emulators.providers.google.api_schema import SCHEMAS
+    from emulators.providers.google.wire import validate_value
+
+    validate_value(metadata, SCHEMAS["drive:File"])
     if not actor.person_id and not metadata.get("parents"):
         raise google_error(403, "Service Accounts do not have storage quota.", reason="storageQuotaExceeded")
     parents, drive = parents_for(
@@ -88,9 +92,11 @@ async def create_file(
         actor.person_id,
         parents,
         drive=drive,
-        stamp=isoformat_z(ctx.clock.now()),
+        stamp=isoformat_z(ctx.clock.now(), timespec="milliseconds"),
     )
     row.update({k: copy.deepcopy(v) for k, v in metadata.items() if k in WRITABLE})
+    for field in ("createdTime", "modifiedTime"):
+        row[field] = isoformat_z(parse_instant(row[field]), timespec="milliseconds")
     row["_modified_by"] = actor.person_id
     if mime in NATIVE:
         row["_paragraphs"] = data.decode(errors="replace").splitlines() if data else []
@@ -111,6 +117,10 @@ async def update_file(
     data: bytes | None = None,
     content_type: str | None = None,
 ) -> dict[str, Any]:
+    from emulators.providers.google.api_schema import SCHEMAS
+    from emulators.providers.google.wire import validate_value
+
+    validate_value(metadata, SCHEMAS["drive:File"])
     row = get_file(ctx, actor, fid, write=True)
     before = visibility(ctx, row)
     old_trash = row["trashed"]
@@ -120,11 +130,11 @@ async def update_file(
             "The parents field is not directly writable in update requests. Use addParents and removeParents.",
             reason="fieldNotWritable",
         )
-    candidate = [
-        p for p in row.get("parents", []) if p not in request.query_params.get("removeParents", "").split(",")
-    ]
+    root = root_id(ctx, actor.person_id or actor.client_id)
+    remove = [root if p == "root" else p for p in request.query_params.get("removeParents", "").split(",")]
+    candidate = [p for p in row.get("parents", []) if p not in remove]
     if request.query_params.get("addParents"):
-        candidate.extend(request.query_params["addParents"].split(","))
+        candidate.extend(root if p == "root" else p for p in request.query_params["addParents"].split(","))
     if candidate != row.get("parents", []):
         parents, drive = parents_for(ctx, actor, list(dict.fromkeys(candidate)))
         if row["mimeType"] == FOLDER and drive != row.get("driveId"):
@@ -152,8 +162,17 @@ async def update_file(
             row.pop("teamDriveId", None)
     row.update({k: copy.deepcopy(v) for k, v in metadata.items() if k in WRITABLE})
     row["explicitlyTrashed"] = row["trashed"]
+    if row["trashed"] and not old_trash:
+        row["trashedTime"] = isoformat_z(ctx.clock.now(), timespec="milliseconds")
+        if actor.person_id:
+            row["trashingUser"] = person_ref(ctx.world.person(actor.person_id))
+    elif not row["trashed"]:
+        row.pop("trashedTime", None)
+        row.pop("trashingUser", None)
     row["version"] = str(int(row["version"]) + 1)
-    row["modifiedTime"] = metadata.get("modifiedTime", isoformat_z(ctx.clock.now()))
+    row["modifiedTime"] = metadata.get("modifiedTime", isoformat_z(ctx.clock.now(), timespec="milliseconds"))
+    for field in ("createdTime", "modifiedTime"):
+        row[field] = isoformat_z(parse_instant(row[field]), timespec="milliseconds")
     row["_modified_by"] = actor.person_id
     row.pop("_exports", None)
     if data is not None:

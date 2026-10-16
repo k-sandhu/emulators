@@ -9,6 +9,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from dateutil.rrule import rruleset, rrulestr
 from fastapi import Request
 
 from emulators.core.clock import isoformat_z
@@ -41,7 +42,9 @@ def identity(request: Request, ctx: ProviderContext) -> str:
             if reading:
                 allowed |= {"calendar.calendarlist.readonly", "calendar.readonly"}
         elif "/acl" in path:
-            allowed |= {"calendar.acls", "calendar.acls.readonly"}
+            allowed.add("calendar.acls")
+            if reading:
+                allowed.add("calendar.acls.readonly")
         elif "/events" in path:
             allowed |= {"calendar.app.created", "calendar.events", "calendar.events.owned"}
             if reading:
@@ -73,8 +76,21 @@ def calendar_access(
     calendar_id = email if calendar_id == "primary" else calendar_id
     cal = ctx.store["calendar_calendars"].get(calendar_id)
     role = cal.get("_acl", {}).get(actor) if cal else None
-    if not role and cal and busy:
+    if not role and cal:
         role = cal.get("_domainRole")
+        for rule in cal.get("_extraAcl", []):
+            scope = rule["scope"]
+            applies = scope["type"] == "default" or (scope["type"] == "user" and scope.get("value") == email)
+            if scope["type"] == "group":
+                from emulators.providers.google.directory import expanded_members
+
+                group = ctx.store["directory_groups"].first(email=scope.get("value"))
+                applies = bool(
+                    group
+                    and any(m.get("email") == email for m in expanded_members(ctx, group["id"], derived=True))
+                )
+            if applies:
+                role = rule["role"]
     if not cal or not role or (role == "freeBusyReader" and not busy):
         raise google_error(404, "Not Found", reason="notFound")
     if write and role not in ("owner", "writer"):
@@ -109,8 +125,8 @@ def _event(ctx: ProviderContext, meeting: Meeting, calendar_id: str, key: str) -
         "etag": '"' + stable_hash(event_id, meeting.start) + '"',
         "status": "cancelled" if meeting.cancelled else "confirmed",
         "htmlLink": f"https://www.google.com/calendar/event?eid={b64url((event_id + ' ' + calendar_id).encode())}",
-        "created": isoformat_z(meeting.start - timedelta(days=14)),
-        "updated": isoformat_z(meeting.start - timedelta(days=1)),
+        "created": isoformat_z(meeting.start - timedelta(days=14), timespec="milliseconds"),
+        "updated": isoformat_z(meeting.start - timedelta(days=1), timespec="milliseconds"),
         "summary": meeting.title,
         "description": meeting.description,
         "creator": {"email": organizer.email, "displayName": organizer.display_name},
@@ -263,37 +279,60 @@ def validate_event(record: dict[str, Any]) -> None:
         record["start"]
     ):
         raise google_error(400, "The specified time range is empty.", reason="timeRangeEmpty")
-    for rule in record.get("recurrence", []):
-        if (
-            not isinstance(rule, str)
-            or not rule.startswith("RRULE:")
-            or not re.search(r"FREQ=(DAILY|WEEKLY|MONTHLY|YEARLY)(;|$)", rule)
-        ):
-            raise google_error(400, "Invalid recurrence rule", reason="badRequest")
-        try:
-            parts = dict(item.split("=", 1) for item in rule[6:].split(";"))
-            if set(parts) - {"FREQ", "INTERVAL", "COUNT", "UNTIL", "BYDAY", "BYMONTHDAY", "WKST"}:
+    if record.get("recurrence"):
+        recurrence_set(record)
+
+
+def recurrence_set(master: dict[str, Any]) -> rruleset:
+    """Keep local DTSTART for DST, and union RDATE before subtracting EXDATE."""
+    try:
+        start_value = master["start"]
+        tz = ZoneInfo(start_value.get("timeZone", "UTC"))
+        start = instant(start_value).astimezone(tz)
+        result = rruleset()
+        lines = master["recurrence"]
+        if not isinstance(lines, list) or not lines:
+            raise ValueError
+        has_rule = False
+        for line in lines:
+            prefix, value = line.split(":", 1)
+            name = prefix.split(";", 1)[0]
+            if name == "RRULE":
+                # Google also accepts an UNTIL date for a date DTSTART.
+                def until_date(match: re.Match[str]) -> str:
+                    end = datetime.strptime(match[1], "%Y%m%d").replace(
+                        tzinfo=tz, hour=23, minute=59, second=59
+                    )
+                    return "UNTIL=" + end.astimezone(UTC).strftime("%Y%m%dT%H%M%SZ")
+
+                value = re.sub(r"UNTIL=(\d{8})(?=;|$)", until_date, value)
+                parts = dict(item.split("=", 1) for item in value.split(";"))
+                if int(parts.get("INTERVAL", "1")) < 1 or int(parts.get("COUNT", "1")) < 1:
+                    raise ValueError
+                result.rrule(rrulestr("RRULE:" + value, dtstart=start))
+                has_rule = True
+            elif name in ("EXDATE", "RDATE"):
+                zone = re.search(r"(?:^|;)TZID=([^;]+)", prefix)
+                date_tz = ZoneInfo(zone[1]) if zone else tz
+                for item in value.split(","):
+                    fmt = (
+                        "%Y%m%d"
+                        if len(item) == 8
+                        else "%Y%m%dT%H%M%SZ"
+                        if item.endswith("Z")
+                        else "%Y%m%dT%H%M%S"
+                    )
+                    stamp = datetime.strptime(item, fmt).replace(
+                        tzinfo=UTC if item.endswith("Z") else date_tz
+                    )
+                    (result.exdate if name == "EXDATE" else result.rdate)(stamp)
+            else:
                 raise ValueError
-            if int(parts.get("INTERVAL", "1")) < 1 or int(parts.get("COUNT", "1")) < 1:
-                raise ValueError
-            if "UNTIL" in parts:
-                datetime.strptime(parts["UNTIL"], "%Y%m%dT%H%M%SZ")
-            if "BYDAY" in parts and (
-                parts["FREQ"] != "WEEKLY"
-                or not re.fullmatch(r"(?:MO|TU|WE|TH|FR|SA|SU)(?:,(?:MO|TU|WE|TH|FR|SA|SU))*", parts["BYDAY"])
-            ):
-                raise ValueError
-            if "BYMONTHDAY" in parts and (
-                parts["FREQ"] != "MONTHLY"
-                or any(not 1 <= int(day) <= 31 for day in parts["BYMONTHDAY"].split(","))
-            ):
-                raise ValueError
-            if "WKST" in parts and parts["WKST"] != "MO":
-                raise ValueError
-        except (ValueError, TypeError) as exc:
-            raise google_error(400, "Invalid or unsupported recurrence rule", reason="badRequest") from exc
-    if len(record.get("recurrence", [])) > 1:
-        raise google_error(400, "Multiple recurrence rules are not supported", reason="badRequest")
+        if not has_rule:
+            result.rdate(start)
+        return result
+    except (ValueError, TypeError, AttributeError, OverflowError, ZoneInfoNotFoundError) as exc:
+        raise google_error(400, "Invalid recurrence rule", reason="badRequest") from exc
 
 
 def event_output(
@@ -356,50 +395,27 @@ def expand(
             for r in rows
             if (not low or instant(r["end"]) > low) and (not high or instant(r["start"]) < high)
         ]
-    rule = dict(part.split("=", 1) for part in master["recurrence"][0][6:].split(";") if "=" in part)
     tz = ZoneInfo(master["start"].get("timeZone", "UTC"))
     start = instant(master["start"]).astimezone(tz)
     duration = instant(master["end"]) - instant(master["start"])
-    until = (
-        datetime.strptime(rule["UNTIL"], "%Y%m%dT%H%M%SZ").replace(tzinfo=UTC) if "UNTIL" in rule else None
+    rules = recurrence_set(master)
+    rule_lines = [r for r in master["recurrence"] if r.startswith("RRULE:")]
+    bounded = all(re.search(r"(?:;|:)(?:COUNT|UNTIL)=", r) for r in rule_lines)
+    boundary = high or (
+        datetime.max.replace(tzinfo=UTC) if bounded else max(start, low or start) + timedelta(days=366)
     )
-    count = int(rule.get("COUNT", 10000))
-    interval = int(rule.get("INTERVAL", 1))
-    if count < 1 or interval < 1:
-        raise google_error(400, "Invalid recurrence rule", reason="badRequest")
-    boundary = high or until or (start + timedelta(days=366))
-    days = ("MO", "TU", "WE", "TH", "FR", "SA", "SU")
-    results, emitted = [], 0
-    for step in range(36600):
-        current = start + timedelta(days=step)
-        if current > boundary or (until and current > until) or emitted >= count:
+    results = []
+    for current in rules.xafter((low - duration) if low else start, count=10000, inc=True):
+        if current >= boundary:
             break
-        freq = rule.get("FREQ")
-        if freq == "DAILY":
-            selected = step % interval == 0
-        elif freq == "WEEKLY":
-            selected = ((step + start.weekday()) // 7) % interval == 0 and days[
-                current.weekday()
-            ] in rule.get("BYDAY", days[start.weekday()]).split(",")
-        elif freq == "MONTHLY":
-            selected = (
-                (current.year - start.year) * 12 + current.month - start.month
-            ) % interval == 0 and current.day in [
-                int(day) for day in rule.get("BYMONTHDAY", str(start.day)).split(",")
-            ]
-        else:
-            selected = (current.year - start.year) % interval == 0 and (current.month, current.day) == (
-                start.month,
-                start.day,
-            )
-        if not selected:
-            continue
-        emitted += 1
-        if low and current + duration <= low:
-            continue
         event = copy.deepcopy(master)
         event.pop("recurrence", None)
-        event["id"] = master["id"] + "_" + current.astimezone(UTC).strftime("%Y%m%dT%H%M%SZ")
+        suffix = (
+            current.strftime("%Y%m%d")
+            if "date" in master["start"]
+            else current.astimezone(UTC).strftime("%Y%m%dT%H%M%SZ")
+        )
+        event["id"] = master["id"] + "_" + suffix
         for field, stamp in (("start", current), ("end", current + duration)):
             event[field] = (
                 {"date": stamp.date().isoformat()}
@@ -408,7 +424,20 @@ def expand(
             )
         event["recurringEventId"] = master["id"]
         event["originalStartTime"] = dict(event["start"])
-        results.append(overrides.get(event["id"], event))
+        results.append(event)
+    # Modified instances may have moved into the window from outside it.
+    results = [r for r in results if r["id"] not in overrides] + list(overrides.values())
+    if master["status"] == "cancelled":
+        results = [
+            dict(r, status="cancelled", _rev=max(r.get("_rev", 0), master.get("_rev", 0))) for r in results
+        ]
+    results = [
+        r
+        for r in results
+        if (not low or instant(r["end"]) > low) and (not high or instant(r["start"]) < high)
+    ]
+    results.sort(key=lambda r: instant(r["start"]))
+
     return results
 
 
@@ -416,7 +445,7 @@ def revision(ctx: ProviderContext, record: dict[str, Any]) -> None:
     value = ctx.store.meta["calendar_revision"] + 1
     ctx.store.meta["calendar_revision"] = value
     record["_rev"] = value
-    record["updated"] = isoformat_z(ctx.clock.now(), timespec="microseconds")
+    record["updated"] = isoformat_z(ctx.clock.now(), timespec="milliseconds")
     record["sequence"] = record.get("sequence", 0) + 1
     record["etag"] = '"' + stable_hash(record["id"], value, record["updated"]) + '"'
 

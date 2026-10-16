@@ -46,7 +46,9 @@ def labels(ctx: ProviderContext, owner: str) -> Any:
 def mailbox(request: Request, ctx: ProviderContext, user_id: str) -> str:
     actor = principal(request, ctx)
     if actor.app_only or not actor.person_id or not ctx.store["gmail_mailboxes"].get(actor.person_id):
-        raise google_error(403, "Precondition check failed.", reason="failedPrecondition")
+        raise google_error(
+            400, "Precondition check failed.", reason="failedPrecondition", status="FAILED_PRECONDITION"
+        )
     person = ctx.world.person(actor.person_id)
     if user_id not in ("me", person.email):
         raise google_error(403, "Delegation denied for " + user_id, reason="forbidden")
@@ -64,6 +66,12 @@ def require_scope(request: Request, scopes: list[str]) -> None:
     if "/settings/" in path:
         if not reading:
             allowed, full_mail = {"gmail.settings.basic"}, False
+            if path.endswith("/autoForwarding") or (
+                ("/forwardingAddresses" in path or "/sendAs" in path) and request.method in ("POST", "DELETE")
+            ):
+                allowed = {"gmail.settings.sharing"}
+            elif "/sendAs/" in path:
+                allowed.add("gmail.settings.sharing")
         else:
             allowed |= {"gmail.readonly", "gmail.settings.basic"}
     elif "/labels" in path:
@@ -124,12 +132,12 @@ def seed(ctx: ProviderContext) -> None:
         for label in SYSTEM_LABELS:
             labels(ctx, person.id).put({"id": label, "name": label, "type": "system"})
     for thread in ctx.world.email_threads:
-        thread_id = stable_hash(ctx.world.seed, "gmail-thread", thread.id)
         for message in thread.messages:
             participants = dict.fromkeys((message.from_id, *message.to_ids, *message.cc_ids))
             for owner in participants:
                 if not ctx.store["gmail_mailboxes"].get(owner):
                     continue
+                thread_id = stable_hash(ctx.world.seed, "gmail-thread", owner, thread.id)
                 message_labels = ["SENT"] if owner == message.from_id else ["INBOX"]
                 if owner in (*message.to_ids, *message.cc_ids) and owner not in message.read_by:
                     message_labels.append("UNREAD")
@@ -198,7 +206,7 @@ async def push(ctx: ProviderContext, owner: str, changed_labels: list[str]) -> N
                 ).encode()
             ).decode(),
             "messageId": ctx.ids.digits(16),
-            "publishTime": isoformat_z(ctx.clock.now()),
+            "publishTime": isoformat_z(ctx.clock.now(), timespec="milliseconds"),
         },
         "subscription": watch["topicName"].split("/topics/")[0] + "/subscriptions/emulator-push",
     }
@@ -266,15 +274,21 @@ async def ingest(
     validate_labels(ctx, owner, record["labelIds"])
     if mode == "send":
         from_email = parseaddr(record["_from"])[1].lower()
-        if from_email and from_email != ctx.world.person(owner).email:
-            raise google_error(403, "Invalid From header", reason="forbidden")
         if not addresses(record):
             raise google_error(400, "Recipient address required", reason="invalidArgument")
         from email import policy
         from email.parser import BytesParser
 
         parsed = BytesParser(policy=policy.SMTP).parsebytes(data)
-        if not parsed.get("From"):
+        aliases = {
+            r["sendAsEmail"].lower()
+            for r in ctx.store["gmail_send_as:" + owner]
+            if r.get("verificationStatus") == "accepted"
+        }
+        aliases.add(ctx.world.person(owner).email.lower())
+        if from_email not in aliases:
+            if parsed.get("From"):
+                del parsed["From"]
             parsed["From"] = ctx.world.person(owner).email
         if not parsed.get("Date"):
             parsed["Date"] = format_datetime(ctx.clock.now())
@@ -287,10 +301,12 @@ async def ingest(
     refs = headers.get("in-reply-to", "") + " " + headers.get("references", "")
     existing = [r for r in messages(ctx, owner) if r["_rfcId"] in refs]
     if requested:
-        if not any(r["threadId"] == requested for r in messages(ctx, owner)):
+        requested_rows = [r for r in messages(ctx, owner) if r["threadId"] == requested]
+        if not requested_rows:
             raise google_error(404, "Requested entity was not found.", reason="notFound")
-        record["threadId"] = requested
-    elif existing:
+        if any(same_subject(r, record) for r in requested_rows):
+            record["threadId"] = requested
+    elif existing and same_subject(existing[-1], record):
         record["threadId"] = existing[-1]["threadId"]
     if (
         mode in ("insert", "import")
@@ -313,6 +329,11 @@ async def ingest(
                 await modify(ctx, owner, record, {"addLabelIds": ["INBOX"]})
                 continue
             replica = copy.deepcopy(record)
+            replica["id"] = ctx.ids.hex(16)
+            recipient_rows = [
+                r for r in messages(ctx, person.id) if r["_rfcId"] in refs and same_subject(r, record)
+            ]
+            replica["threadId"] = recipient_rows[-1]["threadId"] if recipient_rows else ctx.ids.hex(16)
             replica["labelIds"] = ["INBOX", "UNREAD"]
             apply_filters(ctx, person.id, replica)
             # Bcc recipients are delivered, but their addresses are never disclosed.
@@ -330,6 +351,15 @@ async def ingest(
     return record
 
 
+def same_subject(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    import re
+
+    def normalize(value: str) -> str:
+        return re.sub(r"^(?:(?:re|fwd?):\s*)+", "", value.strip(), flags=re.I).casefold()
+
+    return normalize(left["_subject"]) == normalize(right["_subject"])
+
+
 def apply_filters(ctx: ProviderContext, owner: str, record: dict[str, Any]) -> None:
     """Apply supported inbound criteria without making external forwarding calls."""
     label_names = {r["name"].casefold(): r["id"] for r in labels(ctx, owner)}
@@ -343,12 +373,12 @@ def apply_filters(ctx: ProviderContext, owner: str, record: dict[str, Any]) -> N
             continue
         if criteria.get("hasAttachment") and not record.get("_attachments"):
             continue
-        if criteria.get("query") and not compile_query(criteria["query"], ctx.clock.now(), label_names)(
-            record
-        ):
+        if criteria.get("query") and not compile_query(
+            criteria["query"], ctx.clock.now(), label_names, ctx.world.person(owner).email
+        )(record):
             continue
         if criteria.get("negatedQuery") and compile_query(
-            criteria["negatedQuery"], ctx.clock.now(), label_names
+            criteria["negatedQuery"], ctx.clock.now(), label_names, ctx.world.person(owner).email
         )(record):
             continue
         if criteria.get("size"):

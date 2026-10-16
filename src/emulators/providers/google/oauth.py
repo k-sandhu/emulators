@@ -279,7 +279,7 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
                         header.get("alg") != "RS256"
                         or not isinstance(payload.get("iss"), str)
                         or "@" not in payload["iss"]
-                        or not payload.get("scope")
+                        or not (payload.get("scope") or payload.get("target_audience"))
                         or payload.get("aud") not in (TOKEN_URI, "https://www.googleapis.com/oauth2/v4/token")
                         or not isinstance(payload.get("iat"), (int, float))
                         or not isinstance(payload.get("exp"), (int, float))
@@ -296,6 +296,20 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
                 subject = resolve_person(ctx, payload.get("sub"))
                 if payload.get("sub") and (subject is None or not subject.active or subject.is_external):
                     raise OAuthError("invalid_grant", "Invalid email or User ID")
+                if payload.get("target_audience"):
+                    now = ctx.clock.timestamp()
+                    payload = {
+                        "iss": ISSUER,
+                        "aud": payload["target_audience"],
+                        "sub": user_id(ctx.world, payload["iss"]),
+                        "email": payload["iss"],
+                        "email_verified": True,
+                        "iat": now,
+                        "exp": now + 3599,
+                    }
+                    value = ctx.signing_key.sign(payload)
+                    ctx.store["google_id_tokens"].put_as(value, {"claims": payload})
+                    return JSONResponse({"id_token": value})
                 source = ctx.tokens.issue(
                     "code",
                     client_id=payload["iss"],
@@ -340,6 +354,9 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
 
     @app.get("/tokeninfo")
     @app.post("/tokeninfo")
+    @app.get("/oauth2/v1/tokeninfo")
+    @app.get("/oauth2/v2/tokeninfo")
+    @app.get("/oauth2/v3/tokeninfo")
     async def tokeninfo(request: Request) -> Response:
         data = dict(request.query_params)
         if request.method == "POST":
@@ -349,12 +366,15 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
             if (
                 not record
                 or record["claims"]["exp"] <= ctx.clock.timestamp()
-                or not ctx.tokens.resolve(record["access_token"])
+                or (record.get("access_token") and not ctx.tokens.resolve(record["access_token"]))
             ):
                 return JSONResponse(
                     {"error": "invalid_token", "error_description": "Invalid Value"}, status_code=400
                 )
             result = {**record["claims"], "expires_in": str(record["claims"]["exp"] - ctx.clock.timestamp())}
+            for key in ("exp", "iat", "email_verified"):
+                if key in result:
+                    result[key] = str(result[key]).lower()
         else:
             grant = ctx.tokens.resolve(data.get("access_token"))
             if not grant:
@@ -380,13 +400,14 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
     @app.get("/v1/userinfo")
     @app.get("/oauth2/v3/userinfo")
     @app.get("/oauth2/v2/userinfo")
+    @app.get("/userinfo/v2/me")
     async def userinfo(request: Request) -> dict[str, Any]:
         actor = principal(request, ctx)
         person = resolve_person(ctx, actor.person_id)
         if person is None:
             raise google_error(401, "Invalid Credentials", reason="authError")
         result = claims(ctx, person)
-        if request.url.path.endswith("v2/userinfo"):
+        if request.url.path.endswith(("v2/userinfo", "/userinfo/v2/me")):
             result["id"] = result.pop("sub")
             result["verified_email"] = result.pop("email_verified")
         return result

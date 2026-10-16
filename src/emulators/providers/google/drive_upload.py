@@ -13,7 +13,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 
 from emulators.core.provider import ProviderContext, url_for_host
-from emulators.providers.google.common import google_error
+from emulators.providers.google.common import Principal, google_error
 from emulators.providers.google.drive_access import file_shape, get_file, principal
 from emulators.providers.google.drive_fields import select
 from emulators.providers.google.drive_mutations import create_file, update_file
@@ -21,11 +21,11 @@ from emulators.providers.google.drive_mutations import create_file, update_file
 
 def register(app: FastAPI, ctx: ProviderContext) -> None:
     async def upload(request: Request, fid: str | None = None) -> Response:
-        actor = principal(request, ctx)
         q = request.query_params
         upload_type = q.get("uploadType")
         if q.get("upload_id"):
             return await resume(request, q["upload_id"])
+        actor = principal(request, ctx)
         if fid:
             get_file(ctx, actor, fid, write=True)
         body = await request.body()
@@ -52,6 +52,7 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
                 {
                     "_person": actor.person_id,
                     "_client": actor.client_id,
+                    "_scopes": actor.scopes,
                     "metadata": metadata,
                     "file": fid,
                     "type": request.headers.get(
@@ -102,10 +103,12 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         )
 
     async def resume(request: Request, sid: str) -> Response:
-        actor = principal(request, ctx)
         session = ctx.store.collection("drive_uploads").get(sid)
-        if not session or session["_person"] != actor.person_id or session["_client"] != actor.client_id:
+        if not session:
             raise google_error(404, "Not Found", reason="notFound")
+        actor = Principal(
+            session["_person"], not bool(session["_person"]), session["_client"], session.get("_scopes", [])
+        )
         if session["complete"]:
             return JSONResponse(session["response"])
         data = ctx.store.blobs.get(session["blob"])

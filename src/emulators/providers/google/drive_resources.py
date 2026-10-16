@@ -9,7 +9,7 @@ from typing import Any
 from fastapi import FastAPI, Request
 from fastapi.responses import Response
 
-from emulators.core.clock import isoformat_z
+from emulators.core.clock import isoformat_z, parse_instant
 from emulators.core.ids import stable_hash
 from emulators.core.provider import ProviderContext
 from emulators.providers.google.common import Principal, google_error, json_object
@@ -163,6 +163,10 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         for key in ("allowFileDiscovery", "expirationTime", "pendingOwner"):
             if key in data:
                 perm[key] = data[key]
+        if perm.get("expirationTime"):
+            perm["expirationTime"] = isoformat_z(
+                parse_instant(perm["expirationTime"]), timespec="milliseconds"
+            )
         if role == "owner":
             for previous in row["_permissions"]:
                 if previous["role"] == "owner":
@@ -227,6 +231,10 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         )
         if request.query_params.get("removeExpiration") == "true":
             perm.pop("expirationTime", None)
+        if perm.get("expirationTime"):
+            perm["expirationTime"] = isoformat_z(
+                parse_instant(perm["expirationTime"]), timespec="milliseconds"
+            )
         await record_change(ctx, row, before=before, changed="permissions")
         return select(perm, request.query_params.get("fields"))
 
@@ -302,7 +310,7 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
             "kind": "drive#drive",
             "id": did,
             "name": data["name"],
-            "createdTime": isoformat_z(ctx.clock.now()),
+            "createdTime": isoformat_z(ctx.clock.now(), timespec="milliseconds"),
             "hidden": False,
             "restrictions": data.get("restrictions", {}),
         }

@@ -12,6 +12,8 @@ from fastapi import FastAPI, Request, Response
 from emulators.core.clock import isoformat_z, parse_instant
 from emulators.core.ids import b64url, stable_hash
 from emulators.core.provider import ProviderContext, url_for_host
+from emulators.providers.google.calendar_acl import acl_rows, list_revision
+from emulators.providers.google.calendar_acl import register as register_acl
 from emulators.providers.google.calendar_model import (
     PREFIX,
     REMINDERS,
@@ -44,6 +46,10 @@ def _event_get(ctx: ProviderContext, cal: dict[str, Any], event_id: str) -> dict
             event = next((r for r in expand(ctx, master) if r["id"] == event_id), None)
     if event is None:
         raise google_error(404, "Not Found", reason="notFound")
+    if event.get("recurringEventId"):
+        master = ctx.store["calendar_events"].get(cal["id"] + ":" + event["recurringEventId"])
+        if master and master["status"] == "cancelled":
+            event = dict(event, status="cancelled")
     return event
 
 
@@ -90,18 +96,42 @@ async def _save_event(
     importing: bool = False,
 ) -> dict[str, Any]:
     event_id = old["id"] if old else body.get("id", ctx.ids.hex(32))
-    if not re.fullmatch(r"[0-9a-v]{5,1024}", event_id) and not (old and "recurringEventId" in old):
+    if not isinstance(event_id, str) or (
+        not re.fullmatch(r"[0-9a-v]{5,1024}", event_id) and not (old and "recurringEventId" in old)
+    ):
         raise google_error(400, "Invalid resource id value.", reason="invalid")
     if not old and ctx.store["calendar_events"].get(cal["id"] + ":" + event_id):
         raise google_error(409, "The requested identifier already exists.", reason="duplicate")
     if importing and not body.get("iCalUID"):
         raise google_error(400, "Missing iCalUID", reason="required")
     email = ctx.world.person(actor).email
+    attendee_edit = (
+        old and old.get("organizer", {}).get("email") != cal["id"] and not old.get("guestsCanModify", False)
+    )
+    if attendee_edit:
+        # Invitees can RSVP only for themselves, without changing guest details.
+        allowed = set(body) <= {"attendees", "attendeesOmitted"}
+        old_attendees = {a.get("email"): a for a in old.get("attendees", [])}
+        allowed = allowed and email in old_attendees
+        for attendee in body.get("attendees", []):
+            previous = old_attendees.get(attendee.get("email"), {})
+            mutable = {"responseStatus", "self"} if attendee.get("email") == email else {"self"}
+            if not previous or any(k not in mutable and previous.get(k) != v for k, v in attendee.items()):
+                allowed = False
+        if not allowed:
+            raise google_error(403, "Forbidden for non-organizer", reason="forbiddenForNonOrganizer")
+        body = dict(
+            body,
+            attendees=[
+                {**a, **next((v for v in body.get("attendees", []) if v.get("email") == a.get("email")), {})}
+                for a in old.get("attendees", [])
+            ],
+        )
     base: dict[str, Any] = {
         "kind": "calendar#event",
         "id": event_id,
         "status": "confirmed",
-        "created": isoformat_z(ctx.clock.now()),
+        "created": isoformat_z(ctx.clock.now(), timespec="milliseconds"),
         "creator": {"email": email},
         "organizer": {"email": cal["id"]},
         "iCalUID": event_id + "@google.com",
@@ -142,6 +172,10 @@ async def _save_event(
             base[key] = {**base[key], **copy.deepcopy(value)}
         else:
             base[key] = copy.deepcopy(value)
+    for attendee in base.get("attendees", []):
+        attendee.setdefault("responseStatus", "needsAction")
+        if attendee.get("email") == base["organizer"]["email"]:
+            attendee.update(organizer=True, responseStatus="accepted")
     validate_event(base)
     conference = base.get("conferenceData", {})
     if "createRequest" in conference and request.query_params.get("conferenceDataVersion") == "1":
@@ -193,6 +227,19 @@ async def _save_event(
                 revision(ctx, instance)
     collection = "calendar_instances" if "recurringEventId" in base else "calendar_events"
     ctx.store[collection].put_as(cal["id"] + ":" + event_id, base)
+    if attendee_edit:
+        for replica in ctx.store[collection].values():
+            if replica["id"] == event_id:
+                for attendee in replica.get("attendees", []):
+                    if attendee.get("email") == email:
+                        attendee["responseStatus"] = next(
+                            a["responseStatus"] for a in base["attendees"] if a.get("email") == email
+                        )
+                revision(ctx, replica)
+    elif old and old.get("organizer", {}).get("email") != cal["id"] and old.get("guestsCanModify"):
+        for replica in ctx.store[collection].values():
+            if replica["id"] == event_id:
+                replica.update({k: copy.deepcopy(v) for k, v in base.items() if k != "_calendar"})
     # An organizer update is reflected on all internal invitation copies.
     if base.get("organizer", {}).get("email") == cal["id"]:
         recipients = {a.get("email") for a in base.get("attendees", [])} | {cal["id"]}
@@ -208,6 +255,8 @@ async def _save_event(
 
 
 def register(app: FastAPI, ctx: ProviderContext) -> None:
+    register_acl(app, ctx)
+
     @app.get(PREFIX + "/users/me/calendarList")
     async def calendar_list(request: Request) -> dict[str, Any]:
         actor = identity(request, ctx)
@@ -216,20 +265,46 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
             for key in ctx.store["calendar_list"].ids()
             if key.startswith(actor + ":") and (row := ctx.store["calendar_list"].get(key))
         ]
-        if request.query_params.get("minAccessRole"):
+        query = request.query_params
+        since = None
+        if query.get("syncToken"):
+            cursor = ctx.store["calendar_sync"].get(query["syncToken"])
+            if (
+                not cursor
+                or cursor["calendar"] != "calendarList"
+                or cursor["actor"] != actor
+                or cursor["expires"] <= ctx.clock.timestamp()
+            ):
+                raise google_error(
+                    410, "Sync token is no longer valid, a full sync is required.", reason="fullSyncRequired"
+                )
+            if (
+                query.get("minAccessRole")
+                or query.get("showDeleted") == "false"
+                or query.get("showHidden") == "false"
+            ):
+                raise google_error(400, "Invalid query with syncToken", reason="badRequest")
+            since = cursor["revision"]
+            entries = [r for r in entries if r.get("_rev", 0) > since]
+        elif query.get("showDeleted") != "true":
+            entries = [r for r in entries if not r.get("deleted")]
+        if since is None and query.get("showHidden") != "true":
+            entries = [r for r in entries if not r.get("hidden")]
+        if query.get("minAccessRole"):
             levels = {"freeBusyReader": 0, "reader": 1, "writer": 2, "owner": 3}
             minimum = levels.get(request.query_params["minAccessRole"])
             if minimum is None:
                 raise google_error(400, "Invalid minAccessRole", reason="invalid")
-            entries = [r for r in entries if levels[r["accessRole"]] >= minimum]
+            entries = [r for r in entries if levels.get(r["accessRole"], -1) >= minimum]
         rows, token = page(request, entries, default=100, maximum=250, binding=actor)
         result = {
             "kind": "calendar#calendarList",
             "etag": '"calendar-list"',
             "items": [public(r) for r in rows],
         }
-        if token:
-            result["nextPageToken"] = token
+        result["nextPageToken" if token else "nextSyncToken"] = token or sync_token(
+            ctx, "calendarList", actor
+        )
         return result
 
     @app.post(PREFIX + "/users/me/calendarList")
@@ -249,18 +324,20 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         ):
             if field in body:
                 entry[field] = body[field]
+        list_revision(ctx, entry)
         ctx.store["calendar_list"].put_as(actor + ":" + cal["id"], entry)
-        return entry
+        return public(entry)
 
     @app.api_route(PREFIX + "/users/me/calendarList/{calendar_id}", methods=["GET", "PATCH", "PUT", "DELETE"])
     async def calendar_list_item(request: Request, calendar_id: str) -> Any:
         cal, _, actor = calendar_access(request, ctx, calendar_id, busy=True)
         key = actor + ":" + cal["id"]
         entry = ctx.store["calendar_list"].get(key)
-        if not entry:
+        if not entry or entry.get("deleted"):
             raise google_error(404, "Not Found", reason="notFound")
         if request.method == "DELETE":
-            ctx.store["calendar_list"].delete(key)
+            entry["deleted"] = True
+            list_revision(ctx, entry)
             return Response(status_code=204)
         if request.method in ("PATCH", "PUT"):
             body = await json_object(request)
@@ -276,6 +353,7 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
             ):
                 if field in body:
                     entry[field] = body[field]
+            list_revision(ctx, entry)
         return public(entry)
 
     @app.post(PREFIX + "/calendars")
@@ -298,7 +376,9 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
             if field in body:
                 cal[field] = body[field]
         ctx.store["calendar_calendars"].put(cal)
-        ctx.store["calendar_list"].put_as(actor + ":" + calendar_id, list_entry(cal, "owner"))
+        entry = list_entry(cal, "owner")
+        list_revision(ctx, entry)
+        ctx.store["calendar_list"].put_as(actor + ":" + calendar_id, entry)
         return public(cal)
 
     @app.api_route(PREFIX + "/calendars/{calendar_id}", methods=["GET", "PATCH", "PUT", "DELETE"])
@@ -312,7 +392,9 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
             ctx.store["calendar_calendars"].delete(cal["id"])
             for key in ctx.store["calendar_list"].ids():
                 if key.endswith(":" + cal["id"]):
-                    ctx.store["calendar_list"].delete(key)
+                    entry = ctx.store["calendar_list"].get(key)
+                    entry["deleted"] = True
+                    list_revision(ctx, entry)
             for collection in ("calendar_events", "calendar_instances"):
                 for row in ctx.store[collection].where(_calendar=cal["id"]):
                     ctx.store[collection].delete(cal["id"] + ":" + row["id"])
@@ -334,6 +416,7 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
                 for field in ("summary", "timeZone", "etag", "description", "location"):
                     if field in cal:
                         entry[field] = cal[field]
+                list_revision(ctx, entry)
         return public(cal)
 
     @app.post(PREFIX + "/calendars/{calendar_id}/clear")
@@ -353,26 +436,7 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         cal, role, _ = calendar_access(request, ctx, calendar_id)
         if role != "owner":
             raise google_error(403, "Only owners may read calendar ACLs", reason="forbidden")
-        rows = [
-            {
-                "kind": "calendar#aclRule",
-                "id": "user:" + ctx.world.person(pid).email,
-                "etag": '"' + stable_hash(cal["id"], pid, access) + '"',
-                "scope": {"type": "user", "value": ctx.world.person(pid).email},
-                "role": access,
-            }
-            for pid, access in cal["_acl"].items()
-        ]
-        if cal.get("_domainRole"):
-            rows.append(
-                {
-                    "kind": "calendar#aclRule",
-                    "id": "domain:" + ctx.world.org.domain,
-                    "etag": '"domain"',
-                    "scope": {"type": "domain", "value": ctx.world.org.domain},
-                    "role": cal["_domainRole"],
-                }
-            )
+        rows = acl_rows(ctx, cal)
         rows, token = page(request, rows, default=100, maximum=250)
         return {
             "kind": "calendar#acl",
@@ -458,15 +522,27 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         if high:
             rows = [r for r in rows if instant(r["start"]) < high]
         if query.get("q"):
-            term = query["q"].casefold()
+            terms = query["q"].casefold().split()
             rows = [
                 r
                 for r in rows
-                if term
-                in " ".join(
-                    str(r.get(f, "")) for f in ("summary", "description", "location", "attendees")
-                ).casefold()
+                if all(
+                    term
+                    in " ".join(
+                        [
+                            *(r.get(f, "") for f in ("summary", "description", "location")),
+                            *(a.get(f, "") for a in r.get("attendees", []) for f in ("email", "displayName")),
+                        ]
+                    ).casefold()
+                    for term in terms
+                )
             ]
+        for parameter, area in (("privateExtendedProperty", "private"), ("sharedExtendedProperty", "shared")):
+            for constraint in query.getlist(parameter):
+                key, equal, value = constraint.partition("=")
+                if not equal:
+                    raise google_error(400, "Invalid extended property constraint", reason="badRequest")
+                rows = [r for r in rows if r.get("extendedProperties", {}).get(area, {}).get(key) == value]
         if query.get("iCalUID"):
             rows = [r for r in rows if r.get("iCalUID") == query["iCalUID"]]
         if query.get("updatedMin"):
@@ -484,7 +560,7 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
             "kind": "calendar#events",
             "etag": '"' + stable_hash(cal["id"], ctx.store.meta["calendar_revision"]) + '"',
             "summary": cal["summary"],
-            "updated": isoformat_z(ctx.clock.now()),
+            "updated": isoformat_z(ctx.clock.now(), timespec="milliseconds"),
             "timeZone": cal["timeZone"],
             "accessRole": role,
             "defaultReminders": copy.deepcopy(REMINDERS),
@@ -567,13 +643,13 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         cal, role, actor = calendar_access(request, ctx, calendar_id, write=request.method != "GET")
         event = _event_get(ctx, cal, event_id)
         if request.method == "GET":
-            if event["status"] == "cancelled" and not event.get("recurringEventId"):
-                raise google_error(410, "Resource has been deleted", reason="deleted")
             if request.headers.get("if-none-match") == event["etag"]:
                 return Response(status_code=304, headers={"ETag": event["etag"]})
             return event_output(request, ctx, event, cal, actor, role)
         _precondition(request, event)
         if request.method == "DELETE":
+            if event["status"] == "cancelled":
+                raise google_error(410, "Resource has been deleted", reason="deleted")
             event["status"] = "cancelled"
             revision(ctx, event)
             collection = "calendar_instances" if "recurringEventId" in event else "calendar_events"
@@ -688,8 +764,8 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
             raise google_error(400, "Invalid time range", reason="badRequest") from exc
         result = {
             "kind": "calendar#freeBusy",
-            "timeMin": isoformat_z(low),
-            "timeMax": isoformat_z(high),
+            "timeMin": isoformat_z(low, timespec="milliseconds"),
+            "timeMax": isoformat_z(high, timespec="milliseconds"),
             "calendars": {},
         }
         from emulators.core.errors import EmulatorError
@@ -720,7 +796,13 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
                 else:
                     merged.append((start, end))
             result["calendars"][calendar_id] = {
-                "busy": [{"start": isoformat_z(s), "end": isoformat_z(e)} for s, e in merged]
+                "busy": [
+                    {
+                        "start": isoformat_z(s, timespec="milliseconds"),
+                        "end": isoformat_z(e, timespec="milliseconds"),
+                    }
+                    for s, e in merged
+                ]
             }
         return result
 

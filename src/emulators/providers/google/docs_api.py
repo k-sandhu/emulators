@@ -132,7 +132,7 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         working["_paragraphs"] = text.removesuffix("\n").split("\n")
         working.pop("_exports", None)
         working["version"] = str(int(row["version"]) + 1)
-        working["modifiedTime"] = isoformat_z(ctx.clock.now())
+        working["modifiedTime"] = isoformat_z(ctx.clock.now(), timespec="milliseconds")
         working["_modified_by"] = principal(request, ctx).person_id
         row.update(working)
         save_revision(ctx, row)

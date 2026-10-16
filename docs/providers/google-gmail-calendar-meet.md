@@ -41,8 +41,8 @@ cannot search or retrieve bodies, and permanent Gmail deletion requires
 `https://mail.google.com/`. Missing, invalid and expired credentials return 401.
 
 Gmail requires an active internal user. `{userId}` is `me` or that user's email;
-other mailboxes return 403. Unimpersonated app-only credentials return 403 across
-these three APIs. A service-account subject acts as the impersonated user.
+other mailboxes return 403. Unimpersonated Gmail service accounts return 400
+`FAILED_PRECONDITION` ("Precondition check failed."); Calendar and Meet return 403. A service-account subject acts as the impersonated user.
 
 Calendar IDs are employee emails; `primary` resolves to the caller. Users own their
 primary calendars and subscribe to colleagues in the same department as readers.
@@ -62,7 +62,7 @@ With seed `emulators` and anchor `2026-10-16`:
 
 | World identity/resource | API example |
 | --- | --- |
-| `p018`, Maya Chen | `maya.chen@halcyonadvisory.example`; Gmail message `3659850f48e4ac3d` |
+| `p018`, Maya Chen | `maya.chen@halcyonadvisory.example`; Gmail message `ea69e473bb88d94a` |
 | `p001`, Eleanor Whitfield, CEO | `eleanor.whitfield@halcyonadvisory.example`; Calendar event `af95368e3e4e7767e5530737c4d5367b` |
 | `p003`, Priya Raman, executive assistant | `priya.raman@halcyonadvisory.example`; writer on Eleanor's calendar |
 | `m0005`, Granite Peak Outfitters kickoff | Organizer `p018`; starts `2026-09-09T14:00:00Z` |
@@ -78,7 +78,8 @@ World records determine which past conferences actually have artifacts.
 
 Every internal mail participant receives a mailbox copy with sender/recipient labels,
 per-user unread and starred state, importance, categories and nested user-label names.
-Seeded messages have stable 16-hex IDs and real RFC 2822 MIME. Attachments render lazily
+Seeded messages have stable 16-hex IDs and real RFC 2822 MIME. Message and thread IDs
+are distinct per mailbox; match copies using the RFC Message-ID header. Attachments render lazily
 to valid Office/PDF/etc. bytes and are cached in the content-addressed blob store.
 
 Meet links, conference IDs, recording file IDs and transcript document IDs agree with
@@ -112,7 +113,12 @@ Paths below are relative to `/gmail/v1/users/{userId}`.
 | POST | `/drafts/send` | Send and remove draft; returns SENT message |
 | GET | `/history` | Required `startHistoryId`, `historyTypes`, `labelId`, paging |
 | POST | `/watch`, `/stop` | Pub/Sub watch registration and removal |
-| GET | `/settings/sendAs`, `/settings/vacation` | Primary identity and disabled vacation response |
+| GET, POST | `/settings/sendAs` | Primary identity and send-as aliases |
+| GET, PATCH, PUT, DELETE | `/settings/sendAs/{email}` | Alias settings; primary identity cannot be deleted |
+| GET, PUT | `/settings/vacation`, `/settings/autoForwarding`, `/settings/imap`, `/settings/pop` | Persistent mailbox settings |
+| GET, POST | `/settings/forwardingAddresses` | List/create forwarding verification records |
+| GET, DELETE | `/settings/forwardingAddresses/{email}` | Read/remove forwarding record |
+| GET, DELETE | `/settings/filters/{id}` | Retrieve/delete a filter |
 | GET, POST | `/settings/filters` | Criteria/action resources; incoming internal mail applies supported label actions |
 
 Upload variants are `/upload/gmail/v1/users/{userId}/messages`, `/messages/send`,
@@ -120,15 +126,27 @@ Upload variants are `/upload/gmail/v1/users/{userId}/messages`, `/messages/send`
 Media accepts `message/rfc822`; multipart accepts metadata plus RFC 2822 bytes.
 Recipients in To/Cc/Bcc receive INBOX/UNREAD copies; Bcc addresses are removed from
 delivered MIME. Unknown external recipients are accepted without external delivery.
+Sending without a recipient returns 400. An unverified From address is rewritten to
+the authenticated user; accepted sendAs aliases are preserved. Thread assignment
+requires a matching subject (reply prefixes are normalized). Snippets collapse
+whitespace and escape apostrophes as `&#39;`. Duplicate label names return 409
+`duplicate` ("Label name exists or conflicts").
 
 Search supports `from:`, `to:`, `cc:`, `bcc:`, `subject:`, `label:`, `in:`
 (inbox/sent/trash/spam/anywhere), `is:` (unread/read/starred/important),
 `has:attachment`, `filename:`, `after:`, `before:`, `newer_than:`, `older_than:`,
 `larger:`, `smaller:`, `size:`, `rfc822msgid:`, quoted phrases, implicit AND, OR,
 negation, braces, parentheses and field groups such as `subject:(budget OR review)`.
-Date-only boundaries use America/Los_Angeles, as Gmail documents. Default page size
+`from:me` and `to:me` resolve the caller; category searches map primary/social/
+promotions/updates/forums to system CATEGORY labels. Unknown operators become plain
+text terms. Date-only boundaries use America/Los_Angeles, as Gmail documents. Default page size
 is 100, maximum 500. Empty list responses omit resource arrays. Too-old history IDs
 (below the seed floor 1000) return 404; every mutation advances the mailbox history.
+
+Batch endpoints on `www.googleapis.com` are `/batch/gmail/v1`, `/batch/calendar/v3`
+and generic `/batch`; the Gmail host also accepts `/batch/gmail/v1`. SDK batch
+callbacks receive separate success/error results with matching response Content-IDs.
+Gmail, Calendar and Directory `fields` support nested selectors, slash paths and wildcards.
 
 ## Calendar endpoints
 
@@ -136,12 +154,13 @@ Paths are relative to `/calendar/v3`.
 
 | Method | Path | Notes |
 | --- | --- | --- |
-| GET, POST | `/users/me/calendarList` | Subscriptions, roles, preferences, paging |
+| GET, POST | `/users/me/calendarList` | Subscriptions, roles, preferences, paging and incremental syncToken/nextSyncToken |
 | GET, PATCH, PUT, DELETE | `/users/me/calendarList/{calendarId}` | Subscription properties/removal |
 | POST | `/calendars` | Create owned secondary calendar |
 | GET, PATCH, PUT, DELETE | `/calendars/{calendarId}` | Metadata; primary calendars cannot be deleted |
 | POST | `/calendars/{calendarId}/clear` | Cancel events, retaining sync tombstones |
-| GET | `/calendars/{calendarId}/acl` | Owner-visible sharing rules |
+| GET, POST | `/calendars/{calendarId}/acl` | Owner-visible sharing rules; insert user/group/domain/default scopes |
+| GET, PATCH, PUT, DELETE | `/calendars/{calendarId}/acl/{ruleId}` | Owner-managed sharing rules |
 | GET, POST | `/calendars/{calendarId}/events` | List/insert; query, time bounds, recurrence expansion, sync |
 | GET, PATCH, PUT, DELETE | `/calendars/{calendarId}/events/{eventId}` | ETags, cancellation, invitation copies |
 | GET | `/calendars/{calendarId}/events/{eventId}/instances` | Recurring instances and exceptions |
@@ -215,21 +234,33 @@ Calendar sends empty-body notifications with `X-Goog-Channel-ID`,
 Stopping a channel or an expired channel suppresses later delivery.
 Deleting a watched secondary calendar sends `not_exists` and removes its channels.
 
+Calendar insert defaults attendees to needsAction; organizer attendee entries are
+accepted and marked organizer/self in their own copy. Non-organizers can RSVP for
+themselves; changing event details requires guestsCanModify. Deleting a recurring
+master cancels modified instances too. GET retains status=cancelled; a second DELETE
+returns 410 deleted. Events list supports repeated privateExtendedProperty and
+sharedExtendedProperty constraints plus text search over summary, description,
+location and attendee emails/display names. Created/updated times use milliseconds.
+
 ## Known gaps
 
-- No resumable Gmail upload sessions, HTTP batch envelopes, external SMTP, spam/virus
+- No resumable Gmail upload sessions, external SMTP, spam/virus
   scanning, automatic importance classification or complete label-color validation.
   User filters support from/to/subject/query/negatedQuery/attachment/size matching and
-  label changes; forwarding and full Gmail filter administration are absent. Search
+  label changes. Forwarding verification email, SMTP and actual auto-forward delivery
+  are not simulated. Created forwarding addresses remain pending; tests can set
+  verificationStatus=accepted through the state control plane. SendAs aliases matching
+  Directory aliases are accepted locally; other aliases remain pending. Search
   relative months/years use 30/365 days. Seed size estimates become exact on MIME read.
-- Calendar ACL mutation, resource calendars, group expansion, calendarList incremental
-  sync, nondefault event-type rules and outbound invitation email are absent.
+- Calendar resource-calendar scheduling, nondefault event-type rules and outbound
+  invitation email are absent.
   `sendUpdates` is accepted; internal invitation copies are replicated independently.
   Quick Add implements the documented subset above, not Google's natural-language engine.
-- Recurrence accepts one DAILY/WEEKLY/MONTHLY/YEARLY RRULE with INTERVAL/COUNT/UNTIL,
-  weekly BYDAY, monthly positive BYMONTHDAY and Monday WKST. Other recurrence forms
-  return 400. Unbounded expansion without a timeMax uses a one-year horizon; scans are
-  capped at 100 years. Seeded series cover the world's fixed scheduling horizon.
+- Recurrence uses dateutil's RFC 5545 rruleset: RRULE fields include WKST, ordinal
+  BYDAY, BYMONTH, signed BYMONTHDAY, UNTIL dates/UTC datetimes, COUNT and INTERVAL;
+  RDATE and EXDATE lines union/exclude occurrences. Unbounded expansion without a
+  timeMax uses a one-year horizon, with a 10,000-occurrence cap per expansion. Finite
+  COUNT/UNTIL rules expand beyond one year. Seeded series cover the world's horizon.
 - Fine-grained application-created/owned-resource OAuth scope restrictions and Google
   add-on current-message bindings are not fully modelled beyond endpoint scope checks
   and user ACL enforcement. List continuation is not snapshot-isolated from concurrent
@@ -238,10 +269,6 @@ Deleting a watched secondary calendar sends `not_exists` and removes its channel
   Workspace Events subscriptions are not implemented. Live-action artifact metadata
   is generated immediately; Drive bytes exist for the seeded recording/transcript
   files supplied by Part A, not every newly simulated future artifact.
-- Framework-injected Meet faults use the Google provider's shared legacy error body.
-  Supply an explicit new-style fault `body` to test those failures. A route-aware core
-  fault-error hook would remove this limitation without changing Part A's APIs.
-- Google partial-response `fields` projection is not implemented for these APIs.
 
 ## Verification
 

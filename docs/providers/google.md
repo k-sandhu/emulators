@@ -48,7 +48,8 @@ the official google-auth library to verify those tokens locally.
 Service accounts use the JWT bearer grant with an RS256 assertion, `iss`, `scope`,
 token-endpoint `aud`, `iat`, `exp` (at most one hour), and optional `sub`. Assertions
 are checked structurally and for claims/time; a real registered signing key is not
-required. `sub` impersonates an active internal user. Without impersonation a service
+required. `sub` impersonates an active internal user. Assertions with `target_audience` instead of
+`scope` issue an `id_token` for google-auth `IDTokenCredentials`. Without impersonation a service
 account sees only files explicitly accessible to it and cannot administer Directory.
 
 The control plane offers the same identity without an OAuth round trip:
@@ -76,12 +77,18 @@ unless otherwise noted; deletes return an empty 204 except OAuth revocation.
 | GET | `/o/oauth2/v2/auth`, `/o/oauth2/auth` | Authorization code redirect or account picker |
 | POST | `/token`, `/oauth2/v4/token` | Code, refresh and service-account JWT grants |
 | GET, POST | `/tokeninfo` | Access-token or ID-token information |
-| GET | `/v1/userinfo`, `/oauth2/v3/userinfo`, `/oauth2/v2/userinfo` | Acting user's OIDC profile; legacy v2 names |
+| GET | `/oauth2/v1/tokeninfo`, `/oauth2/v2/tokeninfo`, `/oauth2/v3/tokeninfo` | Token information aliases; ID-token exp/iat/email_verified are strings |
+| GET | `/v1/userinfo`, `/oauth2/v3/userinfo`, `/oauth2/v2/userinfo`, `/userinfo/v2/me` | Acting user's OIDC profile; legacy v2 names |
 | GET | `/oauth2/v3/certs`, `/oauth2/v1/certs` | JWKS / X.509 PEM map |
 | GET | `/.well-known/openid-configuration` | Local OIDC metadata |
 | POST | `/revoke` | Revoke associated client/user grants; empty 200 |
 | GET, POST | `/admin/directory/v1/users` | Query, sort, page, public/admin view; insert |
 | GET, PATCH, PUT, DELETE | `/admin/directory/v1/users/{userKey}` | Email, alias or numeric ID lookup; mutation |
+| POST | `/batch`, `/batch/drive/v3`, `/batch/calendar/v3`, `/batch/admin/directory_v1`, `/batch/gmail/v1` | Multipart/mixed application/http requests; per-part Content-ID, auth inheritance/override, success/error responses |
+| POST | `/admin/directory/v1/users/{userKey}/signOut` | Revoke user grants; 204 |
+| GET | `/admin/directory/v1/users/{userKey}/tokens` | Authorized OAuth clients and scopes |
+| DELETE | `/admin/directory/v1/users/{userKey}/tokens/{clientId}` | Revoke the user/client grants; 204 |
+| POST | `/admin/directory/v1/users/{userKey}/undelete` | Restore a deleted numeric user ID to orgUnitPath; 204 |
 | POST | `/admin/directory/v1/users/{userKey}/makeAdmin` | Set super-admin flag with `{status}` |
 | GET | `/admin/directory/v1/users/{userKey}/photos/thumbnail` | URL-safe base64 PNG photo resource |
 | GET, POST | `/admin/directory/v1/users/{userKey}/aliases` | List / add aliases |
@@ -96,6 +103,9 @@ unless otherwise noted; deletes return an empty 204 except OAuth revocation.
 | GET | `/admin/directory/v1/customers/{customerKey}` | Customer metadata; `my_customer` accepted |
 | GET | `/admin/directory/v1/customer/{customerId}/domains` | Primary verified domain |
 | GET | `/admin/directory/v1/customer/{customerId}/resources/calendars` | Two meeting rooms per office |
+| GET | `/admin/directory/v1/customer/{customerId}/resources/calendars/{resourceId}` | Meeting-room resource |
+| GET | `/admin/directory/v1/customer/{customerId}/resources/buildings` | World office buildings |
+| GET | `/admin/directory/v1/customer/{customerId}/resources/buildings/{buildingId}` | Office address and floor names |
 | GET | `/drive/v3/about` | Required `fields`; user, quota and format metadata |
 | GET, POST | `/drive/v3/files` | Query/sort/page/partial response; metadata creation |
 | GET, PATCH, DELETE | `/drive/v3/files/{id}` | Metadata, media download, metadata update, permanent deletion |
@@ -105,7 +115,7 @@ unless otherwise noted; deletes return an empty 204 except OAuth revocation.
 | GET | `/drive/v3/files/generateIds` | Preallocate file IDs |
 | POST | `/upload/drive/v3/files` | `uploadType=media`, `multipart` or `resumable` |
 | PATCH | `/upload/drive/v3/files/{id}` | Media or resumable update |
-| PUT | Resumable `Location` URL | Chunks, `Content-Range`, status query and 308 Range acknowledgement |
+| PUT | Resumable `Location` URL | Chunks, `Content-Range`, status query and 308 Range acknowledgement; self-authenticating URI, no bearer required |
 | GET, POST | `/drive/v3/files/{id}/permissions` | ACL list / create; fields and pagination |
 | GET, PATCH, DELETE | `/drive/v3/files/{id}/permissions/{permissionId}` | Permission mutation; inherited shared-drive grants protected |
 | GET, POST | `/drive/v3/drives` | Visible shared drives; idempotent create with `requestId` |
@@ -123,12 +133,18 @@ unless otherwise noted; deletes return an empty 204 except OAuth revocation.
 
 Directory users default to 100 results, maximum 500. Groups and group members use
 200. Drive files and changes default to 100, maximum 1000. Opaque file-list tokens
-must be used with the same query. Drive's `fields` grammar supports commas, nesting,
+must be used with the same query. `X-HTTP-Method-Override: GET` moves a form-encoded
+POST body into the query, including SDK long-URL requests. JSON request types are
+validated against an embedded structural snapshot of the official SDK discovery schemas.
+Drive, Gmail, Calendar and Directory support partial responses. Drive's `fields` grammar
+accepts documented but unmodelled fields and omits them. It supports commas, nesting,
 slash paths and wildcards; invalid selectors return a Google-shaped 400.
 
 The Drive `q` parser supports string/boolean/date comparisons, parent and
 owner/writer/reader membership, `sharedWithMe`, name/full-text search, link visibility,
-property maps, `not`, `and`, `or`, grouping and escaped apostrophes. Ordering supports
+property maps, `not`, `and`, `or`, grouping and escaped apostrophes. `name contains`
+matches prefixes at word starts, MIME contains matches substrings, and fullText ANDs
+terms or matches a double-quoted phrase. Boolean inequality is supported. Ordering supports
 multiple keys, descending order and natural names. `corpora=drive` requires `driveId`,
 `supportsAllDrives=true` and `includeItemsFromAllDrives=true`. Shared-drive metadata and
 binary GETs require `supportsAllDrives=true`. Invisible files return 404; visible files
@@ -167,6 +183,13 @@ Shared-drive roles come from space members and live Directory group membership.
 Restricted world documents break inherited access. Personal items inherit parent
 sharing; explicit shares support users, groups, domain and anyone links. Anyone-with-link
 items can be fetched by a known ID but do not appear in an unrelated user's listing.
+Public metadata and binary downloads also accept `?key=fixture-key` without a bearer.
+Domain link-only sharing likewise requires a known ID; discoverable domain grants
+appear in domain/allDrives listings. `root` resolves in addParents/removeParents.
+Trash transitions include trashedTime/trashingUser. Drive and Directory timestamp
+fields use millisecond precision. Exporting a binary file returns 403
+`fileNotExportable` with "Export only supports Docs Editors files."; unsupported native
+export MIME types remain 400. This choice follows the native-file export contract.
 Meet recordings and transcript Docs share the exact IDs used by the Meet API and grant
 attendees reader access. Recordings use the world's MP4 generator.
 
@@ -193,12 +216,13 @@ the seeded collections, grants, cursors, upload sessions and channels.
   key registration and domain-wide delegation approval. Refresh grants have no expiry.
   OIDC certificates use a local self-signed certificate and the shared emulator signing key.
 - Directory implements the documented fixture query subset, not custom schemas, arbitrary
-  query fields, deleted-user restoration, group alias management or device administration.
+  query fields, group alias management or device administration.
   User insertion requires a password but does not store or authenticate it. Scope families
   and admin roles are checked; fine-grained delegated-admin custom roles are not modelled.
 - Drive `drive.file` uses file ACLs without modelling Google's per-app file picker grant.
   App properties, file stars and view history are not isolated per client/user. Domain and
-  anyone discovery, app-data storage, labels, comments and replies have no populated fixtures.
+  anyone discovery have no populated fixtures; domain/anyone permissions can be created.
+  App-data storage, labels, comments and replies have no populated fixtures.
 - Revisions for seeded documents expose the head only; runtime binary revisions retain
   content. Native Docs revisions retain metadata, not historical native exports. Export
   formatting is synthetic and supports the formats in `about.exportFormats`.
@@ -212,6 +236,10 @@ the seeded collections, grants, cursors, upload sessions and channels.
 - Uploads are held in memory; sessions do not expire and chunk sizes need not be multiples
   of 256 KiB. Native imports of uploaded Office binaries do not parse Office layout/content.
   Downloads support one byte range per request.
+- Batch requests run sequentially in-process and accept at most 100 parts. There is no
+  transaction or rollback across parts. The generic endpoint also allows cross-API parts.
+- Directory signOut models grant revocation; browser cookies and real-device sessions
+  do not exist locally. Building resources are read-only world office projections.
 - The remaining Docs API (styles, tables, tabs, named ranges, suggestions and other batch
   request types) is outside this minimal implementation.
 
@@ -234,4 +262,8 @@ Implementation references: [Google OAuth web-server flow](https://developers.goo
 [Directory user search](https://developers.google.com/workspace/admin/directory/v1/guides/search-users),
 [Drive files](https://developers.google.com/workspace/drive/api/reference/rest/v3/files),
 [Drive partial responses](https://developers.google.com/workspace/drive/api/guides/fields-parameter),
-[Drive uploads](https://developers.google.com/workspace/drive/api/guides/manage-uploads).
+[Drive uploads](https://developers.google.com/workspace/drive/api/guides/manage-uploads),
+[Batch format and method override](https://developers.google.com/workspace/drive/api/guides/performance),
+[Drive search operators](https://developers.google.com/workspace/drive/api/guides/ref-search-terms),
+[Drive downloads and exports](https://developers.google.com/workspace/drive/api/guides/manage-downloads),
+[Google-auth service-account ID tokens](https://google-auth.readthedocs.io/en/latest/reference/google.oauth2.service_account.html).

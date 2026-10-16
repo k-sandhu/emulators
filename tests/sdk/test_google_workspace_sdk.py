@@ -199,6 +199,38 @@ def test_workspace_service_account_impersonation(emulator_intercept: Any) -> Non
     app_only = build("gmail", "v1", credentials=service, static_discovery=True)
     with pytest.raises(HttpError) as denied:
         app_only.users().getProfile(userId="me").execute()
-    assert denied.value.resp.status == 403
+    assert denied.value.resp.status == 400
     for api in (gmail, calendar, app_only):
         api.close()
+
+
+@pytest.mark.parametrize(
+    "api,version,user",
+    [("calendar", "v3", "p001"), ("gmail", "v1", "p018"), ("admin", "directory_v1", "p035")],
+)
+def test_workspace_sdk_batch_and_partial_responses(
+    emulator_intercept: Any, api: str, version: str, user: str
+) -> None:
+    service = build(api, version, credentials=credentials(user), static_discovery=True)
+    if api == "calendar":
+        request = service.calendarList().list(fields="items(id),nextSyncToken")
+        key, children = "items", {"id"}
+    elif api == "gmail":
+        request = (
+            service.users().messages().list(userId="me", maxResults=2, fields="messages(id),nextPageToken")
+        )
+        key, children = "messages", {"id"}
+    else:
+        request = service.users().list(
+            customer="my_customer", maxResults=2, fields="users(id,primaryEmail),nextPageToken"
+        )
+        key, children = "users", {"id", "primaryEmail"}
+    results = []
+    batch = service.new_batch_http_request(
+        callback=lambda request_id, response, error: results.append((response, error))
+    )
+    batch.add(request, request_id="partial")
+    batch.execute()
+    assert results[0][1] is None, results[0][1]
+    assert results[0][0][key] and all(set(row) == children for row in results[0][0][key])
+    service.close()

@@ -255,3 +255,68 @@ def test_official_directory_and_docs_clients_and_service_account(emulator_interc
     )
     for api in (admin, docs, drive, impersonated):
         api.close()
+
+
+def test_sdk_drive_batch_mixed_success_error_and_long_get_override(emulator_intercept: Any) -> None:
+    service = build("drive", "v3", credentials=Credentials(token()), static_discovery=True)
+    results: dict[str, tuple[Any, Any]] = {}
+    batch = service.new_batch_http_request(
+        callback=lambda key, value, error: results.update({key: (value, error)})
+    )
+    batch.add(service.files().create(body={"name": "Batched file"}, fields="id,name"), request_id="create")
+    batch.add(service.about().get(fields="user(emailAddress)"), request_id="about")
+    batch.add(service.files().get(fileId="missing"), request_id="missing")
+    batch.execute()
+    assert results["create"][0]["name"] == "Batched file" and results["create"][1] is None
+    assert results["about"][0]["user"]["emailAddress"] == "maya.chen@halcyonadvisory.example"
+    assert isinstance(results["missing"][1], HttpError) and results["missing"][1].resp.status == 404
+    query = " or ".join(["name = 'Batched file'"] * 150)
+    request = service.files().list(q=query, fields="files(id,name)")
+    assert len(request.uri) > 2048
+    response = request.execute()
+    assert any(row["name"] == "Batched file" for row in response["files"])
+    entries = emulator_intercept.hub.context("google").journal.entries()
+    assert any(r["method"] == "POST" and r["headers"].get("x-http-method-override") == "GET" for r in entries)
+    service.close()
+
+
+def test_google_auth_service_account_id_token_credentials(emulator_intercept: Any) -> None:
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from google.oauth2.service_account import IDTokenCredentials
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    pem = key.private_bytes(
+        serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()
+    ).decode()
+    credential = IDTokenCredentials.from_service_account_info(
+        {
+            "type": "service_account",
+            "client_email": "sdk-service@halcyonadvisory.example",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "private_key": pem,
+            "private_key_id": "test-key",
+        },
+        target_audience="https://consumer.example",
+    )
+    credential.refresh(GoogleRequest())
+    assert credential.token
+    verified = verify_oauth2_token(credential.token, GoogleRequest(), audience="https://consumer.example")
+    assert verified["email"] == "sdk-service@halcyonadvisory.example"
+    for version in ("v1", "v2", "v3"):
+        response = requests.get(
+            "https://www.googleapis.com/oauth2/" + version + "/tokeninfo",
+            params={"id_token": credential.token},
+            timeout=10,
+        )
+        response.raise_for_status()
+        body = response.json()
+        assert (
+            isinstance(body["exp"], str) and isinstance(body["iat"], str) and body["email_verified"] == "true"
+        )
+    profile = requests.get(
+        "https://www.googleapis.com/userinfo/v2/me",
+        headers={"Authorization": "Bearer " + token()},
+        timeout=10,
+    )
+    assert profile.status_code == 200 and profile.json()["verified_email"] is True

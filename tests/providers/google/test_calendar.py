@@ -128,7 +128,8 @@ async def test_event_crud_etag_sync_cancel_and_private_visibility(calendar_clien
     assert (await client.delete(EVENTS + "/" + event["id"])).status_code == 204
     cancelled = (await client.get(EVENTS, params={"syncToken": delta["nextSyncToken"]})).json()["items"]
     assert len(cancelled) == 1 and cancelled[0]["status"] == "cancelled"
-    assert (await client.get(EVENTS + "/" + event["id"])).status_code == 410
+    assert (await client.get(EVENTS + "/" + event["id"])).json()["status"] == "cancelled"
+    assert (await client.delete(EVENTS + "/" + event["id"])).status_code == 410
     invalid = await client.get(EVENTS, params={"syncToken": "invalid"})
     assert invalid.status_code == 410 and invalid.json()["error"]["errors"][0]["reason"] == "fullSyncRequired"
     assert (await client.get(EVENTS, params={"syncToken": sync, "q": "x"})).status_code == 400
@@ -250,7 +251,11 @@ async def test_free_busy_colors_settings_and_filters(calendar_client: httpx.Asyn
     )
     assert response.status_code == 200
     busy = response.json()["calendars"]["primary"]["busy"]
-    assert any(r["start"] <= "2026-10-19T13:00:00Z" and r["end"] >= "2026-10-19T14:30:00Z" for r in busy)
+    assert any(
+        parse_instant(r["start"]) <= parse_instant("2026-10-19T13:00:00Z")
+        and parse_instant(r["end"]) >= parse_instant("2026-10-19T14:30:00Z")
+        for r in busy
+    )
     assert (
         response.json()["calendars"]["missing@halcyonadvisory.example"]["errors"][0]["reason"] == "notFound"
     )
@@ -327,7 +332,11 @@ async def test_invalid_event_is_google_400(calendar_client: httpx.AsyncClient, b
 
 async def test_seed_series_update_delete_and_sync_expiry(calendar_client: httpx.AsyncClient) -> None:
     client = calendar_client
-    recurring = next(r for r in (await client.get(EVENTS)).json()["items"] if "recurrence" in r)
+    recurring = next(
+        r
+        for r in (await client.get(EVENTS)).json()["items"]
+        if "recurrence" in r and r["organizer"]["email"] == CEO
+    )
     event_id = recurring["id"]
     response = await client.patch(EVENTS + "/" + event_id, json={"summary": "Updated recurring review"})
     assert response.status_code == 200

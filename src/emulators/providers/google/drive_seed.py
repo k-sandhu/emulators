@@ -70,7 +70,7 @@ def new_file(
     drive: str | None = None,
     stamp: str | None = None,
 ) -> dict[str, Any]:
-    stamp = stamp or isoformat_z(ctx.world.anchor)
+    stamp = stamp or isoformat_z(ctx.world.anchor, timespec="milliseconds")
     row: dict[str, Any] = {
         "kind": "drive#file",
         "id": fid,
@@ -124,7 +124,7 @@ def seed(ctx: ProviderContext) -> None:
             "id": did,
             "name": space.name,
             "colorRgb": "#4986e7",
-            "createdTime": isoformat_z(ctx.world.anchor),
+            "createdTime": isoformat_z(ctx.world.anchor, timespec="milliseconds"),
             "hidden": False,
             "restrictions": {
                 "adminManagedRestrictions": False,
@@ -176,14 +176,14 @@ def seed(ctx: ProviderContext) -> None:
             doc.owner_id,
             [parent],
             drive=drive,
-            stamp=isoformat_z(doc.created),
+            stamp=isoformat_z(doc.created, timespec="milliseconds"),
         )
         row.update(
             description=doc.description,
             starred=doc.starred,
             trashed=doc.trashed,
             explicitlyTrashed=doc.trashed,
-            modifiedTime=isoformat_z(doc.modified),
+            modifiedTime=isoformat_z(doc.modified, timespec="milliseconds"),
             version=str(doc.versions),
         )
         row.update(
@@ -202,7 +202,7 @@ def seed(ctx: ProviderContext) -> None:
         for share in doc.shares:
             perm = permission(ctx, share.principal_id, ROLES[share.role], email=share.email, link=share.link)
             if share.expires:
-                perm["expirationTime"] = isoformat_z(share.expires)
+                perm["expirationTime"] = isoformat_z(share.expires, timespec="milliseconds")
             row["_permissions"].append(perm)
         files.put(row)
     for meeting in ctx.world.meetings:
@@ -233,7 +233,7 @@ def seed(ctx: ProviderContext) -> None:
                 mime,
                 meeting.organizer_id,
                 [folder],
-                stamp=isoformat_z(meeting.end),
+                stamp=isoformat_z(meeting.end, timespec="milliseconds"),
             )
             row["_permissions"].extend(
                 permission(ctx, pid, "reader")

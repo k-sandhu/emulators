@@ -70,8 +70,13 @@ class GoogleProvider(Provider):
 
     def error_body_for(self, scope: dict[str, Any] | None, status: int, code: str, message: str) -> Any:
         # Meet REST v2 is a gRPC-transcoded API: errors carry no legacy ``errors[]`` list.
-        path = (scope or {}).get("path", "")
-        legacy = not path.startswith(("/v2/spaces", "/v2/conferenceRecords", "/meet/v2/"))
+        path = (scope or {}).get("path", "").removeprefix((scope or {}).get("root_path", ""))
+        legacy = not path.startswith(("/v2/spaces", "/v2/conferenceRecords", "/meet/v2/", "/v1/documents"))
+        if path.startswith("/v1/documents"):
+            if status == 404:
+                message = "Requested entity was not found."
+            elif status == 403:
+                message = "The caller does not have permission"
         return common.error_body(status, message, legacy=legacy)
 
     def seed(self, ctx: ProviderContext) -> None:
@@ -80,6 +85,10 @@ class GoogleProvider(Provider):
                 module.seed(ctx)
 
     def build(self, app: FastAPI, ctx: ProviderContext) -> None:
+        from emulators.providers.google.wire import GoogleWireMiddleware, register_batch
+
+        app.add_middleware(GoogleWireMiddleware)
+        register_batch(app)
         for module in _modules():
             if hasattr(module, "register"):
                 module.register(app, ctx)

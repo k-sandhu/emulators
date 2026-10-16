@@ -78,7 +78,7 @@ async def test_profile_auth_visibility_and_host_alias(gmail: httpx.AsyncClient) 
         await gmail.get(ROOT + "/profile", headers={"Authorization": "Bearer invalid"})
     ).status_code == 401
     app_token = await mint(gmail, BASE, app_only=True)
-    assert (await gmail.get(ROOT + "/messages", headers=bearer(app_token))).status_code == 403
+    assert (await gmail.get(ROOT + "/messages", headers=bearer(app_token))).status_code == 400
 
 
 async def test_paging_formats_and_labels(gmail: httpx.AsyncClient) -> None:
@@ -182,7 +182,16 @@ async def test_send_reply_internal_delivery_and_bcc_privacy(gmail: httpx.AsyncCl
     sent = (await gmail.post(ROOT + "/messages/send", json={"raw": raw})).json()
     assert sent["labelIds"] == ["SENT"]
     recipient_token = await mint(gmail, BASE, user="p001")
-    recipient = await gmail.get(ROOT + "/messages/" + sent["id"], headers=bearer(recipient_token))
+    recipient_auth = bearer(recipient_token)
+    matches = (
+        await gmail.get(
+            ROOT + "/messages",
+            headers=recipient_auth,
+            params={"q": "rfc822msgid:contract-seed@halcyonadvisory.example"},
+        )
+    ).json()["messages"]
+    assert matches[0]["id"] != sent["id"] and matches[0]["threadId"] != sent["threadId"]
+    recipient = await gmail.get(ROOT + "/messages/" + matches[0]["id"], headers=recipient_auth)
     assert recipient.status_code == 200 and recipient.json()["labelIds"] == ["INBOX", "UNREAD"]
     assert not any(h["name"] == "Bcc" for h in recipient.json()["payload"]["headers"])
     reply_raw = raw_message(
@@ -195,7 +204,9 @@ async def test_send_reply_internal_delivery_and_bcc_privacy(gmail: httpx.AsyncCl
     thread = (await gmail.get(ROOT + "/threads/" + sent["threadId"])).json()
     assert len(thread["messages"]) == 2 and thread["snippet"]
     wrong = await gmail.post(ROOT + "/messages/send", json={"raw": raw_message(From=RECIPIENT)})
-    assert wrong.status_code == 403
+    assert wrong.status_code == 200
+    rewritten = (await gmail.get(ROOT + "/messages/" + wrong.json()["id"])).json()
+    assert next(h["value"] for h in rewritten["payload"]["headers"] if h["name"] == "From") == SENDER
 
 
 async def test_message_thread_mutations_history_and_label_crud(gmail: httpx.AsyncClient) -> None:
@@ -390,7 +401,15 @@ async def test_explicit_scopes_and_inbound_filter(gmail: httpx.AsyncClient) -> N
     )
     assert response.status_code == 200
     sent = (await gmail.post(ROOT + "/messages/send", json={"raw": raw_message()})).json()
-    delivered = (await gmail.get(ROOT + "/messages/" + sent["id"], headers=recipient)).json()
+    incoming = (
+        await gmail.get(
+            ROOT + "/messages",
+            headers=recipient,
+            params={"q": "rfc822msgid:contract-seed@halcyonadvisory.example"},
+        )
+    ).json()["messages"][0]
+    assert incoming["id"] != sent["id"]
+    delivered = (await gmail.get(ROOT + "/messages/" + incoming["id"], headers=recipient)).json()
     assert "IMPORTANT" in delivered["labelIds"] and "UNREAD" not in delivered["labelIds"]
 
 

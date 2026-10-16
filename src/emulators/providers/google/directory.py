@@ -49,6 +49,10 @@ def admin(request: Request, ctx: ProviderContext, *, public: bool = False) -> No
         "customer",
     )
     scopes = {"https://www.googleapis.com/auth/admin.directory." + area}
+    if "/tokens" in request.url.path or request.url.path.endswith("/signOut"):
+        scopes = {"https://www.googleapis.com/auth/admin.directory.user.security"}
+    if "/resources/buildings" in request.url.path:
+        scopes = {"https://www.googleapis.com/auth/admin.directory.resource.calendar"}
     if area == "group" and ("/members" in request.url.path or "/hasMember" in request.url.path):
         scopes.add("https://www.googleapis.com/auth/admin.directory.group.member")
     if request.method == "GET":
@@ -140,7 +144,7 @@ def user_shape(ctx: ProviderContext, person: Person) -> dict[str, Any]:
         },
         "isAdmin": person.is_admin,
         "isDelegatedAdmin": False,
-        "lastLoginTime": isoformat_z(ctx.world.anchor),
+        "lastLoginTime": isoformat_z(ctx.world.anchor, timespec="milliseconds"),
         "creationTime": str(person.hire_date or "2010-01-01") + "T00:00:00.000Z",
         "agreedToTerms": True,
         "suspended": not person.active,
@@ -359,6 +363,10 @@ def project_user(row: dict[str, Any], request: Request) -> dict[str, Any]:
 
 
 def register(app: FastAPI, ctx: ProviderContext) -> None:
+    from emulators.providers.google.directory_extra import register as register_extra
+
+    register_extra(app, ctx)
+
     @app.get(BASE + "/users")
     async def list_users(request: Request) -> dict[str, Any]:
         q = request.query_params
@@ -406,7 +414,7 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
             "archived": False,
             "orgUnitPath": "/",
             "customerId": ctx.world.org.google_customer_id,
-            "creationTime": isoformat_z(ctx.clock.now()),
+            "creationTime": isoformat_z(ctx.clock.now(), timespec="milliseconds"),
             "lastLoginTime": "1970-01-01T00:00:00.000Z",
             "aliases": [],
             **{k: v for k, v in data.items() if k not in ("password", "id", "isAdmin", "isDelegatedAdmin")},
@@ -450,7 +458,7 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         admin(request, ctx)
         row = lookup(ctx, "directory_users", user_key)
         row["_deleted"] = True
-        row["deletionTime"] = isoformat_z(ctx.clock.now())
+        row["deletionTime"] = isoformat_z(ctx.clock.now(), timespec="milliseconds")
         if row.get("_person"):
             ctx.tokens.revoke_user(row["_person"])
         return Response(status_code=204)

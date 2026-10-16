@@ -203,5 +203,12 @@ def select(value: dict[str, Any], fields: str | None, default: str = "*") -> dic
     tree = parse_fields(default if fields is None else fields)
     schema = SCHEMAS.get(value.get("kind", ""))
     if schema is not None:
+        from emulators.providers.google.api_schema import SCHEMAS as DISCOVERY_SCHEMAS
+        from emulators.providers.google.wire import field_tree
+
+        name = value["kind"].split("#")[-1]
+        reference = "drive:" + name[0].upper() + name[1:]
+        if reference in DISCOVERY_SCHEMAS:
+            schema = field_tree(DISCOVERY_SCHEMAS[reference])
         validate(tree, schema)
     return project(value, tree)

@@ -116,13 +116,15 @@ class Parser:
                 and ("value" not in pairs or f[field][pairs["key"]] == pairs["value"])
             )
         if field in BOOL_FIELDS:
-            if field == "sharedWithMe" and not self.peek("="):
+            if field == "sharedWithMe" and not (self.peek("=") or self.peek("!=")):
                 return lambda f: bool(f.get("sharedWithMe", False))
-            self.take("=")
-            _, boolean = self.take()
-            if boolean not in ("true", "false"):
+            _, operator = self.take()
+            if operator not in ("=", "!="):
                 raise ValueError
-            return lambda f: bool(f.get(field, False)) == (boolean == "true")
+            boolean_kind, boolean = self.take()
+            if boolean_kind != "token" or boolean not in ("true", "false"):
+                raise ValueError
+            return lambda f: (bool(f.get(field, False)) == (boolean == "true")) == (operator == "=")
         if field not in STRING_FIELDS | DATE_FIELDS:
             raise ValueError
         _, operator = self.take()
@@ -149,7 +151,7 @@ class Parser:
 
             return compare_date
         if operator not in ("=", "!=", "contains") or (
-            operator == "contains" and field not in ("name", "fullText")
+            operator == "contains" and field not in ("name", "fullText", "mimeType")
         ):
             raise ValueError
 
@@ -157,10 +159,21 @@ class Parser:
             text = str(f.get("_text", "") if field == "fullText" else f.get(field, ""))
             if operator == "contains":
                 if field == "name":
-                    return text.casefold().startswith(value.casefold())
+                    return any(
+                        text[m.start() :].casefold().startswith(value.casefold())
+                        for m in re.finditer(r"(?<!\w)\w", text)
+                    )
+                if field == "mimeType":
+                    return value.casefold() in text.casefold()
                 if value.startswith('"') and value.endswith('"'):
-                    return value[1:-1].casefold() in text.casefold()
-                return any(token.casefold() == value.casefold() for token in re.findall(r"\w+", text))
+
+                    def normalize(s: str) -> str:
+                        return " ".join(re.findall(r"[^\W_]+", s.casefold()))
+
+                    return " " + normalize(value[1:-1]) + " " in " " + normalize(text) + " "
+                return set(re.findall(r"[^\W_]+", value.casefold())) <= set(
+                    re.findall(r"[^\W_]+", text.casefold())
+                )
             equal = text.casefold() == value.casefold()
             return equal if operator == "=" else not equal
 

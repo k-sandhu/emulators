@@ -19,6 +19,8 @@ from emulators.providers.google.gmail_mime import (
     read_upload,
 )
 from emulators.providers.google.gmail_query import compile_query
+from emulators.providers.google.gmail_settings import register as register_settings
+from emulators.providers.google.gmail_settings import send_as_rows
 from emulators.providers.google.gmail_state import (
     change,
     get_message,
@@ -69,6 +71,7 @@ def _filtered(request: Request, ctx: ProviderContext, owner: str) -> list[dict[s
         request.query_params.get("q", ""),
         ctx.clock.now(),
         {r["name"].casefold(): r["id"] for r in labels(ctx, owner)},
+        ctx.world.person(owner).email,
     )
     required = request.query_params.getlist("labelIds")
     include = request.query_params.get("includeSpamTrash", "false") == "true"
@@ -266,8 +269,10 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         owner = mailbox(request, ctx, user_id)
         body = await json_object(request)
         name = body.get("name", "")
-        if not name or any(r["name"].casefold() == name.casefold() for r in labels(ctx, owner)):
-            raise google_error(400, "Invalid label name or name exists", reason="invalidArgument")
+        if not name:
+            raise google_error(400, "Invalid label name", reason="invalidArgument")
+        if any(r["name"].casefold() == name.casefold() for r in labels(ctx, owner)):
+            raise google_error(409, "Label name exists or conflicts", reason="duplicate")
         number = (
             max([int(r["id"].split("_")[1]) for r in labels(ctx, owner) if r["type"] == "user"] or [0]) + 1
         )
@@ -298,14 +303,13 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
             labels(ctx, owner).delete(label_id)
             return Response(status_code=204)
         body = await json_object(request)
-        if "name" in body and (
-            label["type"] == "system"
-            or any(
-                r["id"] != label_id and r["name"].casefold() == body["name"].casefold()
-                for r in labels(ctx, owner)
-            )
-        ):
+        if "name" in body and label["type"] == "system":
             raise google_error(400, "Invalid label name", reason="invalidArgument")
+        if "name" in body and any(
+            r["id"] != label_id and r["name"].casefold() == body["name"].casefold()
+            for r in labels(ctx, owner)
+        ):
+            raise google_error(409, "Label name exists or conflicts", reason="duplicate")
         for key in ("name", "color", "messageListVisibility", "labelListVisibility"):
             if key in body:
                 label[key] = body[key]
@@ -472,26 +476,7 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
 
     @app.get(PREFIX + "/settings/sendAs")
     async def send_as(request: Request, user_id: str) -> dict[str, Any]:
-        person = ctx.world.person(mailbox(request, ctx, user_id))
-        return {
-            "sendAs": [
-                {
-                    "sendAsEmail": person.email,
-                    "displayName": person.display_name,
-                    "replyToAddress": person.email,
-                    "signature": "",
-                    "isPrimary": True,
-                    "isDefault": True,
-                    "treatAsAlias": False,
-                    "verificationStatus": "accepted",
-                }
-            ]
-        }
-
-    @app.get(PREFIX + "/settings/vacation")
-    async def vacation(request: Request, user_id: str) -> dict[str, Any]:
-        mailbox(request, ctx, user_id)
-        return {"enableAutoReply": False, "restrictToContacts": False, "restrictToDomain": False}
+        return {"sendAs": send_as_rows(ctx, mailbox(request, ctx, user_id))}
 
     @app.api_route(PREFIX + "/settings/filters", methods=["GET", "POST"])
     async def filters(request: Request, user_id: str) -> dict[str, Any]:
@@ -515,3 +500,4 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         return {"topicName": body["topicName"], "endpoint": body["endpoint"]}
 
     ctx.provider.actions["configure_pubsub_push"] = configure_push
+    register_settings(app, ctx)

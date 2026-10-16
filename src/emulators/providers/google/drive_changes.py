@@ -60,7 +60,7 @@ async def record_change(
         "id": str(number),
         "kind": "drive#change",
         "changeType": "drive" if drive else "file",
-        "time": isoformat_z(ctx.clock.now()),
+        "time": isoformat_z(ctx.clock.now(), timespec="milliseconds"),
         "removed": removed,
         "_visible": audience,
         "_record": copy.deepcopy(row),

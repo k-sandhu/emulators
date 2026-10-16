@@ -13,7 +13,7 @@ from emulators.providers.google.drive_query import compile_query
     [
         ("name = 'O\\'Brien plan'", True),
         ("name contains 'O'", True),
-        ("name contains 'plan'", False),
+        ("name contains 'plan'", True),
         ("fullText contains 'budget'", True),
         ("mimeType != 'application/pdf' and trashed = false", True),
         ("'folder1' in parents", True),

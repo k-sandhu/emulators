@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import html
+import re
 from email import policy
 from email.message import EmailMessage, Message
 from email.parser import BytesParser
@@ -149,10 +150,10 @@ def seed_message(
             }
         )
     return {
-        "id": stable_hash(ctx.world.seed, "gmail-message", message.id),
+        "id": stable_hash(ctx.world.seed, "gmail-message", owner_email, message.id),
         "threadId": thread_id,
         "labelIds": labels,
-        "snippet": html.escape(message.body[:200]),
+        "snippet": snippet(message.body),
         "historyId": "1000",
         "internalDate": str(int(message.sent.timestamp() * 1000)),
         "sizeEstimate": len(message.body.encode()) + 700,
@@ -198,7 +199,7 @@ def parse_raw(
             "id": message_id,
             "threadId": thread_id,
             "labelIds": list(labels),
-            "snippet": html.escape(text[:200]),
+            "snippet": snippet(text),
             "historyId": "1000",
             "internalDate": str(int(ctx.clock.now().timestamp() * 1000)),
             "sizeEstimate": len(data),
@@ -218,7 +219,6 @@ def parse_raw(
 
 
 def re_strip_html(parsed: Message) -> str:
-    import re
 
     return "\n".join(
         html.unescape(
@@ -233,6 +233,10 @@ def re_strip_html(parsed: Message) -> str:
         for p in parsed.walk()
         if p.get_content_type() == "text/html"
     )
+
+
+def snippet(text: str) -> str:
+    return html.escape(" ".join(text.split())[:200]).replace("&#x27;", "&#39;")
 
 
 async def read_upload(request: Any) -> dict[str, Any]:
@@ -272,4 +276,5 @@ def addresses(record: dict[str, Any]) -> list[str]:
     return [
         email.lower()
         for _, email in getaddresses([record.get("_to", ""), record.get("_cc", ""), record.get("_bcc", "")])
+        if email
     ]

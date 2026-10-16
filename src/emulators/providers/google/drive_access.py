@@ -9,7 +9,7 @@ from typing import Any
 
 from fastapi import Request
 
-from emulators.core.clock import parse_instant
+from emulators.core.clock import isoformat_z, parse_instant
 from emulators.core.provider import ProviderContext, url_for_host
 from emulators.providers.google.common import Principal, google_error, person_ref
 from emulators.providers.google.common import principal as google_principal
@@ -39,6 +39,14 @@ EXPORTS = {
 
 
 def principal(request: Request, ctx: ProviderContext, *, legacy: bool = True) -> Principal:
+    if (
+        request.method == "GET"
+        and request.query_params.get("key")
+        and not request.headers.get("authorization")
+        and not request.query_params.get("access_token")
+    ):
+        # An API key identifies the calling app, never a domain user.
+        return Principal(None, True, "anonymous")
     actor = google_principal(request, ctx, legacy=legacy)
     write = request.method not in ("GET", "HEAD") and not request.url.path.endswith(
         ("/watch", "/channels/stop")
@@ -152,7 +160,11 @@ def applies(ctx: ProviderContext, perm: dict[str, Any], actor: Principal, *, kno
     if perm["type"] == "anyone":
         return known_id or perm.get("allowFileDiscovery", False)
     if perm["type"] == "domain":
-        return "@" in email and email.split("@")[-1] == perm.get("domain")
+        return (
+            (known_id or perm.get("allowFileDiscovery", False))
+            and "@" in email
+            and email.split("@")[-1] == perm.get("domain")
+        )
     if perm["type"] == "user":
         return email.lower() == str(perm.get("emailAddress", "")).lower()
     if perm["type"] == "group" and actor.person_id:
@@ -237,6 +249,8 @@ def store_binary(ctx: ProviderContext, row: dict[str, Any], data: bytes) -> None
 
 
 def export_content(ctx: ProviderContext, row: dict[str, Any], mime: str) -> bytes:
+    if row["mimeType"] not in NATIVE:
+        raise google_error(403, "Export only supports Docs Editors files.", reason="fileNotExportable")
     kind = EXPORTS.get(row["mimeType"], {}).get(mime)
     if not kind:
         raise google_error(
@@ -349,6 +363,16 @@ def file_shape(
         result["thumbnailLink"] = url_for_host(
             request, ctx, "drive.google.com", f"/thumbnail?id={row['id']}&sz=s220"
         )
+    for field in (
+        "createdTime",
+        "modifiedTime",
+        "modifiedByMeTime",
+        "viewedByMeTime",
+        "sharedWithMeTime",
+        "trashedTime",
+    ):
+        if result.get(field):
+            result[field] = isoformat_z(parse_instant(result[field]), timespec="milliseconds")
     return result
 
 
