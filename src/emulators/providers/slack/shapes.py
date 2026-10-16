@@ -16,7 +16,6 @@ from emulators.providers.slack.util import (
     clean,
     message_permalink,
     stable_id,
-    ts_key,
 )
 
 TZ_LABELS: dict[str, tuple[str, str]] = {
@@ -273,8 +272,8 @@ def message_json(
             if (f := ctx.store.collection(access.FILES).get(fid)) and not f.get("_deleted")
         ]
         out["files"] = files
-        out["upload"] = False
-        out["display_as_bot"] = False
+        out.setdefault("upload", False)
+        out.setdefault("display_as_bot", False)
     if rec.get("bot_id") and "bot_profile" not in out:
         profile = bot_profile(ctx, rec["bot_id"])
         if profile:
@@ -288,10 +287,6 @@ def message_json(
         if parent is not None:
             out["root"] = message_json(ctx, request, actor, parent, root=False)
     return out
-
-
-def reaction_items(rec: dict[str, Any]) -> list[dict[str, Any]]:
-    return [dict(r) for r in rec.get("reactions", [])]
 
 
 def permalink_for(rec: dict[str, Any]) -> str:
@@ -312,7 +307,3 @@ def usergroup_json(
     if include_count:
         out["user_count"] = len(users)
     return out
-
-
-def sort_by_ts(messages: list[dict[str, Any]], *, newest_first: bool = False) -> list[dict[str, Any]]:
-    return sorted(messages, key=lambda m: ts_key(m["ts"]), reverse=newest_first)

@@ -13,22 +13,83 @@ from emulators.providers.slack.util import digits_from, stable_id
 
 #: Scopes a typical Slack app requests. ``chat:write.public``/``chat:write.customize`` are left
 #: out of the default bot token on purpose so ``not_in_channel`` can be exercised.
-BOT_SCOPES = (
-    "app_mentions:read,bookmarks:read,bookmarks:write,channels:history,channels:join,channels:manage,"
-    "channels:read,chat:write,commands,dnd:read,emoji:read,files:read,files:write,groups:history,"
-    "groups:read,groups:write,im:history,im:read,im:write,incoming-webhook,mpim:history,mpim:read,"
-    "mpim:write,pins:read,pins:write,reactions:read,reactions:write,team:read,usergroups:read,"
-    "usergroups:write,users.profile:read,users:read,users:read.email"
-).split(",")
-BOT_SCOPES_FULL = sorted({*BOT_SCOPES, "chat:write.public", "chat:write.customize", "links:read", "links:write"})
+BOT_SCOPES = [
+    "app_mentions:read",
+    "bookmarks:read",
+    "bookmarks:write",
+    "channels:history",
+    "channels:join",
+    "channels:manage",
+    "channels:read",
+    "chat:write",
+    "commands",
+    "dnd:read",
+    "emoji:read",
+    "files:read",
+    "files:write",
+    "groups:history",
+    "groups:read",
+    "groups:write",
+    "im:history",
+    "im:read",
+    "im:write",
+    "incoming-webhook",
+    "mpim:history",
+    "mpim:read",
+    "mpim:write",
+    "pins:read",
+    "pins:write",
+    "reactions:read",
+    "reactions:write",
+    "team:read",
+    "usergroups:read",
+    "usergroups:write",
+    "users.profile:read",
+    "users:read",
+    "users:read.email",
+]
+BOT_SCOPES_FULL = sorted(
+    {*BOT_SCOPES, "chat:write.public", "chat:write.customize", "links:read", "links:write"}
+)
 BOT_SCOPES_READONLY = ["channels:read", "groups:read", "users:read", "team:read"]
-USER_SCOPES = (
-    "bookmarks:read,bookmarks:write,channels:history,channels:read,channels:write,chat:write,dnd:read,"
-    "dnd:write,emoji:read,files:read,files:write,groups:history,groups:read,groups:write,identify,"
-    "im:history,im:read,im:write,mpim:history,mpim:read,mpim:write,pins:read,pins:write,reactions:read,"
-    "reactions:write,search:read,team:read,usergroups:read,usergroups:write,users.profile:read,"
-    "users.profile:write,users:read,users:read.email,users:write"
-).split(",")
+USER_SCOPES = [
+    "bookmarks:read",
+    "bookmarks:write",
+    "channels:history",
+    "channels:read",
+    "channels:write",
+    "chat:write",
+    "dnd:read",
+    "dnd:write",
+    "emoji:read",
+    "files:read",
+    "files:write",
+    "groups:history",
+    "groups:read",
+    "groups:write",
+    "identify",
+    "im:history",
+    "im:read",
+    "im:write",
+    "mpim:history",
+    "mpim:read",
+    "mpim:write",
+    "pins:read",
+    "pins:write",
+    "reactions:read",
+    "reactions:write",
+    "reminders:read",
+    "reminders:write",
+    "search:read",
+    "team:read",
+    "usergroups:read",
+    "usergroups:write",
+    "users.profile:read",
+    "users.profile:write",
+    "users:read",
+    "users:read.email",
+    "users:write",
+]
 APP_SCOPES = ["connections:write", "authorizations:read", "app_configurations:write"]
 
 STATUSES = (
@@ -205,8 +266,18 @@ def seed_users(ctx: ProviderContext) -> dict[str, str]:
         tz="America/Los_Angeles",
         updated=founded,
     )
-    slackbot["profile"].update({"always_active": True, "email": None, "title": "", "image_original": None})
     slackbot["profile"].pop("email")
+    slackbot["profile"].pop("image_original", None)
+    slackbot["profile"].update(
+        {
+            "always_active": True,
+            "first_name": "slackbot",
+            **{
+                f"image_{size}": f"https://a.slack-edge.com/80588/img/slackbot_{size}.png"
+                for size in (24, 32, 48, 72, 192, 512)
+            },
+        }
+    )
     slackbot["_presence"] = "active"
     users.put(slackbot)
     for person in w.employees:
@@ -309,7 +380,12 @@ def seed_users(ctx: ProviderContext) -> dict[str, str]:
 
 def seed_usergroups(ctx: ProviderContext, mapping: dict[str, str], channels: dict[str, str]) -> None:
     w = ctx.world
-    handles = {"g-partners": "partners", "g-leadership": "leadership", "g-managers": "managers", "g-it-admins": "it-admins"}
+    handles = {
+        "g-partners": "partners",
+        "g-leadership": "leadership",
+        "g-managers": "managers",
+        "g-it-admins": "it-admins",
+    }
     default_channel = {
         "audit": "audit-general",
         "tax": "tax-general",
@@ -401,7 +477,9 @@ def seed_tokens(ctx: ProviderContext, mapping: dict[str, str]) -> None:
         )
 
     def bot_token(label: str) -> str:
-        return f"xoxb-{team_digits}-{digits_from(label, 'a', length=13)}-{stable_hash('xoxb', label, length=24)}"
+        return (
+            f"xoxb-{team_digits}-{digits_from(label, 'a', length=13)}-{stable_hash('xoxb', label, length=24)}"
+        )
 
     def user_token(person: str) -> str:
         return (

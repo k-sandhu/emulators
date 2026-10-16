@@ -50,22 +50,29 @@ MAX_BLOCKS = 50
 
 
 def _styled(text: str, style: dict[str, bool] | None = None) -> list[dict[str, Any]]:
-    """Split plain text into ``text`` elements, applying mrkdwn styles recursively."""
+    """Split plain text into ``text`` elements, applying mrkdwn styles (nested ones merge)."""
     if not text:
         return []
+    best: tuple[str, re.Match[str]] | None = None
     for name, pattern in _STYLES:
         match = pattern.search(text)
-        if match:
-            merged = {**(style or {}), name: True}
-            inner = match.group(1)
-            parts = _styled(text[: match.start()], style)
-            parts += [{"type": "text", "text": unescape_text(inner), "style": merged}]
-            parts += _styled(text[match.end() :], style)
-            return parts
-    element: dict[str, Any] = {"type": "text", "text": unescape_text(text)}
-    if style:
-        element["style"] = dict(style)
-    return [element]
+        if match and (
+            best is None or (match.start(), -len(match.group(0))) < (best[1].start(), -len(best[1].group(0)))
+        ):
+            best = (name, match)
+    if best is None:
+        element: dict[str, Any] = {"type": "text", "text": unescape_text(text)}
+        if style:
+            element["style"] = dict(style)
+        return [element]
+    name, match = best
+    merged = {**(style or {}), name: True}
+    inner = (
+        _styled(match.group(1), merged)
+        if name != "code"
+        else [{"type": "text", "text": unescape_text(match.group(1)), "style": merged}]
+    )
+    return _styled(text[: match.start()], style) + inner + _styled(text[match.end() :], style)
 
 
 def inline_elements(text: str) -> list[dict[str, Any]]:
@@ -128,7 +135,10 @@ def text_to_blocks(text: str, seed: str) -> list[dict[str, Any]]:
                     body.append(lines[index].split("```")[0])
             code = "\n".join(body).strip("\n")
             elements.append(
-                {"type": "rich_text_preformatted", "elements": [{"type": "text", "text": unescape_text(code)}]}
+                {
+                    "type": "rich_text_preformatted",
+                    "elements": [{"type": "text", "text": unescape_text(code)}],
+                }
             )
         elif line.startswith("&gt;") or line.startswith(">"):
             flush_plain()
@@ -172,7 +182,9 @@ def validate_blocks(blocks: Any, seed: str) -> list[dict[str, Any]]:
         if not isinstance(block, dict) or not isinstance(block.get("type"), str):
             raise SlackError(
                 "invalid_blocks",
-                response_metadata={"messages": [f"[ERROR] must provide a valid type (json-pointer: /blocks/{index})"]},
+                response_metadata={
+                    "messages": [f"[ERROR] must provide a valid type (json-pointer: /blocks/{index})"]
+                },
             )
         if block["type"] not in BLOCK_TYPES:
             raise SlackError(

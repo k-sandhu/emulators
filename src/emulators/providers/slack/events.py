@@ -169,8 +169,7 @@ async def emit_message(ctx: ProviderContext, channel: dict[str, Any], rec: dict[
     if not config.get("request_url"):
         return
     kind = access.channel_kind(channel)
-    own = rec.get("user") == config["bot_user_id"] or (rec.get("bot_id") or "") == config["bot_id"]
-    if not own:
+    if not _own(config, rec):
         await emit(
             ctx,
             {"type": "message", **message_event_body(ctx, channel, rec)},
@@ -193,9 +192,16 @@ async def emit_message(ctx: ProviderContext, channel: dict[str, Any], rec: dict[
             await emit(ctx, mention, channel=channel)
 
 
+def _own(config: dict[str, Any], rec: dict[str, Any]) -> bool:
+    """Messages authored by the app's own bot user are never sent back to the app."""
+    return rec.get("user") == config["bot_user_id"] or (rec.get("bot_id") or "") == config["bot_id"]
+
+
 async def emit_message_changed(
     ctx: ProviderContext, channel: dict[str, Any], new: dict[str, Any], previous: dict[str, Any]
 ) -> None:
+    if _own(access.app_config(ctx), new):
+        return
     event = {
         "type": "message",
         "subtype": "message_changed",
@@ -210,7 +216,11 @@ async def emit_message_changed(
     await emit(ctx, event, subscription=MESSAGE_SUBSCRIPTIONS[access.channel_kind(channel)], channel=channel)
 
 
-async def emit_message_deleted(ctx: ProviderContext, channel: dict[str, Any], previous: dict[str, Any]) -> None:
+async def emit_message_deleted(
+    ctx: ProviderContext, channel: dict[str, Any], previous: dict[str, Any]
+) -> None:
+    if _own(access.app_config(ctx), previous):
+        return
     stamp = _event_ts(ctx)
     event = {
         "type": "message",
@@ -298,7 +308,12 @@ async def emit_channel_event(
 
 
 async def emit_pin(
-    ctx: ProviderContext, added: bool, channel: dict[str, Any], rec: dict[str, Any], uid: str, pin: dict[str, Any]
+    ctx: ProviderContext,
+    added: bool,
+    channel: dict[str, Any],
+    rec: dict[str, Any],
+    uid: str,
+    pin: dict[str, Any],
 ) -> None:
     pins = ctx.store.collection(access.PINS).filter(lambda p: p["channel"] == channel["id"])
     event = {

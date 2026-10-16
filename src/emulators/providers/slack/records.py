@@ -53,7 +53,11 @@ def make_channel(
         "creator": creator,
         "updated": created * 1000,
         "topic": {"value": topic, "creator": creator if topic else "", "last_set": created if topic else 0},
-        "purpose": {"value": purpose, "creator": creator if purpose else "", "last_set": created if purpose else 0},
+        "purpose": {
+            "value": purpose,
+            "creator": creator if purpose else "",
+            "last_set": created if purpose else 0,
+        },
         "previous_names": [],
         "_members": list(dict.fromkeys(members)),
         "_marks": {},

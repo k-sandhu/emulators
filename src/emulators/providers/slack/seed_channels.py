@@ -8,6 +8,7 @@ from typing import Any
 from emulators.core.ids import stable_guid, stable_hash
 from emulators.core.provider import ProviderContext
 from emulators.providers.slack import access
+from emulators.providers.slack.incoming import create_webhook
 from emulators.providers.slack.messages import refresh_thread
 from emulators.providers.slack.records import make_channel
 from emulators.providers.slack.richtext import text_to_blocks
@@ -197,7 +198,9 @@ class Seeder:
         if files:
             rec["_files"] = files
             for fid in files:
-                access.col(self.ctx, access.FILES).get(fid)["_shares"].append({"channel": channel["id"], "ts": ts})
+                access.col(self.ctx, access.FILES).get(fid)["_shares"].append(
+                    {"channel": channel["id"], "ts": ts}
+                )
         access.col(self.ctx, access.MESSAGES).put(rec)
         if ts_key(ts) > ts_key(channel["_last_ts"]):
             channel["_last_ts"] = ts
@@ -288,7 +291,9 @@ class Seeder:
                 self.load_messages(record, ch.messages, attachments)
                 index += 1
 
-    def _channel_attachments(self, name: str, messages: tuple[ChatMessage, ...], team: Team) -> dict[str, list[str]]:
+    def _channel_attachments(
+        self, name: str, messages: tuple[ChatMessage, ...], team: Team
+    ) -> dict[str, list[str]]:
         found: dict[str, list[str]] = {}
         if team.client_id:
             docs = self.docs_by_client.get(team.client_id, [])
@@ -315,14 +320,18 @@ class Seeder:
         w = self.w
         for client_id in EXT_CLIENTS:
             client = w.client(client_id)
-            engagement = next((e for e in w.engagements if e.client_id == client_id and e.status == "In Progress"), None)
+            engagement = next(
+                (e for e in w.engagements if e.client_id == client_id and e.status == "In Progress"), None
+            )
             if engagement is None:
                 continue
             name = f"ext-{slugify(client.name)}"
             lead = self.mapping[engagement.lead_id]
             internal = self.uids([engagement.lead_id, *engagement.team_ids])
             contacts = [self.mapping[c] for c in client.contact_ids if c in self.mapping]
-            base = datetime(w.anchor.year, w.anchor.month, w.anchor.day, 15, 0, tzinfo=UTC) - timedelta(days=14)
+            base = datetime(w.anchor.year, w.anchor.month, w.anchor.day, 15, 0, tzinfo=UTC) - timedelta(
+                days=14
+            )
             record = make_channel(
                 self.ctx,
                 channel_id=stable_id("C", "ext", client_id),
@@ -340,11 +349,23 @@ class Seeder:
             first_contact = w.person(client.contact_ids[0])
             second_contact = w.person(client.contact_ids[min(1, len(client.contact_ids) - 1)])
             script = [
-                (lead_person, f"Welcome to the shared channel, {first_contact.first_name}! "
-                 f"We'll coordinate the {engagement.service.lower()} work here.", None),
-                (first_contact, f"Thanks {lead_person.first_name}, glad to be connected. "
-                 "We'll post documents as they're ready.", None),
-                (lead_person, "Sharing the request list this week. Let us know if anything needs more time.", None),
+                (
+                    lead_person,
+                    f"Welcome to the shared channel, {first_contact.first_name}! "
+                    f"We'll coordinate the {engagement.service.lower()} work here.",
+                    None,
+                ),
+                (
+                    first_contact,
+                    f"Thanks {lead_person.first_name}, glad to be connected. "
+                    "We'll post documents as they're ready.",
+                    None,
+                ),
+                (
+                    lead_person,
+                    "Sharing the request list this week. Let us know if anything needs more time.",
+                    None,
+                ),
                 (second_contact, "Received, we'll review it with the team and confirm timing by Friday.", 2),
                 (lead_person, "Perfect, thank you both.", None),
             ]
@@ -431,7 +452,11 @@ class Seeder:
             cid = self.names.get(name)
             if not cid:
                 continue
-            top = [m for m in access.channel_messages(self.ctx, cid) if not m.get("thread_ts") or m["thread_ts"] == m["ts"]]
+            top = [
+                m
+                for m in access.channel_messages(self.ctx, cid)
+                if not m.get("thread_ts") or m["thread_ts"] == m["ts"]
+            ]
             if top:
                 message = top[0]
                 access.col(self.ctx, access.PINS).put(
@@ -478,43 +503,9 @@ class Seeder:
         for name in WEBHOOK_CHANNELS:
             cid = self.names.get(name)
             if cid:
-                create_webhook(self.ctx, cid, created_by=admin, created=created, label=f"Halcyon alerts #{name}")
-
-
-def create_webhook(
-    ctx: ProviderContext, channel_id: str, *, created_by: str, created: int, label: str, seed: str = ""
-) -> dict[str, Any]:
-    """Register an incoming webhook (and its own ``B...`` bot id) for a channel."""
-    team = access.team_id(ctx)
-    app = access.app_config(ctx)
-    bot_id = stable_id("B", "webhook", channel_id, seed)
-    secret = stable_hash("slack-webhook-secret", channel_id, seed, length=24)
-    record = {
-        "id": f"{team}/{bot_id}/{secret}",
-        "channel_id": channel_id,
-        "bot_id": bot_id,
-        "app_id": app["app_id"],
-        "label": label,
-        "created": created,
-        "created_by": created_by,
-    }
-    access.col(ctx, access.WEBHOOKS).put(record)
-    ctx.store.collection("bots").put(
-        {
-            "id": bot_id,
-            "app_id": app["app_id"],
-            "user_id": app["bot_user_id"],
-            "name": "incoming-webhook",
-            "updated": created,
-            "deleted": False,
-            "icons": {
-                "image_36": "https://a.slack-edge.com/80588/img/plugins/incoming-webhook/service_36.png",
-                "image_48": "https://a.slack-edge.com/80588/img/plugins/incoming-webhook/service_48.png",
-                "image_72": "https://a.slack-edge.com/80588/img/plugins/incoming-webhook/service_72.png",
-            },
-        }
-    )
-    return record
+                create_webhook(
+                    self.ctx, cid, created_by=admin, created=created, label=f"Halcyon alerts #{name}"
+                )
 
 
 def seed_conversations(ctx: ProviderContext, mapping: dict[str, str]) -> dict[str, str]:

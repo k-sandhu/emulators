@@ -89,7 +89,7 @@ async def create_message(
         rec["app_id"] = app_id
     if blocks is not None:
         rec["blocks"] = validate_blocks(blocks, stamp)
-    elif text and (not subtype or subtype in ("thread_broadcast", "bot_message", "me_message")):
+    elif text and (not subtype or subtype in ("thread_broadcast", "bot_message", "me_message", "file_share")):
         generated = text_to_blocks(text, stamp)
         if generated:
             rec["blocks"] = generated
@@ -299,4 +299,3 @@ async def process_scheduled(ctx: ProviderContext) -> None:
 
 
 BEFORE_CALL.append(process_scheduled)
-

@@ -73,7 +73,9 @@ def resolve_user_ref(ctx: ProviderContext, ref: str | None) -> dict[str, Any] | 
     """A Slack id, world person id (``p018``) or e-mail address -> user record."""
     if not ref:
         return None
-    return user_by_id(ctx, ref) or user_by_person(ctx, ref) or (user_by_email(ctx, ref) if "@" in ref else None)
+    return (
+        user_by_id(ctx, ref) or user_by_person(ctx, ref) or (user_by_email(ctx, ref) if "@" in ref else None)
+    )
 
 
 def actor_user(ctx: ProviderContext, actor: Actor) -> dict[str, Any]:
@@ -114,10 +116,6 @@ def channel_by_name(ctx: ProviderContext, name: str) -> dict[str, Any] | None:
         if channel.get("name_normalized") == wanted or wanted in channel.get("previous_names", []):
             return channel
     return None
-
-
-def members(channel: dict[str, Any]) -> list[str]:
-    return channel["_members"]
 
 
 def is_member(channel: dict[str, Any], uid: str) -> bool:
@@ -161,18 +159,7 @@ def require_readable(ctx: ProviderContext, actor: Actor, channel_id: str | None)
     return channel
 
 
-def require_postable(ctx: ProviderContext, actor: Actor, channel_id: str | None) -> dict[str, Any]:
-    channel = require_channel(ctx, actor, channel_id)
-    if channel.get("is_archived"):
-        raise SlackError("is_archived")
-    if is_member(channel, actor.uid):
-        return channel
-    if actor.is_bot and channel_kind(channel) == "public" and actor.has("chat:write.public"):
-        return channel
-    raise SlackError("not_in_channel")
-
-
-def conversation_scope(channel: dict[str, Any], action: str, actor_kind: str = "bot") -> tuple[str, ...]:
+def conversation_scope(channel: dict[str, Any], action: str) -> tuple[str, ...]:
     """Scopes (any one suffices) that unlock ``read``/``history``/``write`` on this conversation type."""
     family = {"public": "channels", "private": "groups", "im": "im", "mpim": "mpim"}[channel_kind(channel)]
     if action == "write":
@@ -234,10 +221,3 @@ def new_ts(ctx: ProviderContext, channel: dict[str, Any] | None = None) -> str:
             candidate = bump_ts(last, 100)
         channel["_last_ts"] = candidate
     return candidate
-
-
-def conversation_counts(ctx: ProviderContext) -> dict[str, int]:
-    counts: dict[str, int] = {}
-    for channel in col(ctx, CHANNELS):
-        counts[channel_kind(channel)] = counts.get(channel_kind(channel), 0) + 1
-    return counts

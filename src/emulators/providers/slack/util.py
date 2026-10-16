@@ -44,10 +44,6 @@ def ts_from_datetime(moment: datetime) -> str:
     return format_ts(int(moment.timestamp()), moment.microsecond)
 
 
-def ts_to_epoch(value: object) -> int:
-    return ts_key(value)[0]
-
-
 def ts_to_float(value: object) -> float:
     sec, micro = ts_key(value)
     return sec + micro / 1_000_000
@@ -115,7 +111,3 @@ def clean(record: dict[str, Any], *, keep_id: bool = True) -> dict[str, Any]:
 def digits_from(*parts: object, length: int = 12) -> str:
     """Stable numeric string, used for the numeric segments of ``xoxb-`` style tokens."""
     return str(int(stable_hash("slack-digits", *parts, length=16), 16))[:length].rjust(length, "1")
-
-
-def first_line(text: str, limit: int = 80) -> str:
-    return text.strip().splitlines()[0][:limit] if text.strip() else ""

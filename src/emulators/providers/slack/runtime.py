@@ -21,6 +21,7 @@ from emulators.core.auth import Grant, bearer_token
 from emulators.core.clock import utc
 from emulators.core.provider import ProviderContext
 
+JSON_TYPE = "application/json; charset=utf-8"
 BOT = "bot"
 USER = "user"
 APP = "app"
@@ -83,7 +84,8 @@ class Params:
         value = self.str(name)
         if value is None:
             raise SlackError(
-                "invalid_arguments", response_metadata={"messages": [f"[ERROR] missing required field: {name}"]}
+                "invalid_arguments",
+                response_metadata={"messages": [f"[ERROR] missing required field: {name}"]},
             )
         return value
 
@@ -302,7 +304,9 @@ def _headers(spec: Method | None, actor: Actor | None, request_id: str) -> dict[
 
 
 def failure(error: SlackError, headers: dict[str, str] | None = None) -> JSONResponse:
-    return JSONResponse({"ok": False, "error": error.error, **error.extra}, headers=headers)
+    return JSONResponse(
+        {"ok": False, "error": error.error, **error.extra}, headers=headers, media_type=JSON_TYPE
+    )
 
 
 async def dispatch(ctx: ProviderContext, request: Request, method_name: str) -> Response:
@@ -333,4 +337,4 @@ async def dispatch(ctx: ProviderContext, request: Request, method_name: str) -> 
         meta = dict(body.get("response_metadata") or {})
         meta["warnings"] = list(dict.fromkeys([*meta.get("warnings", []), *call.warnings]))
         body["response_metadata"] = meta
-    return JSONResponse(body, headers=_headers(spec, actor, request_id))
+    return JSONResponse(body, headers=_headers(spec, actor, request_id), media_type=JSON_TYPE)
