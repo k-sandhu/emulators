@@ -146,11 +146,10 @@ Use the identity/subscriptions module's `/subscriptions` endpoints. Validation e
 signature: subscribers validate their configured clientState. All network delivery
 uses `ctx.webhooks`, including in-process test receivers.
 
-Drive writes publish `drives/{driveId}/root` changes. A local compatibility bridge
-delivers exact-root subscriptions when the shared listener only matches descendants;
-it checks the delivery journal to avoid duplicate delivery. Teams posts/edits publish
-their channel/chat message resource. Artifact actions publish user and communications
-resource paths, and meeting completion publishes its call record.
+Drive writes publish `drives/{driveId}/root` changes. Teams posts/edits publish their
+channel/chat message resource. Artifact actions publish user resource changes, which
+the shared subscriptions listener matches to communications subscriptions; meeting
+completion also publishes its call record. All notifications use the common change bus.
 
 | Action | Payload | Result |
 |---|---|---|

@@ -392,12 +392,6 @@ async def add_transcript(ctx: ProviderContext, payload: dict[str, Any]) -> dict[
         "created",
         dm.public(transcript),
     )
-    await common.publish_change(
-        ctx,
-        f"communications/onlineMeetings/{meeting['id']}/transcripts/{transcript['id']}",
-        "created",
-        dm.public(transcript),
-    )
     return dm.public(transcript)
 
 
@@ -434,12 +428,6 @@ async def end_meeting(ctx: ProviderContext, payload: dict[str, Any]) -> dict[str
         await common.publish_change(
             ctx,
             f"users/{uid}/onlineMeetings/{meeting['id']}/recordings/{recording['id']}",
-            "created",
-            dm.public(recording),
-        )
-        await common.publish_change(
-            ctx,
-            f"communications/onlineMeetings/{meeting['id']}/recordings/{recording['id']}",
             "created",
             dm.public(recording),
         )

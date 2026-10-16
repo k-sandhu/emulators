@@ -6,7 +6,6 @@ import base64
 import copy
 import hashlib
 import io
-import json
 import mimetypes
 import re
 import secrets
@@ -603,47 +602,7 @@ async def changed(ctx: ProviderContext, item: dict[str, Any], change: str = "upd
         {"id": str(sequence), "drive": item["_drive"], "item": copy.deepcopy(item)}
     )
     resource = f"drives/{item['_drive']}/root"
-    before = {d["id"] for d in ctx.webhooks.deliveries}
     await common.publish_change(ctx, resource, "updated", public(item))
-    # Root notifications describe the root itself. Older bus listeners match only
-    # descendants; fill in undelivered subscriptions without duplicating newer listeners.
-    drive = ctx.store[DRIVES].get(item["_drive"])
-    aliases = {resource, f"users/{common.user_id(ctx.world, drive['_owner'])}/drive/root"}
-    for subscription in ctx.store["subscriptions"]:
-        if (
-            subscription.get("_resource") not in aliases
-            or "updated" not in subscription.get("changeType", "").split(",")
-            or parse_instant(subscription["expirationDateTime"]) <= ctx.clock.now()
-        ):
-            continue
-        if any(
-            d["id"] not in before and d.get("metadata", {}).get("subscriptionId") == subscription["id"]
-            for d in ctx.webhooks.deliveries
-        ):
-            continue
-        body = {
-            "value": [
-                {
-                    "subscriptionId": subscription["id"],
-                    "subscriptionExpirationDateTime": subscription["expirationDateTime"],
-                    "changeType": "updated",
-                    "resource": subscription["_resource"],
-                    "resourceData": {
-                        "@odata.type": "#microsoft.graph.driveItem",
-                        "@odata.id": subscription["_resource"],
-                        "id": drive["_root"],
-                    },
-                    "clientState": subscription.get("clientState"),
-                    "tenantId": common.tenant_id(ctx.world),
-                }
-            ]
-        }
-        await ctx.webhooks.deliver(
-            subscription["notificationUrl"],
-            json.dumps(body).encode(),
-            event_type="updated",
-            metadata={"subscriptionId": subscription["id"]},
-        )
 
 
 def delta_token(

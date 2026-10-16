@@ -82,7 +82,9 @@ async def test_engagement_tracker_mutations_and_site_permissions(make_client: Ca
         seeded = (await client.get(url, headers=writer, params={"$expand": "fields"})).json()["value"]
         assert len(seeded) == len(client.hub.world.engagements)
         first_title = seeded[0]["fields"]["Title"].replace("'", "''")
-        filtered = (await client.get(url, headers=writer, params={"$filter": f"fields/Title eq '{first_title}'"})).json()["value"]
+        filtered = (
+            await client.get(url, headers=writer, params={"$filter": f"fields/Title eq '{first_title}'"})
+        ).json()["value"]
         assert filtered and filtered[0]["id"] == seeded[0]["id"] and "fields" not in filtered[0]
         assert set(seeded[0]["fields"]) >= {
             "Title",

@@ -265,7 +265,10 @@ async def list_dispatch(
                 search_fields=("fields/Title",),
             )
             sources = {r["id"]: r for r in records}
-            result["value"] = [list_wire(request, ctx, {**r, "_drive_item": sources[r["id"]].get("_drive_item")}) for r in result["value"]]
+            result["value"] = [
+                list_wire(request, ctx, {**r, "_drive_item": sources[r["id"]].get("_drive_item")})
+                for r in result["value"]
+            ]
             return result
         if request.method == "POST":
             require_site(ctx, site["id"], p, write=True)

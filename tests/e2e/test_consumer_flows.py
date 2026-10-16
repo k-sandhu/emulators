@@ -119,10 +119,14 @@ async def test_parlance_teams_import(make_client) -> None:
             assert len(meetings) == 1
             mid = meetings[0]["id"]
             transcripts = (
-                await client.get(f"https://graph.microsoft.com/v1.0/me/onlineMeetings/{mid}/transcripts", headers=auth)
+                await client.get(
+                    f"https://graph.microsoft.com/v1.0/me/onlineMeetings/{mid}/transcripts", headers=auth
+                )
             ).json()["value"]
             recordings = (
-                await client.get(f"https://graph.microsoft.com/v1.0/me/onlineMeetings/{mid}/recordings", headers=auth)
+                await client.get(
+                    f"https://graph.microsoft.com/v1.0/me/onlineMeetings/{mid}/recordings", headers=auth
+                )
             ).json()["value"]
             if transcripts:
                 vtt = await client.get(
@@ -174,8 +178,12 @@ async def test_parlance_zoom_import(make_client) -> None:
         )
         token = await client.post(
             "https://zoom.us/oauth/token",
-            data={"grant_type": "authorization_code", "code": query["code"][0], "redirect_uri": REDIRECT,
-                  "code_verifier": verifier},
+            data={
+                "grant_type": "authorization_code",
+                "code": query["code"][0],
+                "redirect_uri": REDIRECT,
+                "code_verifier": verifier,
+            },
             auth=("parlance-zoom", "secret"),
         )
         assert token.status_code == 200, token.text
@@ -186,8 +194,12 @@ async def test_parlance_zoom_import(make_client) -> None:
         while True:
             r = await client.get(
                 "https://api.zoom.us/v2/users/me/recordings",
-                params={"from": str(today - timedelta(days=29)), "to": str(today), "page_size": 30,
-                        "next_page_token": next_token},
+                params={
+                    "from": str(today - timedelta(days=29)),
+                    "to": str(today),
+                    "page_size": 30,
+                    "next_page_token": next_token,
+                },
                 headers=auth,
             )
             assert r.status_code == 200, r.text
@@ -196,18 +208,19 @@ async def test_parlance_zoom_import(make_client) -> None:
             if not next_token:
                 break
         assert meetings, "Maya hosts recorded Zoom meetings in the last 30 days"
-        downloaded = 0
-        for meeting in meetings:
-            r = await client.get(f"https://api.zoom.us/v2/meetings/{zoom_uuid_path(meeting['uuid'])}/recordings",
-                                 headers=auth)
+        for downloaded, meeting in enumerate(meetings, start=1):
+            r = await client.get(
+                f"https://api.zoom.us/v2/meetings/{zoom_uuid_path(meeting['uuid'])}/recordings", headers=auth
+            )
             assert r.status_code == 200, r.text
             files = [f for f in r.json()["recording_files"] if f.get("status") == "completed"]
-            best = next((f for t in ("VTT", "M4A", "MP4") for f in files if f.get("file_extension") == t), None)
+            best = next(
+                (f for t in ("VTT", "M4A", "MP4") for f in files if f.get("file_extension") == t), None
+            )
             assert best is not None
             content = await client.get(best["download_url"], headers=auth, follow_redirects=True)
             assert content.status_code == 200
             assert content.content
-            downloaded += 1
             if downloaded >= 3:
                 break
 
@@ -225,8 +238,10 @@ async def test_parlance_google_meet_import(make_client) -> None:
         auth = bearer(token)
         r = await client.get(
             "https://meet.googleapis.com/v2/conferenceRecords",
-            params={"filter": 'start_time>="2026-09-01T00:00:00Z" AND end_time<="2026-10-17T00:00:00Z"',
-                    "pageSize": 15},
+            params={
+                "filter": 'start_time>="2026-09-01T00:00:00Z" AND end_time<="2026-10-17T00:00:00Z"',
+                "pageSize": 15,
+            },
             headers=auth,
         )
         assert r.status_code == 200, r.text
@@ -235,24 +250,45 @@ async def test_parlance_google_meet_import(make_client) -> None:
         got_recording = False
         for record in records:
             name = record["name"]
-            assert (await client.get(f"https://meet.googleapis.com/v2/{name}", headers=auth)).status_code == 200
-            participants = (await client.get(f"https://meet.googleapis.com/v2/{name}/participants",
-                                             headers=auth)).json().get("participants", [])
+            assert (
+                await client.get(f"https://meet.googleapis.com/v2/{name}", headers=auth)
+            ).status_code == 200
+            participants = (
+                (await client.get(f"https://meet.googleapis.com/v2/{name}/participants", headers=auth))
+                .json()
+                .get("participants", [])
+            )
             assert participants
-            transcripts = (await client.get(f"https://meet.googleapis.com/v2/{name}/transcripts",
-                                            headers=auth)).json().get("transcripts", [])
+            transcripts = (
+                (await client.get(f"https://meet.googleapis.com/v2/{name}/transcripts", headers=auth))
+                .json()
+                .get("transcripts", [])
+            )
             for transcript in transcripts:
                 if transcript.get("state") == "FILE_GENERATED":
-                    entries = (await client.get(f"https://meet.googleapis.com/v2/{transcript['name']}/entries",
-                                                headers=auth)).json().get("transcriptEntries", [])
+                    entries = (
+                        (
+                            await client.get(
+                                f"https://meet.googleapis.com/v2/{transcript['name']}/entries", headers=auth
+                            )
+                        )
+                        .json()
+                        .get("transcriptEntries", [])
+                    )
                     assert entries and entries[0]["text"]
-            recordings = (await client.get(f"https://meet.googleapis.com/v2/{name}/recordings",
-                                           headers=auth)).json().get("recordings", [])
+            recordings = (
+                (await client.get(f"https://meet.googleapis.com/v2/{name}/recordings", headers=auth))
+                .json()
+                .get("recordings", [])
+            )
             for recording in recordings:
                 if recording.get("state") == "FILE_GENERATED":
                     file_id = recording["driveDestination"]["file"]
-                    media = await client.get(f"https://www.googleapis.com/drive/v3/files/{file_id}",
-                                             params={"alt": "media"}, headers=auth)
+                    media = await client.get(
+                        f"https://www.googleapis.com/drive/v3/files/{file_id}",
+                        params={"alt": "media"},
+                        headers=auth,
+                    )
                     assert media.status_code == 200, media.text[:300]
                     assert media.content[4:8] == b"ftyp"
                     got_recording = True
@@ -269,24 +305,41 @@ async def test_parlance_google_meet_import(make_client) -> None:
 async def test_lumen_copilot_drive_sync(make_client) -> None:
     requires("emulators.providers.google.drive")
     async with make_client("google") as client:
-        auth = bearer(await mint(client, "https://www.googleapis.com", user="p018",
-                                 scopes=["https://www.googleapis.com/auth/drive.readonly"]))
+        auth = bearer(
+            await mint(
+                client,
+                "https://www.googleapis.com",
+                user="p018",
+                scopes=["https://www.googleapis.com/auth/drive.readonly"],
+            )
+        )
         base = "https://www.googleapis.com/drive/v3"
         about = await client.get(f"{base}/about", params={"fields": "user(emailAddress)"}, headers=auth)
         assert about.json() == {"user": {"emailAddress": "maya.chen@halcyonadvisory.example"}}
         drives = (await client.get(f"{base}/drives", headers=auth)).json()["drives"]
         assert drives
         drive_id = drives[0]["id"]
-        start = (await client.get(f"{base}/changes/startPageToken", params={"driveId": drive_id,
-                                  "supportsAllDrives": "true"}, headers=auth)).json()["startPageToken"]
+        start = (
+            await client.get(
+                f"{base}/changes/startPageToken",
+                params={"driveId": drive_id, "supportsAllDrives": "true"},
+                headers=auth,
+            )
+        ).json()["startPageToken"]
         files, page_token, queue = [], None, [drive_id]
         fields = "nextPageToken,files(id,name,mimeType,modifiedTime,size,md5Checksum,parents,webViewLink)"
         while queue:
             parent = queue.pop()
             while True:
-                params = {"q": f"'{parent}' in parents and trashed = false", "pageSize": "100", "fields": fields,
-                          "supportsAllDrives": "true", "includeItemsFromAllDrives": "true", "corpora": "drive",
-                          "driveId": drive_id}
+                params = {
+                    "q": f"'{parent}' in parents and trashed = false",
+                    "pageSize": "100",
+                    "fields": fields,
+                    "supportsAllDrives": "true",
+                    "includeItemsFromAllDrives": "true",
+                    "corpora": "drive",
+                    "driveId": drive_id,
+                }
                 if page_token:
                     params["pageToken"] = page_token
                 r = await client.get(f"{base}/files", params=params, headers=auth)
@@ -294,8 +347,16 @@ async def test_lumen_copilot_drive_sync(make_client) -> None:
                 body = r.json()
                 assert set(body) <= {"nextPageToken", "files"}
                 for f in body["files"]:
-                    assert set(f) <= {"id", "name", "mimeType", "modifiedTime", "size", "md5Checksum", "parents",
-                                      "webViewLink"}
+                    assert set(f) <= {
+                        "id",
+                        "name",
+                        "mimeType",
+                        "modifiedTime",
+                        "size",
+                        "md5Checksum",
+                        "parents",
+                        "webViewLink",
+                    }
                     if f["mimeType"] == "application/vnd.google-apps.folder":
                         queue.append(f["id"])
                     else:
@@ -305,24 +366,41 @@ async def test_lumen_copilot_drive_sync(make_client) -> None:
                     break
         assert files
         native = next((f for f in files if f["mimeType"].startswith("application/vnd.google-apps.")), None)
-        binary = next((f for f in files if not f["mimeType"].startswith("application/vnd.google-apps.")), None)
+        binary = next(
+            (f for f in files if not f["mimeType"].startswith("application/vnd.google-apps.")), None
+        )
         if native:
-            text = await client.get(f"{base}/files/{native['id']}/export",
-                                    params={"mimeType": "text/plain", "supportsAllDrives": "true"}, headers=auth)
+            text = await client.get(
+                f"{base}/files/{native['id']}/export",
+                params={"mimeType": "text/plain", "supportsAllDrives": "true"},
+                headers=auth,
+            )
             assert text.status_code == 200 and text.text.strip()
         if binary:
             # Shared-drive items are invisible without supportsAllDrives=true, exactly like Drive.
             hidden = await client.get(f"{base}/files/{binary['id']}", params={"alt": "media"}, headers=auth)
             assert hidden.status_code == 404
-            raw = await client.get(f"{base}/files/{binary['id']}", params={"alt": "media", "supportsAllDrives": "true"},
-                                   headers=auth)
+            raw = await client.get(
+                f"{base}/files/{binary['id']}",
+                params={"alt": "media", "supportsAllDrives": "true"},
+                headers=auth,
+            )
             assert raw.status_code == 200 and raw.content
-            perms = await client.get(f"{base}/files/{binary['id']}/permissions", params={"supportsAllDrives": "true"},
-                                     headers=auth)
+            perms = await client.get(
+                f"{base}/files/{binary['id']}/permissions", params={"supportsAllDrives": "true"}, headers=auth
+            )
             assert perms.status_code == 200
-        changes = await client.get(f"{base}/changes", params={"pageToken": start, "includeRemoved": "true",
-                                   "supportsAllDrives": "true", "includeItemsFromAllDrives": "true",
-                                   "driveId": drive_id}, headers=auth)
+        changes = await client.get(
+            f"{base}/changes",
+            params={
+                "pageToken": start,
+                "includeRemoved": "true",
+                "supportsAllDrives": "true",
+                "includeItemsFromAllDrives": "true",
+                "driveId": drive_id,
+            },
+            headers=auth,
+        )
         assert changes.status_code == 200, changes.text
         assert "newStartPageToken" in changes.json() or "nextPageToken" in changes.json()
 
@@ -348,13 +426,19 @@ async def test_parlance_onedrive_listing(make_client) -> None:
                 file_item = item
             elif "folder" in item:
                 children = await client.get(
-                    f"https://graph.microsoft.com/v1.0/me/drive/items/{item['id']}/children", headers=auth)
+                    f"https://graph.microsoft.com/v1.0/me/drive/items/{item['id']}/children", headers=auth
+                )
                 stack += children.json()["value"]
         assert file_item is not None
-        meta = await client.get(f"https://graph.microsoft.com/v1.0/me/drive/items/{file_item['id']}", headers=auth)
+        meta = await client.get(
+            f"https://graph.microsoft.com/v1.0/me/drive/items/{file_item['id']}", headers=auth
+        )
         assert meta.status_code == 200
-        content = await client.get(f"https://graph.microsoft.com/v1.0/me/drive/items/{file_item['id']}/content",
-                                   headers=auth, follow_redirects=True)
+        content = await client.get(
+            f"https://graph.microsoft.com/v1.0/me/drive/items/{file_item['id']}/content",
+            headers=auth,
+            follow_redirects=True,
+        )
         assert content.status_code == 200 and content.content
 
 
@@ -362,22 +446,31 @@ async def test_parlance_dropbox_listing(make_client) -> None:
     requires("emulators.providers.dropbox")
     async with make_client("dropbox") as client:
         auth = bearer(await mint(client, "https://api.dropboxapi.com", user="p018"))
-        r = await client.post("https://api.dropboxapi.com/2/files/list_folder", json={"path": "", "recursive": True},
-                              headers=auth)
+        r = await client.post(
+            "https://api.dropboxapi.com/2/files/list_folder",
+            json={"path": "", "recursive": True},
+            headers=auth,
+        )
         assert r.status_code == 200, r.text
         entries = r.json()["entries"]
         while r.json()["has_more"]:
-            r = await client.post("https://api.dropboxapi.com/2/files/list_folder/continue",
-                                  json={"cursor": r.json()["cursor"]}, headers=auth)
+            r = await client.post(
+                "https://api.dropboxapi.com/2/files/list_folder/continue",
+                json={"cursor": r.json()["cursor"]},
+                headers=auth,
+            )
             entries += r.json()["entries"]
         f = next(e for e in entries if e[".tag"] == "file")
-        meta = await client.post("https://api.dropboxapi.com/2/files/get_metadata", json={"path": f["id"]},
-                                 headers=auth)
+        meta = await client.post(
+            "https://api.dropboxapi.com/2/files/get_metadata", json={"path": f["id"]}, headers=auth
+        )
         assert meta.json()["path_lower"] == f["path_lower"]
         import json as _json
 
-        dl = await client.post("https://content.dropboxapi.com/2/files/download",
-                               headers={**auth, "Dropbox-API-Arg": _json.dumps({"path": f["path_lower"]})})
+        dl = await client.post(
+            "https://content.dropboxapi.com/2/files/download",
+            headers={**auth, "Dropbox-API-Arg": _json.dumps({"path": f["path_lower"]})},
+        )
         assert dl.status_code == 200 and dl.content
         assert _json.loads(dl.headers["Dropbox-API-Result"])["id"] == f["id"]
 
@@ -395,14 +488,19 @@ async def test_parlance_box_listing(make_client) -> None:
             if entry["type"] == "file":
                 file_entry = entry
             elif entry["type"] == "folder":
-                stack += (await client.get(f"https://api.box.com/2.0/folders/{entry['id']}/items",
-                                           headers=auth)).json()["entries"]
+                stack += (
+                    await client.get(f"https://api.box.com/2.0/folders/{entry['id']}/items", headers=auth)
+                ).json()["entries"]
         assert file_entry is not None
         info = await client.get(f"https://api.box.com/2.0/files/{file_entry['id']}", headers=auth)
         assert info.status_code == 200
         version = info.json()["file_version"]["id"]
-        content = await client.get(f"https://api.box.com/2.0/files/{file_entry['id']}/content",
-                                   params={"version": version}, headers=auth, follow_redirects=True)
+        content = await client.get(
+            f"https://api.box.com/2.0/files/{file_entry['id']}/content",
+            params={"version": version},
+            headers=auth,
+            follow_redirects=True,
+        )
         assert content.status_code == 200 and content.content
 
 
@@ -444,12 +542,18 @@ async def test_backbone_stripe_webhook_signature(make_client) -> None:
         hub = client.hub  # type: ignore[attr-defined]
         hub.webhook_transport = httpx.ASGITransport(app=receiver)
         key = {"Authorization": "Bearer sk_test_emulator"}
-        endpoint = await client.post("https://api.stripe.com/v1/webhook_endpoints", headers=key,
-                                     data={"url": "http://consumer.test/stripe/webhook", "enabled_events[]": "*"})
+        endpoint = await client.post(
+            "https://api.stripe.com/v1/webhook_endpoints",
+            headers=key,
+            data={"url": "http://consumer.test/stripe/webhook", "enabled_events[]": "*"},
+        )
         assert endpoint.status_code == 200, endpoint.text
         secret = endpoint.json()["secret"]
-        created = await client.post("https://api.stripe.com/v1/customers", headers=key,
-                                    data={"email": "new.client@example.com", "name": "New Client"})
+        created = await client.post(
+            "https://api.stripe.com/v1/customers",
+            headers=key,
+            data={"email": "new.client@example.com", "name": "New Client"},
+        )
         assert created.status_code == 200
         await hub.drain_webhooks()
     assert received
@@ -470,7 +574,11 @@ async def test_same_person_everywhere(make_client) -> None:
         ms = bearer(await mint(client, "https://graph.microsoft.com", user="p018"))
         me = (await client.get("https://graph.microsoft.com/v1.0/me", headers=ms)).json()
         gg = bearer(await mint(client, "https://admin.googleapis.com", user="p035"))
-        user = (await client.get("https://admin.googleapis.com/admin/directory/v1/users/maya.chen@halcyonadvisory.example",
-                                 headers=gg)).json()
+        user = (
+            await client.get(
+                "https://admin.googleapis.com/admin/directory/v1/users/maya.chen@halcyonadvisory.example",
+                headers=gg,
+            )
+        ).json()
         assert me["mail"] == user["primaryEmail"] == "maya.chen@halcyonadvisory.example"
         assert me["displayName"] == user["name"]["fullName"] == "Maya Chen"

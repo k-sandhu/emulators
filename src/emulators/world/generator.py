@@ -536,7 +536,7 @@ class _Builder:
             count = 1 if client.status == "Former" else (2 if rng.random() < 0.45 else 1)
             for service in options[:count]:
                 n += 1
-                svc, item, rate, (lo, hi), billing, dept = services[service]
+                _svc, item, rate, (lo, hi), billing, dept = services[service]
                 staff = [e for e in self.dept_members(dept) if not e.is_partner]
                 lead = next(e for e in self.dept_members(dept))
                 manager = staff[0] if staff else lead
@@ -718,7 +718,7 @@ class _Builder:
                 "Business Development",
                 "Pipeline and marketing.",
                 ("p040",),
-                g["g-growth"].member_ids + ("p001", "p018"),
+                (*g["g-growth"].member_ids, "p001", "p018"),
                 "Private",
                 [
                     ("General", "", "general", False),
@@ -1863,7 +1863,7 @@ class _Builder:
                 )
             )
 
-        leadership = [x for x in self.groups if x.id == "g-leadership"][0].member_ids
+        leadership = next(x for x in self.groups if x.id == "g-leadership").member_ids
         for day in window:
             wd = day.weekday()
             if wd == 0:
@@ -2166,7 +2166,7 @@ class _Builder:
                 item,
                 f"{svc} — billed {billing.lower()}",
                 rate,
-                income[dept] if dept in income else "a4200",
+                income.get(dept, "a4200"),
                 "Service",
                 f"SVC-{idx:03d}",
             )
@@ -2926,7 +2926,7 @@ class _Builder:
             for p in self.people
             if p.is_external and p.company_id in {c.id for c in self.clients if c.status == "Prospect"}
         ]
-        for i, person in enumerate(leads[:6]):
+        for person in leads[:6]:
             client = self._client(person.company_id or "c022")
             build("messenger", person, ["lead"], self.p("p042"), page_id, client)
         return convs

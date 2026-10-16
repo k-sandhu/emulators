@@ -88,7 +88,12 @@ async def handle(
                 )
             resolved.append((person.id, person.email) if person else (group.id, group.email))
         if payload.get("retainInheritedPermissions") is False:
-            if not any(r.get("_item") == item["id"] and item["_owner"] in r.get("_principals", []) and "owner" in r["roles"] for r in dm.permissions(ctx, item)):
+            if not any(
+                r.get("_item") == item["id"]
+                and item["_owner"] in r.get("_principals", [])
+                and "owner" in r["roles"]
+                for r in dm.permissions(ctx, item)
+            ):
                 dm.add_permission(ctx, item, item["_owner"], ["owner"])
             item["_restricted"] = True
         results = [

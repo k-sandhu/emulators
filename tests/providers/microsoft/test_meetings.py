@@ -5,10 +5,15 @@ import json
 import re
 import zipfile
 from collections.abc import Callable
+from datetime import timedelta
 from typing import Any
 
+import httpx
 import pytest
+from fastapi import FastAPI, Request
+from fastapi.responses import Response
 
+from emulators.core.clock import isoformat_z
 from emulators.providers.microsoft import common
 from emulators.providers.microsoft import drive_model as dm
 from emulators.providers.microsoft import meetings_model as mm
@@ -233,3 +238,58 @@ async def test_seeded_artifacts_are_lazy_and_stable(make_hub: Callable[..., Any]
     ids = ctx.store[mm.MEETINGS].ids()
     hub.reset()
     assert ctx.store[mm.MEETINGS].ids() == ids
+
+
+async def test_end_meeting_artifact_and_call_notifications(make_client: Callable[..., Any]) -> None:
+    async with make_client("microsoft") as client:
+        received: list[dict[str, Any]] = []
+        receiver = FastAPI()
+
+        @receiver.post("/hook")
+        async def hook(request: Request) -> Response:
+            if token := request.query_params.get("validationToken"):
+                return Response(token, media_type="text/plain")
+            received.append(await request.json())
+            return Response(status_code=202)
+
+        client.hub.webhook_transport = httpx.ASGITransport(app=receiver)
+        delegated = bearer(await mint(client, BASE, user="p018"))
+        app = bearer(await mint(client, BASE, app_only=True))
+        created = await client.post(
+            BASE + "/v1.0/me/onlineMeetings",
+            headers=delegated,
+            json={
+                "subject": "Notification meeting",
+                "startDateTime": "2026-10-16T12:00:00Z",
+                "endDateTime": "2026-10-16T12:30:00Z",
+            },
+        )
+        assert created.status_code == 201
+        mid = created.json()["id"]
+        for resource in (
+            f"communications/onlineMeetings/{mid}/transcripts",
+            f"communications/onlineMeetings/{mid}/recordings",
+            "communications/callRecords",
+        ):
+            subscription = await client.post(
+                BASE + "/v1.0/subscriptions",
+                headers=app,
+                json={
+                    "resource": resource,
+                    "changeType": "created",
+                    "notificationUrl": "https://receiver.example/hook",
+                    "expirationDateTime": isoformat_z(client.hub.clock.now() + timedelta(hours=1)),
+                    "clientState": "meeting-contract",
+                },
+            )
+            assert subscription.status_code == 201, subscription.text
+        ended = await client.post(BASE + "/_emulator/actions/end_meeting", json={"meeting_id": mid})
+        assert ended.status_code == 200
+        notifications = [body["value"][0] for body in received]
+        assert len(notifications) == 3
+        assert {n["resourceData"]["@odata.type"] for n in notifications} == {
+            "#microsoft.graph.callTranscript",
+            "#microsoft.graph.callRecording",
+            "#microsoft.graph.callRecord",
+        }
+        assert all(n["clientState"] == "meeting-contract" for n in notifications)

@@ -182,7 +182,6 @@ def email_body(
 ) -> str:
     extra = extra or {}
     greeting = f"Hi {recipient.first_name},"
-    c = client.name if client else ""
     e = eng.name if eng else ""
     templates: dict[str, list[str]] = {
         "pbc_request": [
