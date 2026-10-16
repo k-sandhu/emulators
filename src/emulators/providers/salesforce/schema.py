@@ -73,6 +73,8 @@ class Field:
         if not self.label:
             self.label = camel_to_label(self.name)
         self.custom = self.custom or self.name.endswith("__c")
+        if self.default_pick is not None or self.default is not None:
+            self.defaulted = True
         if self.type == "textarea" and self.length > 4000:
             self.filterable = False
             self.sortable = False
@@ -220,7 +222,14 @@ def pick(
 ) -> Field:
     vals = tuple((v, v) for v in values)
     return Field(
-        name, "picklist", label, length=length, picklist=vals, restricted=restricted, default_pick=default, **kw
+        name,
+        "picklist",
+        label,
+        length=length,
+        picklist=vals,
+        restricted=restricted,
+        default_pick=default,
+        **kw,
     )
 
 
@@ -291,10 +300,28 @@ def address(prefix: str, label: str, *, street: str = "Street", geo: bool = True
     if geo:
         fields += [
             Field(f"{prefix}Latitude", "double", f"{label} Latitude", precision=18, scale=15, compound=comp),
-            Field(f"{prefix}Longitude", "double", f"{label} Longitude", precision=18, scale=15, compound=comp),
-            pick(f"{prefix}GeocodeAccuracy", ["Address", "NearAddress", "Block", "Street", "ExtendedZip",
-                                             "Zip", "Neighborhood", "City", "County", "State", "Unknown"],
-                 f"{label} Geocode Accuracy", restricted=True, compound=comp),
+            Field(
+                f"{prefix}Longitude", "double", f"{label} Longitude", precision=18, scale=15, compound=comp
+            ),
+            pick(
+                f"{prefix}GeocodeAccuracy",
+                [
+                    "Address",
+                    "NearAddress",
+                    "Block",
+                    "Street",
+                    "ExtendedZip",
+                    "Zip",
+                    "Neighborhood",
+                    "City",
+                    "County",
+                    "State",
+                    "Unknown",
+                ],
+                f"{label} Geocode Accuracy",
+                restricted=True,
+                compound=comp,
+            ),
         ]
     fields.append(
         Field(
@@ -339,9 +366,18 @@ def deleted_field() -> Field:
     )
 
 
-def owner_field(targets: tuple[str, ...] = ("User",), child: str | None = None, label: str = "Owner ID") -> Field:
+def owner_field(
+    targets: tuple[str, ...] = ("User",), child: str | None = None, label: str = "Owner ID"
+) -> Field:
     return ref(
-        "OwnerId", targets, "Owner", label, nillable=False, defaulted=True, child=child, restricted_delete=True
+        "OwnerId",
+        targets,
+        "Owner",
+        label,
+        nillable=False,
+        defaulted=True,
+        child=child,
+        restricted_delete=True,
     )
 
 
@@ -435,13 +471,14 @@ class SObject:
             "quickActions": f"{base}/quickActions",
             "namedLayouts": f"{base}/describe/namedLayouts/{{name}}",
             "defaultValues": f"{base}/defaultValues?recordTypeId&fields",
-            "uiDetailTemplate": f"https://halcyonadvisory.lightning.force.com/{{ID}}",
-            "uiEditTemplate": f"https://halcyonadvisory.lightning.force.com/{{ID}}/e",
+            "uiDetailTemplate": "https://halcyonadvisory.lightning.force.com/{ID}",
+            "uiEditTemplate": "https://halcyonadvisory.lightning.force.com/{ID}/e",
             "uiNewRecord": f"https://halcyonadvisory.lightning.force.com/{self.prefix}/e",
         }
 
-    def global_entry(self, version: str, *, can_create: bool = True, can_update: bool = True,
-                     can_delete: bool = True) -> dict[str, Any]:
+    def global_entry(
+        self, version: str, *, can_create: bool = True, can_update: bool = True, can_delete: bool = True
+    ) -> dict[str, Any]:
         urls = self.urls(version)
         return {
             "activateable": False,
@@ -471,7 +508,11 @@ class SObject:
             "triggerable": self.createable,
             "undeletable": self.deletable,
             "updateable": self.updateable and can_update,
-            "urls": {"sobject": urls["sobject"], "describe": urls["describe"], "rowTemplate": urls["rowTemplate"]},
+            "urls": {
+                "sobject": urls["sobject"],
+                "describe": urls["describe"],
+                "rowTemplate": urls["rowTemplate"],
+            },
         }
 
 
@@ -508,15 +549,24 @@ class Schema:
                     for target in f.reference_to:
                         name = f.child.get(target) if isinstance(f.child, dict) else f.child
                         if name:
-                            self._children.setdefault(target, []).append(ChildRel(target, name, obj.name, f.name))
+                            self._children.setdefault(target, []).append(
+                                ChildRel(target, name, obj.name, f.name)
+                            )
         return self._children.get(parent, [])
 
     def child_rel(self, parent: str, name: str) -> ChildRel | None:
         lowered = name.lower()
         return next((c for c in self.children(parent) if c.name.lower() == lowered), None)
 
-    def describe_object(self, obj: SObject, version: str, *, can_create: bool = True,
-                        can_update: bool = True, can_delete: bool = True) -> dict[str, Any]:
+    def describe_object(
+        self,
+        obj: SObject,
+        version: str,
+        *,
+        can_create: bool = True,
+        can_update: bool = True,
+        can_delete: bool = True,
+    ) -> dict[str, Any]:
         entry = obj.global_entry(version, can_create=can_create, can_update=can_update, can_delete=can_delete)
         urls = obj.urls(version)
         plural_lower = obj.plural.lower()
@@ -529,7 +579,7 @@ class Schema:
             "childRelationships": [
                 {
                     "cascadeDelete": any(
-                        (f.cascade for f in self.objects[c.child].fields if f.name == c.field)
+                        f.cascade for f in self.objects[c.child].fields if f.name == c.field
                     ),
                     "childSObject": c.child,
                     "deprecatedAndHidden": False,
@@ -576,9 +626,9 @@ SCHEMA = Schema()
 
 
 def _register_all() -> None:
-    from emulators.providers.salesforce import schema_crm, schema_org
+    from emulators.providers.salesforce import schema_content, schema_crm, schema_org
 
-    for module in (schema_org, schema_crm):
+    for module in (schema_org, schema_crm, schema_content):
         for obj in module.OBJECTS:
             SCHEMA.add(obj)
 

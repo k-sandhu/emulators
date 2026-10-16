@@ -171,7 +171,7 @@ def _decode_body(body: bytes, content_type: str) -> Any:
     if "json" in content_type:
         try:
             return json.loads(snippet)
-        except ValueError:
+        except (ValueError, RecursionError):
             pass
     try:
         return snippet.decode("utf-8")

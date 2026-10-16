@@ -7,6 +7,7 @@ from datetime import date, datetime, timedelta
 from typing import Any
 
 from emulators.providers.salesforce.common import fmt_dt
+from emulators.providers.salesforce.hooks import recompute_campaign
 from emulators.providers.salesforce.opp_logic import forecast_for, stage_info
 from emulators.providers.salesforce.org import Record
 from emulators.providers.salesforce.seedlib import (
@@ -17,7 +18,7 @@ from emulators.providers.salesforce.seedlib import (
     modified_after,
     stamp,
 )
-from emulators.world.model import Client, Deal, Lead, Person, SupportCase, World
+from emulators.world.model import Deal, Lead, Person, World
 
 ACCOUNT_TYPE = {"Active": "Customer", "Prospect": "Prospect", "Former": "Former Customer"}
 SIC = {
@@ -44,13 +45,26 @@ SIC = {
     "Software / SaaS": ("7372", "Prepackaged Software"),
     "Transportation & Logistics": ("4731", "Freight Transportation Arrangement"),
     "Veterinary Healthcare": ("0742", "Veterinary Services"),
-}  # fmt: skip
+}
 PLATFORM = {"teams": "Microsoft Teams", "zoom": "Zoom", "meet": "Google Meet"}
-VENDOR_INDUSTRY = {
-    "Software": "Technology", "IT Services": "Technology", "Telecom": "Telecommunications",
-    "Insurance": "Insurance", "Travel": "Hospitality", "Meals": "Food & Beverage", "Rent": "Other",
-    "Payroll": "Consulting", "Training": "Education", "Research": "Education", "Shipping": "Shipping",
+SERVICE_LINE = {
+    "Audit": "Audit & Assurance", "Review Engagement": "Audit & Assurance", "Tax Compliance": "Tax",
+    "Tax Advisory": "Tax", "SR&ED Claim": "Tax", "Transaction Advisory": "Advisory",
+    "Systems Advisory": "Advisory", "Fractional CFO": "Advisory", "Bookkeeping": "Accounting",
 }  # fmt: skip
+VENDOR_INDUSTRY = {
+    "Software": "Technology",
+    "IT Services": "Technology",
+    "Telecom": "Telecommunications",
+    "Insurance": "Insurance",
+    "Travel": "Hospitality",
+    "Meals": "Food & Beverage",
+    "Rent": "Other",
+    "Payroll": "Consulting",
+    "Training": "Education",
+    "Research": "Education",
+    "Shipping": "Shipping",
+}
 FAMILY_BY_ACCOUNT = {"a4000": "Audit & Assurance", "a4100": "Tax", "a4200": "Advisory", "a4900": "Expenses"}
 OPEN_STATUSES = {"Open - Not Contacted", "Working - Contacted"}
 
@@ -96,6 +110,13 @@ def _address(prefix: str, address: Any) -> dict[str, Any]:
     }
 
 
+def _service_lines(world: World, client_id: str) -> str | None:
+    lines = sorted(
+        {SERVICE_LINE.get(e.service, "Advisory") for e in world.engagements if e.client_id == client_id}
+    )
+    return ";".join(lines) or None
+
+
 def _first_deal_source(world: World, client_id: str) -> str | None:
     deals = sorted((d for d in world.deals if d.client_id == client_id), key=lambda d: d.created)
     return deals[0].lead_source if deals else None
@@ -129,6 +150,7 @@ def seed_accounts_and_contacts(state: SeedState, world: World) -> None:
             Payment_Terms__c=f"Net {c.payment_terms_days}",
             Preferred_Meeting_Platform__c=PLATFORM.get(c.preferred_platform),
             QuickBooks_Customer_Id__c=str(int(c.id[1:])) if c.id[1:].isdigit() else None,
+            Service_Lines__c=_service_lines(world, c.id),
             **_address("Billing", c.address),
             **_address("Shipping", c.address),
         )
@@ -213,8 +235,13 @@ def _contact_for(state: SeedState, world: World, person: Person) -> None:
 def seed_pricebook(state: SeedState, world: World) -> None:
     anchor = world.anchor
     created = at(world.org.founded.replace(year=world.org.founded.year + 8), 9)
-    book = state.new("Pricebook2", Name="Standard Price Book", IsActive=True, IsStandard=True,
-                     Description="Standard price book")  # fmt: skip
+    book = state.new(
+        "Pricebook2",
+        Name="Standard Price Book",
+        IsActive=True,
+        IsStandard=True,
+        Description="Standard price book",
+    )
     stamp(book, created, created_by=state.admin_id)
     state.save("Pricebook2", book)
     state.pricebook_id = book["Id"]
@@ -232,8 +259,12 @@ def seed_pricebook(state: SeedState, world: World) -> None:
             StockKeepingUnit=item.sku,
             QuantityUnitOfMeasure="Hour" if item.type == "Service" else None,
         )
-        stamp(product, created, modified=modified_after(anchor, created, "prod", item.id),
-              created_by=state.admin_id)  # fmt: skip
+        stamp(
+            product,
+            created,
+            modified=modified_after(anchor, created, "prod", item.id),
+            created_by=state.admin_id,
+        )
         state.save("Product2", product)
         state.product_by_item[item.id] = product["Id"]
         entry = state.new(
@@ -260,32 +291,65 @@ def seed_campaigns(state: SeedState, world: World) -> None:
     owner2 = _owner(state, "p044") if "p044" in state.user_by_person else owner
     specs: list[dict[str, Any]] = [
         dict(
-            key="year_end", Name="Year-End Tax Planning Webinar 2026", Type="Webinar", Status="In Progress",
-            StartDate=anchor - timedelta(days=15), EndDate=anchor + timedelta(days=60), ExpectedRevenue=150000.0,
-            BudgetedCost=4500.0, ActualCost=1800.0, ExpectedResponse=5.0, NumberSent=1200.0, OwnerId=owner,
+            key="year_end",
+            Name="Year-End Tax Planning Webinar 2026",
+            Type="Webinar",
+            Status="In Progress",
+            StartDate=anchor - timedelta(days=15),
+            EndDate=anchor + timedelta(days=60),
+            ExpectedRevenue=150000.0,
+            BudgetedCost=4500.0,
+            ActualCost=1800.0,
+            ExpectedResponse=5.0,
+            NumberSent=1200.0,
+            OwnerId=owner,
             Description="Webinar series on year-end tax planning for owner-managed businesses.",
         ),
         dict(
-            key="audit_roundtable", Name="Fall Audit Readiness Roundtable 2026", Type="Conference",
-            Status="Completed", StartDate=anchor - timedelta(days=31), EndDate=anchor - timedelta(days=31),
-            ExpectedRevenue=90000.0, BudgetedCost=7500.0, ActualCost=7120.0, ExpectedResponse=8.0,
-            NumberSent=400.0, OwnerId=owner,
+            key="audit_roundtable",
+            Name="Fall Audit Readiness Roundtable 2026",
+            Type="Conference",
+            Status="Completed",
+            StartDate=anchor - timedelta(days=31),
+            EndDate=anchor - timedelta(days=31),
+            ExpectedRevenue=90000.0,
+            BudgetedCost=7500.0,
+            ActualCost=7120.0,
+            ExpectedResponse=8.0,
+            NumberSent=400.0,
+            OwnerId=owner,
             Description="Invitation-only roundtable for finance leaders preparing for year-end audits.",
         ),
         dict(
-            key="sred", Name="SR&ED Credit Workshop 2026", Type="Webinar", Status="Planned",
-            StartDate=anchor + timedelta(days=33), EndDate=anchor + timedelta(days=33), ExpectedRevenue=60000.0,
-            BudgetedCost=3000.0, ActualCost=0.0, ExpectedResponse=4.0, NumberSent=0.0, OwnerId=owner2,
+            key="sred",
+            Name="SR&ED Credit Workshop 2026",
+            Type="Webinar",
+            Status="Planned",
+            StartDate=anchor + timedelta(days=33),
+            EndDate=anchor + timedelta(days=33),
+            ExpectedRevenue=60000.0,
+            BudgetedCost=3000.0,
+            ActualCost=0.0,
+            ExpectedResponse=4.0,
+            NumberSent=0.0,
+            OwnerId=owner2,
             Description="Workshop on maximising SR&ED credits for technology companies.",
         ),
-    ]  # fmt: skip
+    ]
     for spec in specs:
         key = spec.pop("key")
-        created = at(spec["StartDate"] - timedelta(days=30), 9)
-        rec = state.new("Campaign", IsActive=True, **{k: (d.isoformat() if isinstance(d, date) else d)
-                                                       for k, d in spec.items()})
-        stamp(rec, created, modified=modified_after(world.anchor, created, "camp", key),
-              created_by=spec["OwnerId"])  # fmt: skip
+        created = at(min(spec["StartDate"] - timedelta(days=30), anchor - timedelta(days=7)), 9)
+        rec = state.new(
+            "Campaign",
+            IsActive=True,
+            **{k: (d.isoformat() if isinstance(d, date) else d) for k, d in spec.items()},
+        )
+        stamp(
+            rec,
+            created,
+            modified=modified_after(world.anchor, created, "camp", key),
+            created_by=spec["OwnerId"],
+        )
         state.save("Campaign", rec)
         state.campaign_ids[key] = rec["Id"]
 
@@ -365,7 +429,7 @@ def seed_opportunities(state: SeedState, world: World) -> None:
             OwnerId=owner,
             FiscalQuarter=fq,
             FiscalYear=fy,
-            Fiscal=f"{fy} Q{fq}",
+            Fiscal=f"{fy} {fq}",
             Engagement__c=state.engagement_by_world.get(d.engagement_id or ""),
         )
         modified = (
@@ -392,8 +456,13 @@ def _contact_roles(state: SeedState, world: World, d: Deal, opp: Record, created
         contact_id = state.contact_by_person.get(person_id)
         if not contact_id:
             continue
-        rec = state.new("OpportunityContactRole", OpportunityId=opp["Id"], ContactId=contact_id, Role=role,
-                        IsPrimary=primary)  # fmt: skip
+        rec = state.new(
+            "OpportunityContactRole",
+            OpportunityId=opp["Id"],
+            ContactId=contact_id,
+            Role=role,
+            IsPrimary=primary,
+        )
         stamp(rec, created, created_by=opp["OwnerId"])
         state.save("OpportunityContactRole", rec)
 
@@ -518,13 +587,18 @@ def _convert(state: SeedState, world: World, lead: Lead, rec: Record, when: date
         OwnerId=owner,
         FiscalQuarter=fq,
         FiscalYear=fy,
-        Fiscal=f"{fy} Q{fq}",
+        Fiscal=f"{fy} {fq}",
     )
     stamp(opp, when, created_by=owner)
     opp["LastStageChangeDate"] = fmt_dt(when)
     state.save("Opportunity", opp)
-    role = state.new("OpportunityContactRole", OpportunityId=opp["Id"], ContactId=contact["Id"],
-                     Role="Decision Maker", IsPrimary=True)  # fmt: skip
+    role = state.new(
+        "OpportunityContactRole",
+        OpportunityId=opp["Id"],
+        ContactId=contact["Id"],
+        Role="Decision Maker",
+        IsPrimary=True,
+    )
     stamp(role, when, created_by=owner)
     state.save("OpportunityContactRole", role)
     rec.update(
@@ -575,14 +649,21 @@ def seed_cases(state: SeedState, world: World) -> None:
         modified = closed_at if closed and closed_at else modified_after(anchor, created, "case", case.id)
         stamp(rec, created, modified=min(modified, anchor), created_by=owner)
         state.save("Case", rec)
-    state.org.meta["case_number"] = max(highest + 9, state.org.meta["case_number"])
+    state.org.meta["case_number"] = max(highest, state.org.meta["case_number"])
 
 
 # -- campaign members & rollups --------------------------------------------------------------
 
 
-def _member(state: SeedState, campaign: str, *, lead_id: str | None = None, contact_id: str | None = None,
-            responded: bool, when: datetime) -> None:  # fmt: skip
+def _member(
+    state: SeedState,
+    campaign: str,
+    *,
+    lead_id: str | None = None,
+    contact_id: str | None = None,
+    responded: bool,
+    when: datetime,
+) -> None:
     source = state.org.get("Lead", lead_id) if lead_id else state.org.get("Contact", contact_id)
     assert source is not None
     account = state.org.get("Account", source.get("AccountId")) if contact_id else None
@@ -630,27 +711,16 @@ def seed_campaign_members(state: SeedState, world: World) -> None:
             continue
         _member(state, "audit_roundtable", contact_id=cid, responded=True, when=roundtable)
         if i < 6:
-            _member(state, "year_end", contact_id=cid, responded=hnum("resp", client.id, mod=3) == 0,
-                    when=year_end)  # fmt: skip
+            _member(
+                state,
+                "year_end",
+                contact_id=cid,
+                responded=hnum("resp", client.id, mod=3) == 0,
+                when=year_end,
+            )
     _campaign_rollups(state)
 
 
 def _campaign_rollups(state: SeedState) -> None:
-    org = state.org
-    for camp in org.coll("Campaign"):
-        members = [m for m in org.coll("CampaignMember") if m["CampaignId"] == camp["Id"]]
-        opps = [o for o in org.coll("Opportunity") if o.get("CampaignId") == camp["Id"]]
-        leads = [m for m in members if m["LeadId"]]
-        camp["NumberOfLeads"] = len(leads)
-        camp["NumberOfConvertedLeads"] = sum(
-            1 for m in leads if (org.get("Lead", m["LeadId"]) or {}).get("IsConverted")
-        )
-        camp["NumberOfContacts"] = sum(1 for m in members if m["ContactId"])
-        camp["NumberOfResponses"] = sum(1 for m in members if m["HasResponded"])
-        camp["NumberOfOpportunities"] = len(opps)
-        camp["NumberOfWonOpportunities"] = sum(1 for o in opps if o["IsWon"])
-        camp["AmountAllOpportunities"] = float(sum(o["Amount"] or 0 for o in opps))
-        camp["AmountWonOpportunities"] = float(sum(o["Amount"] or 0 for o in opps if o["IsWon"]))
-
-
-_ = (Client, SupportCase)
+    for camp in state.org.coll("Campaign"):
+        recompute_campaign(state.org, camp)

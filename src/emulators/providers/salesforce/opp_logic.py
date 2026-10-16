@@ -20,7 +20,9 @@ NAME_BY_CATEGORY = {api: name for _, api, name, _, _ in STAGE_TABLE.values()}
 
 
 def stage_info(stage: str) -> dict[str, object]:
-    probability, category, name, closed, won = STAGE_TABLE.get(stage, (10, "Pipeline", "Pipeline", False, False))
+    probability, category, name, closed, won = STAGE_TABLE.get(
+        stage, (10, "Pipeline", "Pipeline", False, False)
+    )
     return {
         "probability": probability,
         "category": category,

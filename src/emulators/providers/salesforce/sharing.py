@@ -35,19 +35,52 @@ OWD: dict[str, str] = {
     "Engagement__c": "None",
 }
 PUBLIC_OBJECTS = {
-    "Product2", "Pricebook2", "PricebookEntry", "User", "UserRole", "Profile", "Group", "RecordType",
+    "Product2",
+    "Pricebook2",
+    "PricebookEntry",
+    "User",
+    "UserRole",
+    "Profile",
+    "Group",
+    "RecordType",
     "Organization",
-}  # fmt: skip
-SETUP_OBJECTS = {"User", "UserRole", "Profile", "Group", "RecordType", "Organization"}
+    "OpportunityStage",
+    "LeadStatus",
+    "CaseStatus",
+}
+SETUP_OBJECTS = {
+    "User",
+    "UserRole",
+    "Profile",
+    "Group",
+    "RecordType",
+    "Organization",
+    "OpportunityStage",
+    "LeadStatus",
+    "CaseStatus",
+}
 PARENT_OF: dict[str, tuple[str, str]] = {
     "OpportunityContactRole": ("Opportunity", "OpportunityId"),
     "OpportunityLineItem": ("Opportunity", "OpportunityId"),
     "CampaignMember": ("Campaign", "CampaignId"),
 }
 SALES_OBJECTS = {
-    "Account", "Contact", "Opportunity", "OpportunityContactRole", "OpportunityLineItem", "Lead", "Case",
-    "Task", "Event", "Engagement__c",
-}  # fmt: skip
+    "Account",
+    "Contact",
+    "Opportunity",
+    "OpportunityContactRole",
+    "OpportunityLineItem",
+    "Lead",
+    "Case",
+    "Task",
+    "Event",
+    "Engagement__c",
+    "ContentDocument",
+    "ContentVersion",
+    "ContentDocumentLink",
+    "Attachment",
+}
+FILE_OBJECTS = {"ContentDocument", "ContentVersion", "ContentDocumentLink", "Attachment"}
 
 
 def object_perms(profile_name: str, modify_all: bool, obj: SObject) -> str:
@@ -86,6 +119,7 @@ class Access:
         self.view_all = self.modify_all or bool(profile.get("PermissionsViewAllData"))
         self.is_admin = self.modify_all
         self.owner_ids = self._visible_owner_ids()
+        self._doc_links: dict[str, list[str]] | None = None
 
     # -- hierarchy ---------------------------------------------------------------------
     def _visible_owner_ids(self) -> set[str]:
@@ -123,6 +157,58 @@ class Access:
     def can_delete_object(self, obj: SObject) -> bool:
         return "d" in self.perms(obj)
 
+    # -- files ---------------------------------------------------------------------------
+    def _links(self) -> dict[str, list[str]]:
+        """ContentDocument id -> ids of the records it is shared with (built once per request)."""
+        if self._doc_links is None:
+            index: dict[str, list[str]] = {}
+            for link in self.org.coll("ContentDocumentLink"):
+                if not link.get("IsDeleted"):
+                    index.setdefault(link["ContentDocumentId"], []).append(link["LinkedEntityId"])
+            self._doc_links = index
+        return self._doc_links
+
+    def _entity_readable(self, entity_id: str) -> bool:
+        if entity_id.startswith("005"):  # a personal library is visible to its owner and the owner's managers
+            return entity_id in self.owner_ids
+        found = self.org.find(entity_id)
+        return found is not None and not found[1].get("IsDeleted") and self.can_read(*found)
+
+    def _doc_readable(self, doc: Record | None) -> bool:
+        if doc is None:
+            return False
+        if doc.get("OwnerId") in self.owner_ids:
+            return True
+        return any(self._entity_readable(e) for e in self._links().get(doc["Id"], ()))
+
+    def _doc_editable(self, doc: Record | None) -> bool:
+        return doc is not None and (self.modify_all or doc.get("OwnerId") in self.owner_ids)
+
+    def _doc_of(self, obj: SObject, rec: Record) -> Record | None:
+        """The ContentDocument a file record belongs to."""
+        if obj.name == "ContentDocument":
+            return rec
+        return self.org.get("ContentDocument", rec.get("ContentDocumentId"))
+
+    def _file_read(self, obj: SObject, rec: Record) -> bool:
+        if obj.name == "Attachment":
+            parent = self.org.find(rec.get("ParentId")) if rec.get("ParentId") else None
+            return parent is None or self.can_read(*parent)
+        if obj.name == "ContentDocumentLink":
+            return self._entity_readable(rec["LinkedEntityId"]) or self._doc_editable(self._doc_of(obj, rec))
+        return self._doc_readable(self._doc_of(obj, rec))
+
+    def _file_edit(self, obj: SObject, rec: Record) -> bool:
+        if obj.name == "Attachment":
+            parent = self.org.find(rec.get("ParentId")) if rec.get("ParentId") else None
+            return parent is not None and self.can_edit(*parent)
+        if obj.name == "ContentDocumentLink":
+            found = self.org.find(rec["LinkedEntityId"])
+            return self._doc_editable(self._doc_of(obj, rec)) or (
+                found is not None and not rec["LinkedEntityId"].startswith("005") and self.can_edit(*found)
+            )
+        return self._doc_editable(self._doc_of(obj, rec))
+
     # -- record visibility -------------------------------------------------------------
     def _owner_visible(self, rec: Record) -> bool:
         return rec.get("OwnerId") in self.owner_ids
@@ -135,24 +221,23 @@ class Access:
             parent_obj = SCHEMA.objects[spec[0]]
             parent = self.org.get(parent_obj.name, rec.get(spec[1]))
             return (parent_obj, parent) if parent else None
-        if obj.name in ("Task", "Event"):
-            for key in ("WhatId", "WhoId"):
-                found = self.org.find(rec.get(key)) if rec.get(key) else None
-                if found:
-                    return found
         return None
+
+    def _activity_parents(self, rec: Record) -> list[tuple[SObject, Record]]:
+        """The What and Who records a task/event hangs off (either one can grant access)."""
+        found = [self.org.find(rec[key]) for key in ("WhatId", "WhoId") if rec.get(key)]
+        return [f for f in found if f is not None]
 
     def can_read(self, obj: SObject, rec: Record) -> bool:
         if self.view_all or obj.name in PUBLIC_OBJECTS:
             return True
+        if obj.name in FILE_OBJECTS:
+            return self._file_read(obj, rec)
         if obj.name in PARENT_OF:
             parent = self._parent(obj, rec)
             return parent is None or self.can_read(*parent)
         if obj.name in ("Task", "Event"):
-            if self._owner_visible(rec):
-                return True
-            parent = self._parent(obj, rec)
-            return parent is not None and self.can_read(*parent)
+            return self._owner_visible(rec) or any(self.can_read(*p) for p in self._activity_parents(rec))
         if OWD.get(obj.name) in ("Read", "Edit"):
             return True
         return self._owner_visible(rec)
@@ -164,14 +249,13 @@ class Access:
             return True
         if obj.name in PUBLIC_OBJECTS:
             return False
+        if obj.name in FILE_OBJECTS:
+            return self._file_edit(obj, rec)
         if obj.name in PARENT_OF:
             parent = self._parent(obj, rec)
             return parent is not None and self.can_edit(*parent)
         if obj.name in ("Task", "Event"):
-            if self._owner_visible(rec):
-                return True
-            parent = self._parent(obj, rec)
-            return parent is not None and self.can_edit(*parent)
+            return self._owner_visible(rec) or any(self.can_edit(*p) for p in self._activity_parents(rec))
         if OWD.get(obj.name) == "Edit":
             return True
         return self._owner_visible(rec)
@@ -183,6 +267,8 @@ class Access:
             return True
         if obj.name in PUBLIC_OBJECTS:
             return False
+        if obj.name in FILE_OBJECTS:
+            return self._file_edit(obj, rec)
         if obj.name in PARENT_OF:
             parent = self._parent(obj, rec)
             return parent is not None and self.can_edit(*parent)
@@ -194,7 +280,7 @@ class Access:
         """A predicate over records of ``obj``; cheap shortcuts for the common cases."""
         if self.view_all or obj.name in PUBLIC_OBJECTS:
             return lambda rec: True
-        if obj.name not in PARENT_OF and obj.name not in ("Task", "Event"):
+        if obj.name not in PARENT_OF and obj.name not in ("Task", "Event") and obj.name not in FILE_OBJECTS:
             if OWD.get(obj.name) in ("Read", "Edit"):
                 return lambda rec: True
             owners = self.owner_ids

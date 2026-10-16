@@ -148,11 +148,15 @@ class Org:
             "street": pick("Street"),
         }
 
-    def field_value(self, obj: SObject, rec: Record, name: str) -> Any:
+    def field_value(self, obj: SObject, rec: Record, name: str, version: str = "62.0") -> Any:
         f = obj.field(name)
         if f is not None and f.type == "address":
             return self.address_value(obj, rec, f.name)
-        return rec.get(name if f is None else f.name)
+        value = rec.get(name if f is None else f.name)
+        if f is not None and f.type == "base64":
+            # binary fields come back as the URL the bytes can be fetched from
+            return f"/services/data/v{version}/sobjects/{obj.name}/{rec['Id']}/{f.name}" if value else None
+        return value
 
     def render(self, obj: SObject, rec: Record, version: str, fields: list[str] | None = None) -> Record:
         """The REST representation of one record (``attributes`` first, then the fields)."""
@@ -162,5 +166,5 @@ class Org:
             f = obj.field(name)
             if f is None:
                 continue
-            out[f.name] = self.field_value(obj, rec, f.name)
+            out[f.name] = self.field_value(obj, rec, f.name, version)
         return out

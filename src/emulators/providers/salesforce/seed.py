@@ -13,30 +13,41 @@ from datetime import timedelta
 from typing import Any
 
 from emulators.core.provider import ProviderContext
-from emulators.providers.salesforce import seed_activity, seed_crm
+from emulators.providers.salesforce import seed_activity, seed_content, seed_crm
 from emulators.providers.salesforce.common import fmt_dt, to_18
+from emulators.providers.salesforce.opp_logic import STAGE_TABLE
 from emulators.providers.salesforce.org import Org
 from emulators.providers.salesforce.schema import SCHEMA
+from emulators.providers.salesforce.schema_crm import CASE_STATUSES, LEAD_STATUSES
 from emulators.providers.salesforce.seedlib import SeedState, at, blank, hnum, modified_after, stamp
 from emulators.world.model import Department, Person, World
 
 PROFILE_FLAGS: dict[str, dict[str, bool]] = {
     "System Administrator": {
-        "PermissionsEmailMass": True, "PermissionsExportReport": True, "PermissionsDataExport": True,
-        "PermissionsManageUsers": True, "PermissionsViewSetup": True, "PermissionsModifyAllData": True,
-        "PermissionsViewAllData": True, "PermissionsConvertLeads": True,
+        "PermissionsEmailMass": True,
+        "PermissionsExportReport": True,
+        "PermissionsDataExport": True,
+        "PermissionsManageUsers": True,
+        "PermissionsViewSetup": True,
+        "PermissionsModifyAllData": True,
+        "PermissionsViewAllData": True,
+        "PermissionsConvertLeads": True,
         "PermissionsEditPublicDocuments": True,
-    },  # fmt: skip
+    },
     "Standard User": {"PermissionsConvertLeads": True, "PermissionsExportReport": True},
     "Sales User": {
-        "PermissionsConvertLeads": True, "PermissionsExportReport": True, "PermissionsEmailMass": True,
+        "PermissionsConvertLeads": True,
+        "PermissionsExportReport": True,
+        "PermissionsEmailMass": True,
         "PermissionsImportPersonal": True,
-    },  # fmt: skip
+    },
     "Read Only": {"PermissionsEditTask": False, "PermissionsEditEvent": False},
     "Salesforce API Only System Integrations": {
-        "PermissionsApiUserOnly": True, "PermissionsModifyAllData": True, "PermissionsViewAllData": True,
+        "PermissionsApiUserOnly": True,
+        "PermissionsModifyAllData": True,
+        "PermissionsViewAllData": True,
         "PermissionsViewSetup": True,
-    },  # fmt: skip
+    },
 }
 READ_ONLY_TITLES = ("Office Manager", "Learning & Development Coordinator", "IT Support Specialist")
 HEAD_ROLE_NAMES = {
@@ -49,9 +60,14 @@ HEAD_ROLE_NAMES = {
     "growth": "Director of Business Development",
 }
 DEPT_SHORT = {
-    "audit": "Audit", "tax": "Tax", "advisory": "Advisory", "finance": "Finance", "people": "People & Culture",
-    "it": "Technology", "growth": "Business Development",
-}  # fmt: skip
+    "audit": "Audit",
+    "tax": "Tax",
+    "advisory": "Advisory",
+    "finance": "Finance",
+    "people": "People & Culture",
+    "it": "Technology",
+    "growth": "Business Development",
+}
 
 
 def seed(ctx: ProviderContext) -> None:
@@ -62,8 +78,20 @@ def seed(ctx: ProviderContext) -> None:
     profiles = seed_profiles(org, world)
     roles = seed_roles(org, world)
     seed_users(org, world, state, profiles, roles)
+    seed_status_values(org, world)
+    _attribute_setup_records(org, state.admin_id)
     seed_crm.seed(state, world)
     seed_activity.seed(state, world)
+    seed_content.seed(state, world)
+
+
+def _attribute_setup_records(org: Org, admin_id: str) -> None:
+    """Setup data (org, profiles, roles, status values) was created by the first system administrator."""
+    for name in ("Organization", "Profile", "UserRole", "OpportunityStage", "LeadStatus", "CaseStatus"):
+        for rec in org.coll(name):
+            for key in ("CreatedById", "LastModifiedById"):
+                if key in rec and not rec[key]:
+                    rec[key] = admin_id
 
 
 def _slug(text: str) -> str:
@@ -195,8 +223,10 @@ def _role_key_of(world: World, person_id: str | None) -> str:
         return "root" if p.manager_id is None else f"person:{p.id}"
     if p.id == dept.head_id:
         return f"{dept.id}:head"
-    if _has_manager_tier(world, dept) and p.manager_id == dept.head_id and any(
-        r.department_id == dept.id for r in world.direct_reports(p.id)
+    if (
+        _has_manager_tier(world, dept)
+        and p.manager_id == dept.head_id
+        and any(r.department_id == dept.id for r in world.direct_reports(p.id))
     ):
         return f"{dept.id}:manager"
     return f"{dept.id}:staff"
@@ -225,6 +255,52 @@ def seed_roles(org: Org, world: World) -> dict[str, str]:
         ids[key] = rec["Id"]
         org.put("UserRole", rec)
     return ids
+
+
+# -- picklist value objects --------------------------------------------------------------
+
+
+def seed_status_values(org: Org, world: World) -> None:
+    """``OpportunityStage``, ``LeadStatus`` and ``CaseStatus`` rows mirror the standard picklists."""
+    created = at(world.org.founded, 9)
+    for order, (name, (prob, category, category_name, closed, won)) in enumerate(
+        STAGE_TABLE.items(), start=1
+    ):
+        rec = blank(SCHEMA.objects["OpportunityStage"])
+        rec["Id"] = org.new_id("OpportunityStage")
+        rec.update(
+            MasterLabel=name,
+            ApiName=name,
+            IsActive=True,
+            SortOrder=order,
+            IsClosed=closed,
+            IsWon=won,
+            ForecastCategory=category,
+            ForecastCategoryName=category_name,
+            DefaultProbability=float(prob),
+        )
+        stamp(rec, created)
+        org.put("OpportunityStage", rec)
+    for order, name in enumerate(LEAD_STATUSES, start=1):
+        rec = blank(SCHEMA.objects["LeadStatus"])
+        rec["Id"] = org.new_id("LeadStatus")
+        rec.update(
+            MasterLabel=name,
+            ApiName=name,
+            SortOrder=order,
+            IsDefault=order == 1,
+            IsConverted=name == "Closed - Converted",
+        )
+        stamp(rec, created)
+        org.put("LeadStatus", rec)
+    for order, name in enumerate(CASE_STATUSES, start=1):
+        rec = blank(SCHEMA.objects["CaseStatus"])
+        rec["Id"] = org.new_id("CaseStatus")
+        rec.update(
+            MasterLabel=name, ApiName=name, SortOrder=order, IsDefault=order == 1, IsClosed=name == "Closed"
+        )
+        stamp(rec, created)
+        org.put("CaseStatus", rec)
 
 
 # -- users ---------------------------------------------------------------------------------
@@ -365,4 +441,3 @@ def _integration_user(org: Org, world: World, state: SeedState, profiles: dict[s
     stamp(rec, created, created_by=state.admin_id)
     state.integration_id = rec["Id"]
     org.put("User", rec)
-
