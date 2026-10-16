@@ -11,12 +11,13 @@ single vendor account.
 | Storage | OneDrive & SharePoint, Google Drive, Box, Dropbox | folder trees, shared drives/sites/team folders, ACLs and sharing links enforced per user, uploads (simple, multipart, resumable/chunked), delta/changes feeds, real DOCX/XLSX/PPTX/PDF content |
 | Email & calendar | Outlook (Graph), Gmail, Google Calendar | mailboxes with folders/labels, MIME, attachments, send, delta/history; calendars with recurrence, free/busy |
 | Meetings (audio/video) | Microsoft Teams, Zoom, Google Meet, Webex | online meetings, participants, cloud recordings (valid MP4/M4A), transcripts (WebVTT), attendance, webhooks |
+| Knowledge & work tracking | Notion, Confluence, Jira | page trees, databases, blocks, CQL/JQL, space permissions and page restrictions |
 | Messaging | Slack, Teams chat, Twilio (SMS/MMS, Verify, Lookup), WhatsApp Cloud API, Messenger | channels/threads/DMs, inbound simulation, delivery status callbacks, 24-hour windows, opt-outs, signed webhooks |
 | Payments | Stripe | customers, payment methods, PaymentIntents state machine with test cards, subscriptions, invoices, refunds, disputes, events + signed webhooks, test clocks |
 | CRM | Salesforce, HubSpot | SOQL/SOSL, composite, Bulk 2.0, describe, role-hierarchy sharing; HubSpot CRM v3 objects, associations, search, pipelines |
 | Accounting | QuickBooks Online, Xero | chart of accounts, customers/jobs, invoices, payments, bills, reports that tie out, CDC, webhooks |
 
-Every emulator is seeded from **one shared synthetic organisation** — *Halcyon Advisory Group*, a
+Sixteen emulators, all seeded from **one shared synthetic organisation** — *Halcyon Advisory Group*, a
 45-person accounting and advisory firm with 24 clients — so the same person, client, document
 and meeting line up across every system. All data is fictional (`*.example` emails, fictional
 phone ranges).
@@ -99,8 +100,9 @@ date; pin it with `EMULATORS_ANCHOR=2026-10-16` for byte-stable fixtures.
 
 * [Architecture](docs/architecture.md) · [Use from Python tests](docs/howto/python-tests.md) ·
   [Docker with real hostnames](docs/howto/docker-compose.md)
-* Provider references: [docs/providers/](docs/providers/) — hosts, auth, endpoints, seeded data,
-  webhooks, actions and known gaps for each emulator.
+* Provider references: [docs/providers/](docs/providers/README.md) — hosts, auth, endpoints, seeded
+  data, webhooks, actions and known gaps for each of the 16 emulators.
+* [Webhooks, simulations, faults and time](docs/howto/webhooks-faults-time.md)
 * Decisions: [0001 hostname routing](docs/decisions/0001-hostname-routing.md) ·
   [0002 shared synthetic world](docs/decisions/0002-shared-synthetic-world.md)
 * Contributing: [AGENTS.md](AGENTS.md)
