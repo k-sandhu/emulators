@@ -137,8 +137,12 @@ def evaluate(node: Any, record: dict[str, Any]) -> Any:
         if not isinstance(left, str) or not isinstance(right, str):
             return False
         left, right = left.casefold(), right.casefold()
-        return {"contains": lambda: right in left, "startswith": lambda: left.startswith(right),
-                "endswith": lambda: left.endswith(right), "equals": lambda: left == right}[op]()
+        return {
+            "contains": lambda: right in left,
+            "startswith": lambda: left.startswith(right),
+            "endswith": lambda: left.endswith(right),
+            "equals": lambda: left == right,
+        }[op]()
     if isinstance(left, datetime) or isinstance(right, datetime):
         try:
             left, right = instant(left), instant(right)
@@ -147,19 +151,30 @@ def evaluate(node: Any, record: dict[str, Any]) -> Any:
     if isinstance(left, str) and isinstance(right, str):
         left, right = left.casefold(), right.casefold()
     try:
-        return {"==": operator.eq, "!=": operator.ne, ">": operator.gt, "<": operator.lt,
-                ">=": operator.ge, "<=": operator.le}[op](left, right)
+        return {
+            "==": operator.eq,
+            "!=": operator.ne,
+            ">": operator.gt,
+            "<": operator.lt,
+            ">=": operator.ge,
+            "<=": operator.le,
+        }[op](left, right)
     except TypeError:
         return False
 
 
-def select(request: Request, resource: str, records: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+def select(
+    request: Request, resource: str, records: list[dict[str, Any]]
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     query = {k.lower(): v for k, v in request.query_params.items()}
     if resource == "Contacts" and query.get("includearchived", "false").lower() != "true":
         records = [r for r in records if r.get("ContactStatus") != "ARCHIVED"]
-    for parameter, field in {"ids": ID_FIELDS[resource], "invoicenumbers": "InvoiceNumber",
-                             "contactids": "Contact.ContactID" if resource != "Contacts" else "ContactID",
-                             "statuses": "Status"}.items():
+    for parameter, field in {
+        "ids": ID_FIELDS[resource],
+        "invoicenumbers": "InvoiceNumber",
+        "contactids": "Contact.ContactID" if resource != "Contacts" else "ContactID",
+        "statuses": "Status",
+    }.items():
         if parameter in query:
             wanted = {v.strip().lower() for v in query[parameter].split(",")}
             records = [r for r in records if str(path(r, field)).lower() in wanted]
@@ -175,16 +190,30 @@ def select(request: Request, resource: str, records: list[dict[str, Any]]) -> tu
             validation("If-Modified-Since must be a valid UTC date.")
         records = [r for r in records if r.get("UpdatedDateUTC") and instant(r["UpdatedDateUTC"]) > since]
     if term := query.get("searchterm"):
-        records = [r for r in records if term.casefold().strip('"') in str(r.get("InvoiceNumber", "")
-                    + " " + r.get("Reference", "") + " " + r.get("Name", "")).casefold()]
+        records = [
+            r
+            for r in records
+            if term.casefold().strip('"')
+            in str(
+                r.get("InvoiceNumber", "") + " " + r.get("Reference", "") + " " + r.get("Name", "")
+            ).casefold()
+        ]
     order = query.get("order", "UpdatedDateUTC ASC," + ID_FIELDS[resource] + " ASC")
     for clause in reversed(order.split(",")):
         match = re.fullmatch(r"\s*([\w.]+)(?:\s+(ASC|DESC))?\s*", clause, re.I)
         if not match:
             validation("Invalid order expression.")
-        records = sorted(records, key=lambda r: (path(r, match[1]) is None, path(r, match[1]) or ""),
-                         reverse=(match[2] or "").upper() == "DESC")
-    paged = "page" in query or "pagesize" in query or "statuses" in query or query.get("summaryonly", "").lower() == "true"
+        records = sorted(
+            records,
+            key=lambda r: (path(r, match[1]) is None, path(r, match[1]) or ""),
+            reverse=(match[2] or "").upper() == "DESC",
+        )
+    paged = (
+        "page" in query
+        or "pagesize" in query
+        or "statuses" in query
+        or query.get("summaryonly", "").lower() == "true"
+    )
     extra: dict[str, Any] = {}
     if paged:
         try:
@@ -194,13 +223,21 @@ def select(request: Request, resource: str, records: list[dict[str, Any]]) -> tu
         if page < 1:
             validation("Page must be greater than zero.")
         count = len(records)
-        records = records[(page - 1) * size: page * size]
-        extra["pagination"] = {"page": page, "pageSize": size, "pageCount": math.ceil(count / size), "itemCount": count}
+        records = records[(page - 1) * size : page * size]
+        extra["pagination"] = {
+            "page": page,
+            "pageSize": size,
+            "pageCount": math.ceil(count / size),
+            "itemCount": count,
+        }
     result = public(records)
     if resource == "Invoices" and not paged:
         result = [{k: v for k, v in r.items() if k != "LineItems"} for r in result]
     if query.get("summaryonly", "").lower() == "true":
-        excluded = {"LineItems", "Payments", "HasAttachments", "CISDeduction"} if resource == "Invoices" else {
-            "Addresses", "Balances", "ContactGroups", "ContactPersons", "IsCustomer", "IsSupplier"}
+        excluded = (
+            {"LineItems", "Payments", "HasAttachments", "CISDeduction"}
+            if resource == "Invoices"
+            else {"Addresses", "Balances", "ContactGroups", "ContactPersons", "IsCustomer", "IsSupplier"}
+        )
         result = [{k: v for k, v in r.items() if k not in excluded} for r in result]
     return result, extra

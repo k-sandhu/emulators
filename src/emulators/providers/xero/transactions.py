@@ -26,7 +26,10 @@ def number(value: Any, field: str) -> Decimal:
 def account_ref(ctx: ProviderContext, tenant: str, value: Any, *, payment: bool = False) -> dict[str, Any]:
     if not isinstance(value, dict) or not (value.get("AccountID") or value.get("Code")):
         validation("An AccountID or Code is required.")
-    account = find(ctx, "Accounts", tenant, str(value.get("AccountID") or value["Code"]))
+    try:
+        account = find(ctx, "Accounts", tenant, str(value.get("AccountID") or value["Code"]))
+    except EmulatorError:
+        validation("The account is not valid.")
     if account["Status"] != "ACTIVE" or (payment and not account.get("EnablePaymentsToAccount")):
         validation("The account is not valid for payments.")
     return {k: account[k] for k in ["AccountID", "Code", "Name"]}
@@ -45,7 +48,9 @@ def contact_ref(ctx: ProviderContext, tenant: str, value: Any) -> dict[str, Any]
         name = str(value.get("Name", "")).strip()
         if not name:
             validation("A ContactID or contact Name is required.")
-        contact = next((c for c in rows(ctx, "Contacts", tenant) if c["Name"].casefold() == name.casefold()), None)
+        contact = next(
+            (c for c in rows(ctx, "Contacts", tenant) if c["Name"].casefold() == name.casefold()), None
+        )
         if contact is None:
             contact = save_simple(ctx, tenant, "Contacts", value, None)
     if contact.get("ContactStatus") != "ACTIVE":
@@ -95,72 +100,143 @@ def line_items(ctx: ProviderContext, tenant: str, record: dict[str, Any], *, pur
         discount = number(line.get("DiscountRate", 0), "DiscountRate")
         if not 0 <= discount <= 100:
             validation("DiscountRate must be between 0 and 100.")
-        gross = money(quantity * unit * (1 - discount / 100))
+        if (purchase or record.get("Type", "").endswith("CREDIT")) and any(
+            k in line for k in ["DiscountRate", "DiscountAmount"]
+        ):
+            validation("Discounts are supported only on sales invoices and quotes.")
+        if "DiscountAmount" in line:
+            discount_amount = number(line["DiscountAmount"], "DiscountAmount")
+            if discount_amount < 0 or discount_amount > quantity * unit:
+                validation("DiscountAmount must not exceed the line value.")
+            gross = money(quantity * unit - discount_amount)
+        else:
+            gross = money(quantity * unit * (1 - discount / 100))
         line.setdefault("AccountCode", defaults.get("AccountCode", ""))
         try:
             account = find(ctx, "Accounts", tenant, str(line["AccountCode"]))
         except EmulatorError:
             validation("The AccountCode is not valid.")
-        if account["Status"] != "ACTIVE" or account.get("SystemAccount"):
+        if account["Status"] != "ACTIVE" or account.get("SystemAccount") or account["Type"] == "BANK":
             validation("The account cannot be used on a line item.")
         line["AccountCode"] = account["Code"]
         line.setdefault("TaxType", defaults.get("TaxType", account.get("TaxType", "NONE")))
-        taxes = [t for t in rows(ctx, "TaxRates", tenant) if t["TaxType"] == line["TaxType"] and t["Status"] == "ACTIVE"]
+        taxes = [
+            t
+            for t in rows(ctx, "TaxRates", tenant)
+            if t["TaxType"] == line["TaxType"] and t["Status"] == "ACTIVE"
+        ]
         if not taxes:
             validation("The TaxType is not valid.")
         rate = Decimal(str(taxes[0]["EffectiveRate"])) / 100 if mode != "NoTax" else Decimal(0)
-        tax = money(Decimal(str(gross)) * rate / (1 + rate)) if mode == "Inclusive" else money(Decimal(str(gross)) * rate)
+        tax = (
+            money(Decimal(str(gross)) * rate / (1 + rate))
+            if mode == "Inclusive"
+            else money(Decimal(str(gross)) * rate)
+        )
         if "TaxAmount" in line and mode != "NoTax":
             tax = money(line["TaxAmount"])
         if mode == "NoTax":
             tax = 0.0
         line["TaxAmount"] = tax
-        line["LineAmount"] = money(gross - tax) if mode == "Inclusive" else gross
+        line["LineAmount"] = gross
         line.setdefault("LineItemID", ctx.ids.guid())
         tracking = line.setdefault("Tracking", [])
         if not isinstance(tracking, list) or len(tracking) > 2:
             validation("A line may have at most two tracking categories.")
         categories = set()
         for track in tracking:
-            category = next((c for c in rows(ctx, "TrackingCategories", tenant)
-                             if track.get("TrackingCategoryID") == c["TrackingCategoryID"] or track.get("Name") == c["Name"]), None)
-            option = next((o for o in (category or {}).get("Options", [])
-                           if track.get("TrackingOptionID") == o["TrackingOptionID"] or track.get("Option") == o["Name"]), None)
+            if not isinstance(track, dict):
+                validation("Tracking must contain category and option objects.")
+            category = next(
+                (
+                    c
+                    for c in rows(ctx, "TrackingCategories", tenant)
+                    if track.get("TrackingCategoryID") == c["TrackingCategoryID"]
+                    or track.get("Name") == c["Name"]
+                ),
+                None,
+            )
+            option = next(
+                (
+                    o
+                    for o in (category or {}).get("Options", [])
+                    if track.get("TrackingOptionID") == o["TrackingOptionID"]
+                    or track.get("Option") == o["Name"]
+                ),
+                None,
+            )
             if not category or not option or option["Status"] != "ACTIVE" or category["Status"] != "ACTIVE":
                 validation("The tracking category or option is not valid.")
             if category["TrackingCategoryID"] in categories:
                 validation("A tracking category cannot be repeated on a line.")
             categories.add(category["TrackingCategoryID"])
-            track.update(TrackingCategoryID=category["TrackingCategoryID"], Name=category["Name"],
-                         TrackingOptionID=option["TrackingOptionID"], Option=option["Name"])
+            track.update(
+                TrackingCategoryID=category["TrackingCategoryID"],
+                Name=category["Name"],
+                TrackingOptionID=option["TrackingOptionID"],
+                Option=option["Name"],
+            )
         result.append(line)
     record["LineItems"] = result
-    record["SubTotal"] = money(sum(Decimal(str(l["LineAmount"])) for l in result))
-    record["TotalTax"] = money(sum(Decimal(str(l["TaxAmount"])) for l in result))
+    record["SubTotal"] = money(
+        sum(
+            Decimal(str(line["LineAmount"]))
+            - (Decimal(str(line["TaxAmount"])) if mode == "Inclusive" else Decimal(0))
+            for line in result
+        )
+    )
+    record["TotalTax"] = money(sum(Decimal(str(line["TaxAmount"])) for line in result))
     record["Total"] = money(Decimal(str(record["SubTotal"])) + Decimal(str(record["TotalTax"])))
 
 
 def settle(ctx: ProviderContext, tenant: str, invoice: dict[str, Any]) -> None:
-    payments = [p for p in rows(ctx, "Payments", tenant)
-                if p.get("Invoice", {}).get("InvoiceID") == invoice["InvoiceID"] and p["Status"] == "AUTHORISED"]
-    invoice["Payments"] = [{k: p[k] for k in ["PaymentID", "Date", "Amount", "Reference", "CurrencyRate"]}
-                           for p in payments]
+    invoice.pop("_pdf", None)
+    payments = [
+        p
+        for p in rows(ctx, "Payments", tenant)
+        if p.get("Invoice", {}).get("InvoiceID") == invoice["InvoiceID"] and p["Status"] == "AUTHORISED"
+    ]
+    invoice["Payments"] = [
+        {k: p[k] for k in ["PaymentID", "Date", "Amount", "Reference", "CurrencyRate"]} for p in payments
+    ]
     invoice["AmountPaid"] = money(sum(p["Amount"] for p in payments))
-    credited = sum(a["AppliedAmount"] for c in rows(ctx, "CreditNotes", tenant) if c["Status"] not in {"VOIDED", "DELETED"}
-                   for a in c.get("Allocations", []) if a["Invoice"]["InvoiceID"] == invoice["InvoiceID"])
+    credited = sum(
+        a["Amount"]
+        for c in rows(ctx, "CreditNotes", tenant)
+        if c["Status"] not in {"VOIDED", "DELETED"}
+        for a in c.get("Allocations", [])
+        if a["Invoice"]["InvoiceID"] == invoice["InvoiceID"]
+    )
     invoice["AmountCredited"] = money(credited)
-    invoice["AmountDue"] = 0.0 if invoice["Status"] in {"VOIDED", "DELETED"} else money(invoice["Total"] - invoice["AmountPaid"] - credited)
+    invoice["AmountDue"] = (
+        0.0
+        if invoice["Status"] in {"VOIDED", "DELETED"}
+        else money(invoice["Total"] - invoice["AmountPaid"] - credited)
+    )
     if invoice["Status"] in {"AUTHORISED", "PAID"}:
         invoice["Status"] = "PAID" if invoice["AmountDue"] == 0 else "AUTHORISED"
-    if invoice["Status"] == "PAID" and payments:
-        invoice["FullyPaidOnDate"] = max(payments, key=lambda p: instant(p["Date"]))["Date"]
+    if invoice["Status"] == "PAID":
+        settled_dates = [p["Date"] for p in payments]
+        settled_dates.extend(
+            a["Date"]
+            for credit in rows(ctx, "CreditNotes", tenant)
+            if credit["Status"] in {"AUTHORISED", "PAID"}
+            for a in credit.get("Allocations", [])
+            if a["Invoice"]["InvoiceID"] == invoice["InvoiceID"]
+        )
+        invoice["FullyPaidOnDate"] = max(settled_dates or [invoice["Date"]], key=instant)
     else:
         invoice.pop("FullyPaidOnDate", None)
     stamp(ctx, invoice)
 
 
-def save_invoice(ctx: ProviderContext, tenant: str, value: dict[str, Any], old: dict[str, Any] | None,
-                 resource: str = "Invoices") -> dict[str, Any]:
+def save_invoice(
+    ctx: ProviderContext,
+    tenant: str,
+    value: dict[str, Any],
+    old: dict[str, Any] | None,
+    resource: str = "Invoices",
+) -> dict[str, Any]:
     record = {**copy.deepcopy(old or {}), **copy.deepcopy(value)}
     field = ID_FIELDS[resource]
     record.setdefault(field, ctx.ids.guid())
@@ -172,16 +248,47 @@ def save_invoice(ctx: ProviderContext, tenant: str, value: dict[str, Any], old: 
     if resource == "Quotes":
         record.pop("Type", None)
     record.setdefault("Status", "DRAFT")
-    transitions = {"DRAFT": {"DRAFT", "SUBMITTED", "AUTHORISED", "DELETED"},
+    transitions = {
+        "DRAFT": {"DRAFT", "SUBMITTED", "AUTHORISED", "DELETED"},
         "SUBMITTED": {"SUBMITTED", "DRAFT", "AUTHORISED", "DELETED"},
-        "AUTHORISED": {"AUTHORISED", "VOIDED"}, "PAID": {"PAID"}, "VOIDED": {"VOIDED"}, "DELETED": {"DELETED"}}
+        "AUTHORISED": {"AUTHORISED", "VOIDED"},
+        "PAID": {"PAID"},
+        "VOIDED": {"VOIDED"},
+        "DELETED": {"DELETED"},
+    }
     if resource == "Quotes":
-        transitions = {"DRAFT": {"DRAFT", "SENT", "DELETED"}, "SENT": {"SENT", "ACCEPTED", "DECLINED", "DELETED"},
-                       "ACCEPTED": {"ACCEPTED", "INVOICED"}, "DECLINED": {"DECLINED"}, "INVOICED": {"INVOICED"}, "DELETED": {"DELETED"}}
+        transitions = {
+            "DRAFT": {"DRAFT", "SENT", "DELETED"},
+            "SENT": {"SENT", "ACCEPTED", "DECLINED", "DELETED"},
+            "ACCEPTED": {"ACCEPTED", "INVOICED"},
+            "DECLINED": {"DECLINED"},
+            "INVOICED": {"INVOICED"},
+            "DELETED": {"DELETED"},
+        }
     before = (old or {}).get("Status", "DRAFT")
     if record["Status"] not in transitions.get(before, set()):
         validation("The status transition is not valid.", record)
-    if old and (old.get("AmountPaid", 0) or old.get("AmountCredited", 0)) and any(k in value for k in ["LineItems", "Contact", "Type", "Date", "CurrencyCode"]):
+    if old and resource != "Quotes" and record["Type"] != old["Type"]:
+        validation("The Type cannot be changed.", record)
+    if old and old["Status"] in {"DELETED", "VOIDED"} and any(k not in {field, "Status"} for k in value):
+        validation("Deleted or voided transactions cannot be edited.", record)
+    if resource == "CreditNotes":
+        if "Allocations" in value:
+            validation("Use the Allocations endpoint to allocate a credit note.")
+        if (
+            old
+            and old.get("Allocations")
+            and (
+                record["Status"] == "VOIDED"
+                or any(k in value for k in ["LineItems", "Contact", "Date", "CurrencyCode"])
+            )
+        ):
+            validation("Remove credit allocations before changing financial details or voiding.")
+    if (
+        old
+        and (old.get("AmountPaid", 0) or old.get("AmountCredited", 0))
+        and any(k in value for k in ["LineItems", "Contact", "Type", "Date", "CurrencyCode"])
+    ):
         validation("Paid or credited invoices cannot have their financial details changed.", record)
     if record["Status"] == "VOIDED" and (record.get("AmountPaid", 0) or record.get("AmountCredited", 0)):
         validation("Remove payments and credit allocations before voiding.", record)
@@ -198,9 +305,20 @@ def save_invoice(ctx: ProviderContext, tenant: str, value: dict[str, Any], old: 
         line_items(ctx, tenant, record, purchase=record.get("Type", "").startswith("ACCPAY"))
     if record["Total"] < 0:
         validation("The total cannot be negative.", record)
-    number_field = {"Invoices": "InvoiceNumber", "CreditNotes": "CreditNoteNumber", "Quotes": "QuoteNumber"}[resource]
-    record.setdefault(number_field, {"Invoices": "INV-", "CreditNotes": "CN-", "Quotes": "QU-"}[resource] + str(ctx.ids.sequence(resource, 2000)))
-    if any(r[number_field] == record[number_field] and r[field] != record[field] and r.get("Type") == record.get("Type") for r in rows(ctx, resource, tenant)):
+    number_field = {"Invoices": "InvoiceNumber", "CreditNotes": "CreditNoteNumber", "Quotes": "QuoteNumber"}[
+        resource
+    ]
+    record.setdefault(
+        number_field,
+        {"Invoices": "INV-", "CreditNotes": "CN-", "Quotes": "QU-"}[resource]
+        + str(ctx.ids.sequence(resource, 2000)),
+    )
+    if any(
+        r[number_field] == record[number_field]
+        and r[field] != record[field]
+        and r.get("Type") == record.get("Type")
+        for r in rows(ctx, resource, tenant)
+    ):
         validation(f"{number_field} must be unique.", record)
     record.setdefault("Reference", "")
     record.setdefault("HasAttachments", False)
@@ -210,7 +328,9 @@ def save_invoice(ctx: ProviderContext, tenant: str, value: dict[str, Any], old: 
         settle(ctx, tenant, record)
     elif resource == "CreditNotes":
         record.setdefault("Allocations", [])
-        record["RemainingCredit"] = money(record["Total"] - sum(a["AppliedAmount"] for a in record["Allocations"]))
+        record["RemainingCredit"] = money(record["Total"] - sum(a["Amount"] for a in record["Allocations"]))
+        if record["Status"] in {"VOIDED", "DELETED"}:
+            record["RemainingCredit"] = 0.0
     stamp(ctx, record)
     put(ctx, resource, tenant, record)
     if resource == "Invoices":
@@ -219,7 +339,9 @@ def save_invoice(ctx: ProviderContext, tenant: str, value: dict[str, Any], old: 
     return record
 
 
-def save_payment(ctx: ProviderContext, tenant: str, value: dict[str, Any], old: dict[str, Any] | None) -> dict[str, Any]:
+def save_payment(
+    ctx: ProviderContext, tenant: str, value: dict[str, Any], old: dict[str, Any] | None
+) -> dict[str, Any]:
     if old:
         if value.get("Status") != "DELETED":
             validation("Payments can only be updated to DELETED.")
@@ -231,7 +353,10 @@ def save_payment(ctx: ProviderContext, tenant: str, value: dict[str, Any], old: 
         return record
     if not isinstance(value.get("Invoice"), dict) or not value["Invoice"].get("InvoiceID"):
         validation("An InvoiceID is required.")
-    invoice = find(ctx, "Invoices", tenant, value["Invoice"]["InvoiceID"])
+    try:
+        invoice = find(ctx, "Invoices", tenant, value["Invoice"]["InvoiceID"])
+    except EmulatorError:
+        validation("The InvoiceID is not valid.")
     if invoice["Status"] != "AUTHORISED":
         validation("Payments can only be applied to authorised invoices.", value)
     amount = money(value.get("Amount", 0))
@@ -240,10 +365,17 @@ def save_payment(ctx: ProviderContext, tenant: str, value: dict[str, Any], old: 
     account = account_ref(ctx, tenant, value.get("Account"), payment=True)
     if value.get("Status", "AUTHORISED") != "AUTHORISED":
         validation("The payment Status is not valid.")
-    record = {"PaymentID": value.get("PaymentID", ctx.ids.guid()), "Amount": amount,
-              "Account": account, "Invoice": {k: invoice[k] for k in ["InvoiceID", "InvoiceNumber", "Type", "Contact"]},
-              "Reference": value.get("Reference", ""), "CurrencyRate": 1.0, "IsReconciled": bool(value.get("IsReconciled", False)),
-              "Status": "AUTHORISED", "PaymentType": "ACCRECPAYMENT" if invoice["Type"] == "ACCREC" else "ACCPAYPAYMENT"}
+    record = {
+        "PaymentID": value.get("PaymentID", ctx.ids.guid()),
+        "Amount": amount,
+        "Account": account,
+        "Invoice": {k: invoice[k] for k in ["InvoiceID", "InvoiceNumber", "Type", "Contact"]},
+        "Reference": value.get("Reference", ""),
+        "CurrencyRate": 1.0,
+        "IsReconciled": bool(value.get("IsReconciled", False)),
+        "Status": "AUTHORISED",
+        "PaymentType": "ACCRECPAYMENT" if invoice["Type"] == "ACCREC" else "ACCPAYPAYMENT",
+    }
     if "Date" not in value:
         validation("A Date is required.", value)
     record["Date"] = value["Date"]
@@ -256,7 +388,9 @@ def save_payment(ctx: ProviderContext, tenant: str, value: dict[str, Any], old: 
     return record
 
 
-def save_simple(ctx: ProviderContext, tenant: str, resource: str, value: dict[str, Any], old: dict[str, Any] | None) -> dict[str, Any]:
+def save_simple(
+    ctx: ProviderContext, tenant: str, resource: str, value: dict[str, Any], old: dict[str, Any] | None
+) -> dict[str, Any]:
     record = {**copy.deepcopy(old or {}), **copy.deepcopy(value)}
     field = ID_FIELDS[resource]
     record.setdefault(field, ctx.ids.guid())
@@ -266,7 +400,10 @@ def save_simple(ctx: ProviderContext, tenant: str, resource: str, value: dict[st
             validation("Name is required and must be less than 256 characters.", record)
         if name != name.strip() or "  " in name or "<" in name or ">" in name:
             validation("Name contains invalid whitespace or characters.", record)
-        if any(r["Name"].casefold() == name.casefold() and r[field] != record[field] for r in rows(ctx, resource, tenant)):
+        if any(
+            r["Name"].casefold() == name.casefold() and r[field] != record[field]
+            for r in rows(ctx, resource, tenant)
+        ):
             validation("Name must be unique.", record)
     if resource == "Contacts":
         record.setdefault("ContactStatus", "ACTIVE")
@@ -280,13 +417,52 @@ def save_simple(ctx: ProviderContext, tenant: str, resource: str, value: dict[st
             record.setdefault(key, [])
         record.setdefault("DefaultCurrency", "USD")
         record.pop("Balances", None)
+        if record.get("ContactNumber") and any(
+            c.get("ContactNumber") == record["ContactNumber"] and c["ContactID"] != record["ContactID"]
+            for c in rows(ctx, resource, tenant)
+        ):
+            validation("ContactNumber must be unique.")
     elif resource == "Accounts":
-        kinds = {"BANK", "CURRENT", "CURRLIAB", "DEPRECIATN", "DIRECTCOSTS", "EQUITY", "EXPENSE", "FIXED", "INVENTORY", "LIABILITY", "NONCURRENT", "OTHERINCOME", "OVERHEADS", "PREPAYMENT", "REVENUE", "SALES", "TERMLIAB"}
+        kinds = {
+            "BANK",
+            "CURRENT",
+            "CURRLIAB",
+            "DEPRECIATN",
+            "DIRECTCOSTS",
+            "EQUITY",
+            "EXPENSE",
+            "FIXED",
+            "INVENTORY",
+            "LIABILITY",
+            "NONCURRENT",
+            "OTHERINCOME",
+            "OVERHEADS",
+            "PREPAYMENT",
+            "REVENUE",
+            "SALES",
+            "TERMLIAB",
+        }
         if not record.get("Code") or record.get("Type") not in kinds:
             validation("A Code and valid Type are required.", record)
-        if any(r["Code"] == record["Code"] and r[field] != record[field] for r in rows(ctx, resource, tenant)):
+        if any(
+            r["Code"] == record["Code"] and r[field] != record[field] for r in rows(ctx, resource, tenant)
+        ):
             validation("Account Code must be unique.")
-        record["Class"] = {"BANK": "ASSET", "CURRENT": "ASSET", "FIXED": "ASSET", "INVENTORY": "ASSET", "NONCURRENT": "ASSET", "PREPAYMENT": "ASSET", "CURRLIAB": "LIABILITY", "TERMLIAB": "LIABILITY", "LIABILITY": "LIABILITY", "EQUITY": "EQUITY", "REVENUE": "REVENUE", "SALES": "REVENUE", "OTHERINCOME": "REVENUE"}.get(record["Type"], "EXPENSE")
+        record["Class"] = {
+            "BANK": "ASSET",
+            "CURRENT": "ASSET",
+            "FIXED": "ASSET",
+            "INVENTORY": "ASSET",
+            "NONCURRENT": "ASSET",
+            "PREPAYMENT": "ASSET",
+            "CURRLIAB": "LIABILITY",
+            "TERMLIAB": "LIABILITY",
+            "LIABILITY": "LIABILITY",
+            "EQUITY": "EQUITY",
+            "REVENUE": "REVENUE",
+            "SALES": "REVENUE",
+            "OTHERINCOME": "REVENUE",
+        }.get(record["Type"], "EXPENSE")
         record.setdefault("TaxType", "NONE")
         record.setdefault("EnablePaymentsToAccount", record["Type"] == "BANK")
         record.setdefault("Status", "ACTIVE")
@@ -294,12 +470,21 @@ def save_simple(ctx: ProviderContext, tenant: str, resource: str, value: dict[st
             validation("Invalid account Status.")
         if old and old.get("SystemAccount") and any(k in value for k in ["Status", "Code", "Type"]):
             validation("System accounts cannot be changed.")
+        if old and any(record[k] != old[k] for k in ["Code", "Type"]):
+            from .ledger import postings
+
+            if any(p.code == old["Code"] and p.amount for p in postings(ctx, tenant)):
+                validation(
+                    "This emulator requires account codes and types with transactions to remain unchanged."
+                )
     elif resource == "Items":
         if not record.get("Code"):
             validation("Code is required.")
         if record.get("IsTrackedAsInventory"):
             validation("Tracked inventory is not supported by this emulator.")
-        if any(r["Code"] == record["Code"] and r[field] != record[field] for r in rows(ctx, resource, tenant)):
+        if any(
+            r["Code"] == record["Code"] and r[field] != record[field] for r in rows(ctx, resource, tenant)
+        ):
             validation("Item Code must be unique.")
         record.setdefault("IsSold", True)
         record.setdefault("IsPurchased", False)
@@ -321,7 +506,9 @@ def save_simple(ctx: ProviderContext, tenant: str, resource: str, value: dict[st
     return put(ctx, resource, tenant, record)
 
 
-def save_bank(ctx: ProviderContext, tenant: str, resource: str, value: dict[str, Any], old: dict[str, Any] | None) -> dict[str, Any]:
+def save_bank(
+    ctx: ProviderContext, tenant: str, resource: str, value: dict[str, Any], old: dict[str, Any] | None
+) -> dict[str, Any]:
     record = {**copy.deepcopy(old or {}), **copy.deepcopy(value)}
     record.setdefault(ID_FIELDS[resource], ctx.ids.guid())
     if resource == "BankTransfers":
@@ -345,6 +532,10 @@ def save_bank(ctx: ProviderContext, tenant: str, resource: str, value: dict[str,
             validation("Posted journals must be voided.")
         if not record.get("Narration") or not record.get("JournalLines"):
             validation("Narration and JournalLines are required.")
+        if not isinstance(record["JournalLines"], list) or any(
+            not isinstance(line, dict) for line in record["JournalLines"]
+        ):
+            validation("JournalLines must be an array of objects.")
         if record.get("LineAmountTypes", "NoTax") != "NoTax":
             validation("This emulator supports NoTax manual journals only.")
         record["LineAmountTypes"] = "NoTax"
@@ -355,7 +546,7 @@ def save_bank(ctx: ProviderContext, tenant: str, resource: str, value: dict[str,
                 validation("Bank and system accounts cannot be used in manual journals.")
             line["LineAmount"] = money(line.get("LineAmount", 0))
             line.setdefault("TaxType", "NONE")
-        if money(sum(l["LineAmount"] for l in record["JournalLines"])) != 0:
+        if money(sum(line["LineAmount"] for line in record["JournalLines"])) != 0:
             validation("Debits and credits must balance.")
         record.setdefault("ShowOnCashBasisReports", True)
     else:
@@ -365,6 +556,8 @@ def save_bank(ctx: ProviderContext, tenant: str, resource: str, value: dict[str,
         record.setdefault("Status", "AUTHORISED")
         if record["Status"] not in {"AUTHORISED", "DELETED"}:
             validation("Invalid bank transaction Status.")
+        if old and old["Status"] == "DELETED" and record["Status"] != "DELETED":
+            validation("Deleted bank transactions cannot be restored.")
         record["Contact"] = contact_ref(ctx, tenant, record.get("Contact"))
         record["BankAccount"] = account_ref(ctx, tenant, record.get("BankAccount"), payment=True)
         line_items(ctx, tenant, record, purchase=record["Type"] == "SPEND")
@@ -378,7 +571,9 @@ def save_bank(ctx: ProviderContext, tenant: str, resource: str, value: dict[str,
     return put(ctx, resource, tenant, record)
 
 
-def mutate(ctx: ProviderContext, tenant: str, resource: str, value: dict[str, Any], identifier: str | None = None) -> tuple[dict[str, Any], bool]:
+def mutate(
+    ctx: ProviderContext, tenant: str, resource: str, value: dict[str, Any], identifier: str | None = None
+) -> tuple[dict[str, Any], bool]:
     if not isinstance(value, dict):
         validation("Each element must be an object.")
     value = {k: v for k, v in value.items() if not k.startswith("_")}
@@ -405,5 +600,12 @@ def mutate(ctx: ProviderContext, tenant: str, resource: str, value: dict[str, An
         record = save_bank(ctx, tenant, resource, value, old)
     else:
         record = save_simple(ctx, tenant, resource, value, old)
-    history(ctx, tenant, resource, record[field], "Resource updated" if old else "Resource created", changes="Updated" if old else "Created")
+    history(
+        ctx,
+        tenant,
+        resource,
+        record[field],
+        "Resource updated" if old else "Resource created",
+        changes="Updated" if old else "Created",
+    )
     return record, old is None

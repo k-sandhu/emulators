@@ -19,17 +19,35 @@ from emulators.core.provider import ProviderContext
 BASE = "/api.xro/2.0"
 NOT_FOUND = "The resource you're looking for cannot be found"
 FULL_SCOPES = [
-    "openid", "profile", "email", "offline_access", "accounting.transactions",
-    "accounting.contacts", "accounting.settings", "accounting.reports.read",
-    "accounting.attachments", "files",
+    "openid",
+    "profile",
+    "email",
+    "offline_access",
+    "accounting.transactions",
+    "accounting.contacts",
+    "accounting.settings",
+    "accounting.reports.read",
+    "accounting.attachments",
+    "files",
 ]
 ID_FIELDS = {
-    "Organisation": "OrganisationID", "Accounts": "AccountID", "Contacts": "ContactID",
-    "ContactGroups": "ContactGroupID", "Items": "ItemID", "Invoices": "InvoiceID",
-    "Payments": "PaymentID", "BankTransactions": "BankTransactionID", "BankTransfers": "BankTransferID",
-    "CreditNotes": "CreditNoteID", "ManualJournals": "ManualJournalID", "Quotes": "QuoteID",
-    "TrackingCategories": "TrackingCategoryID", "TaxRates": "TaxType", "Currencies": "Code",
-    "BrandingThemes": "BrandingThemeID", "Users": "UserID",
+    "Organisation": "OrganisationID",
+    "Accounts": "AccountID",
+    "Contacts": "ContactID",
+    "ContactGroups": "ContactGroupID",
+    "Items": "ItemID",
+    "Invoices": "InvoiceID",
+    "Payments": "PaymentID",
+    "BankTransactions": "BankTransactionID",
+    "BankTransfers": "BankTransferID",
+    "CreditNotes": "CreditNoteID",
+    "ManualJournals": "ManualJournalID",
+    "Quotes": "QuoteID",
+    "TrackingCategories": "TrackingCategoryID",
+    "TaxRates": "TaxType",
+    "Currencies": "Code",
+    "BrandingThemes": "BrandingThemeID",
+    "Users": "UserID",
 }
 READ_ONLY = {"Organisation", "Currencies", "BrandingThemes", "Users", "TaxRates"}
 
@@ -79,15 +97,25 @@ def public(value: Any) -> Any:
 
 
 def problem(status: int, detail: str = "AuthenticationUnsuccessful") -> dict[str, Any]:
-    return {"Type": "https://httpstatuses.com/" + str(status),
-            "Title": {401: "Unauthorized", 403: "Forbidden", 429: "Too Many Requests"}.get(status, "Error"),
-            "Status": status, "Detail": detail}
+    return {
+        "Type": "https://httpstatuses.com/" + str(status),
+        "Title": {401: "Unauthorized", 403: "Forbidden", 429: "Too Many Requests"}.get(status, "Error"),
+        "Status": status,
+        "Detail": detail,
+    }
 
 
 def validation(message: str, record: dict[str, Any] | None = None) -> NoReturn:
     element = {**public(copy.deepcopy(record or {})), "ValidationErrors": [{"Message": message}]}
-    raise EmulatorError(400, {"ErrorNumber": 10, "Type": "ValidationException",
-                             "Message": "A validation exception occurred", "Elements": [element]})
+    raise EmulatorError(
+        400,
+        {
+            "ErrorNumber": 10,
+            "Type": "ValidationException",
+            "Message": "A validation exception occurred",
+            "Elements": [element],
+        },
+    )
 
 
 def missing() -> NoReturn:
@@ -104,8 +132,12 @@ def find(ctx: ProviderContext, resource: str, tenant: str, identifier: str) -> d
         if str(record.get(field, "")).lower() == identifier.lower():
             return record
         if resource in {"Invoices", "Quotes", "Items", "Accounts"}:
-            alternate = {"Invoices": "InvoiceNumber", "Quotes": "QuoteNumber",
-                         "Items": "Code", "Accounts": "Code"}[resource]
+            alternate = {
+                "Invoices": "InvoiceNumber",
+                "Quotes": "QuoteNumber",
+                "Items": "Code",
+                "Accounts": "Code",
+            }[resource]
             if record.get(alternate) == identifier:
                 return record
     missing()
@@ -117,9 +149,17 @@ def put(ctx: ProviderContext, resource: str, tenant: str, record: dict[str, Any]
     return record
 
 
-def envelope(ctx: ProviderContext, resource: str, records: list[dict[str, Any]], **extra: Any) -> dict[str, Any]:
-    return {"Id": ctx.ids.guid(), "Status": "OK", "ProviderName": "Emulators",
-            "DateTimeUTC": msdate(ctx.clock.now(), offset=False), resource: public(records), **extra}
+def envelope(
+    ctx: ProviderContext, resource: str, records: list[dict[str, Any]], **extra: Any
+) -> dict[str, Any]:
+    return {
+        "Id": ctx.ids.guid(),
+        "Status": "OK",
+        "ProviderName": "Emulators",
+        "DateTimeUTC": msdate(ctx.clock.now(), offset=False),
+        resource: public(records),
+        **extra,
+    }
 
 
 def actor(ctx: ProviderContext, request: Request) -> Grant:
@@ -133,12 +173,13 @@ def actor(ctx: ProviderContext, request: Request) -> Grant:
     return grant
 
 
-def access(ctx: ProviderContext, request: Request, resource: str, *, write: bool = False) -> tuple[Grant, str]:
+def access(
+    ctx: ProviderContext, request: Request, resource: str, *, write: bool = False
+) -> tuple[Grant, str]:
     grant = actor(ctx, request)
     tenant = request.headers.get("xero-tenant-id", "").lower()
     connections = ctx.store.collection("_connections").filter(
-        lambda c: c["_client"] == grant.client_id and c["_user"] == grant.user_id
-        and c["tenantId"] == tenant
+        lambda c: c["_client"] == grant.client_id and c["_user"] == grant.user_id and c["tenantId"] == tenant
     )
     if not connections:
         raise EmulatorError(403, problem(403))
@@ -147,12 +188,24 @@ def access(ctx: ProviderContext, request: Request, resource: str, *, write: bool
         if user is None or user["role"] == "READONLY":
             raise EmulatorError(403, problem(403, "You do not have permission to access this resource"))
     if resource.startswith("Reports"):
-        scopes = {"accounting.reports.read", "accounting.reports." + resource.split("/")[-1].lower() + ".read"}
+        scopes = {
+            "accounting.reports.read",
+            "accounting.reports." + resource.split("/")[-1].lower() + ".read",
+        }
     elif resource in {"Contacts", "ContactGroups"}:
         scopes = {"accounting.contacts"}
     elif resource in {"Attachments"}:
         scopes = {"accounting.attachments", "files"}
-    elif resource in {"Organisation", "Accounts", "TrackingCategories", "TaxRates", "Currencies", "Users", "BrandingThemes", "Items"}:
+    elif resource in {
+        "Organisation",
+        "Accounts",
+        "TrackingCategories",
+        "TaxRates",
+        "Currencies",
+        "Users",
+        "BrandingThemes",
+        "Items",
+    }:
         scopes = {"accounting.settings"}
     else:
         scopes = {"accounting.transactions", "accounting." + resource.lower()}
@@ -167,11 +220,27 @@ def stamp(ctx: ProviderContext, record: dict[str, Any]) -> None:
     record["UpdatedDateUTC"] = msdate(ctx.clock.now())
 
 
-def history(ctx: ProviderContext, tenant: str, resource: str, identifier: str, message: str,
-            user: str = "Emulators", changes: str = "Updated") -> None:
-    ctx.store.collection("_history").put({"id": ctx.ids.guid(), "_tenant": tenant, "_resource": resource,
-        "_parent": identifier, "Changes": changes, "DateUTC": msdate(ctx.clock.now()),
-        "User": user, "Details": message})
+def history(
+    ctx: ProviderContext,
+    tenant: str,
+    resource: str,
+    identifier: str,
+    message: str,
+    user: str = "Emulators",
+    changes: str = "Updated",
+) -> None:
+    ctx.store.collection("_history").put(
+        {
+            "id": ctx.ids.guid(),
+            "_tenant": tenant,
+            "_resource": resource,
+            "_parent": identifier,
+            "Changes": changes,
+            "DateUTC": msdate(ctx.clock.now()),
+            "User": user,
+            "Details": message,
+        }
+    )
 
 
 def utc_text(ctx: ProviderContext) -> str:
