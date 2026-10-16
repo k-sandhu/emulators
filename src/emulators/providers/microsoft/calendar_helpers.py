@@ -16,6 +16,7 @@ from emulators.core.provider import ProviderContext
 from emulators.providers.microsoft import common as c
 from emulators.providers.microsoft import directory_support as s
 from emulators.providers.microsoft import outlook_payloads as payloads
+from emulators.providers.microsoft.calendar_links import external_join_url
 from emulators.world.model import Meeting
 
 ZONES = {
@@ -259,13 +260,7 @@ def from_meeting(ctx: ProviderContext, meeting: Meeting, pid: str) -> dict[str, 
     world = ctx.world
     uid = c.user_id(world, pid)
     link = (
-        c.join_web_url(world, meeting)
-        if meeting.platform == "teams"
-        else (
-            f"https://zoom.us/j/{int(stable_hash(meeting.id, length=12), 16) % 10**11:011d}"
-            if meeting.platform == "zoom"
-            else f"https://meet.google.com/{stable_hash(meeting.id, length=10)[:3]}-{stable_hash(meeting.id, length=10)[3:7]}-{stable_hash(meeting.id, length=10)[7:]}"
-        )
+        c.join_web_url(world, meeting) if meeting.platform == "teams" else external_join_url(world, meeting)
     )
     responses = dict(meeting.responses)
     payload = {

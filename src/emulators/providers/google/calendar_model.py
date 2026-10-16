@@ -15,6 +15,7 @@ from fastapi import Request
 from emulators.core.clock import isoformat_z
 from emulators.core.ids import b64url, b64url_decode, stable_hash
 from emulators.core.provider import ProviderContext, url_for_host
+from emulators.providers.google.calendar_links import external_join_url
 from emulators.providers.google.common import google_error, meet_code, meet_uri, principal, user_id
 from emulators.world.model import Meeting
 
@@ -169,14 +170,11 @@ def _event(ctx: ProviderContext, meeting: Meeting, calendar_id: str, key: str) -
         record["hangoutLink"] = meet_uri(ctx.world, meeting.id)
         record["conferenceData"] = conference_data(ctx, meeting.id)
     elif meeting.platform == "zoom":
-        link = "https://zoom.us/j/" + str(int(stable_hash(ctx.world.seed, "zoom", meeting.id), 16))[:11]
+        link = external_join_url(ctx.world, meeting)
         record["location"] = link
         record["description"] += "\nJoin Zoom: " + link
     else:
-        record["description"] += (
-            "\nJoin Microsoft Teams: https://teams.microsoft.com/l/meetup-join/"
-            + stable_hash(ctx.world.seed, meeting.id)
-        )
+        record["description"] += "\nJoin Microsoft Teams: " + external_join_url(ctx.world, meeting)
     return record
 
 

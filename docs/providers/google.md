@@ -210,6 +210,12 @@ sync/manual/async modes and the control-plane webhook journal work normally.
 mutations produce change-journal entries and notifications directly. Reset restores
 the seeded collections, grants, cursors, upload sessions and channels.
 
+Seeded Calendar invitations carry the exact Zoom series join URL and Teams join URL
+from the shared world's platform projections, including Zoom passwords and Teams
+tenant/organizer context. These links are derived from the world even in a
+Google-only hub; cross-system regression coverage lives in
+`tests/e2e/test_cross_system.py`.
+
 ## Known gaps
 
 - OAuth omits implicit/device flows, real consent policy, app verification, service-account

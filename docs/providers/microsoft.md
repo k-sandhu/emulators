@@ -242,6 +242,11 @@ All actions are POSTs under `/_emulator/actions/` (or `/microsoft/_emulator/acti
 | `approve_device_code` | `user_code`, `user` | Approve a pending device grant for a world user |
 | `expire_subscription` | `id` or `subscription_id`, optional `lifecycleEvent` | Deliver `reauthorizationRequired` (default) or `subscriptionRemoved`; the latter removes the subscription |
 
+Seeded Outlook invitations include the same Zoom series number/password and Google
+Meet code as those providers' projections. Non-Teams join links live in the event
+body; `onlineMeeting` remains null for those events. Cross-system calendar and
+transcript traversal is covered by `tests/e2e/test_cross_system.py`.
+
 ## Known gaps
 
 - Client registration/consent, Conditional Access, MFA, federation, external guest login,
