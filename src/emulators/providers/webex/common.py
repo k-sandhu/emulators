@@ -9,6 +9,7 @@ from contextvars import ContextVar
 from datetime import datetime, timedelta
 from typing import Any
 from urllib.parse import urlencode
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import Request
 from fastapi.responses import JSONResponse
@@ -113,7 +114,7 @@ def authenticate(request: Request, ctx: ProviderContext) -> Grant:
         fail(401, "The request requires a valid access token set in the Authorization request header.")
     if not grant.app_only:
         user = person(ctx, grant.user_id)
-        if not user or user["status"] == "inactive":
+        if not user or not user.get("_loginEnabled", True):
             fail(401, "The access token does not identify an active user.")
     return grant
 
@@ -149,7 +150,7 @@ def meeting_access(
     user = subject(ctx, grant)
     if user["type"] == "bot" or not grant.has_scope(f"meeting:{area}_{'write' if write else 'read'}"):
         return False
-    if area in ("recordings", "transcripts") or write:
+    if area in ("recordings", "transcripts", "participants") or write:
         return user["id"] == meeting["hostUserId"]
     return user["id"] in meeting.get("_people", [])
 
@@ -165,6 +166,40 @@ def get_meeting(
 
 def public(record: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in record.items() if not k.startswith("_")}
+
+
+def time_wire(request: Request, record: dict[str, Any]) -> dict[str, Any]:
+    """Meeting APIs use the timezone header for timestamps, independently of scheduling timezone."""
+    try:
+        zone = ZoneInfo(request.headers.get("timezone", "UTC"))
+    except (ValueError, OSError, ZoneInfoNotFoundError):
+        return fail(400, "Invalid timezone header.")
+    fields = {
+        "start",
+        "end",
+        "createTime",
+        "timeRecorded",
+        "startTime",
+        "joinedTime",
+        "leftTime",
+        "expiration",
+    }
+
+    def convert(value: Any, key: str = "") -> Any:
+        if isinstance(value, dict):
+            return {k: convert(v, k) for k, v in public(value).items()}
+        if isinstance(value, list):
+            return [convert(item) for item in value]
+        if key in fields and isinstance(value, str):
+            return (
+                parse_instant(value)
+                .astimezone(zone)
+                .isoformat(timespec="milliseconds")
+                .replace("+00:00", "Z")
+            )
+        return value
+
+    return convert(record)
 
 
 def bot_message_visible(user: dict[str, Any], message: dict[str, Any]) -> bool:
@@ -188,21 +223,34 @@ def integer(raw: str, name: str, *, minimum: int = 1, maximum: int = 1000) -> in
 
 def instant(raw: str, name: str) -> datetime:
     try:
+        if not isinstance(raw, str):
+            raise ValueError
         return parse_instant(raw)
     except (TypeError, ValueError, OverflowError):
         return fail(400, f"{name} must be an ISO 8601 timestamp.")
 
 
 def date_range(
-    request: Request, ctx: ProviderContext, *, days: int | None = None, defaults: bool = False
+    request: Request,
+    ctx: ProviderContext,
+    *,
+    days: int | None = None,
+    defaults: bool = False,
+    future: bool = False,
 ) -> tuple[datetime | None, datetime | None]:
     query = request.query_params
-    end = instant(query["to"], "to") if "to" in query else (ctx.clock.now() if defaults else None)
-    start = (
-        instant(query["from"], "from")
-        if "from" in query
-        else (end - timedelta(days=days or 30) if end and defaults else None)
-    )
+    end = instant(query["to"], "to") if "to" in query else None
+    start = instant(query["from"], "from") if "from" in query else None
+    if defaults:
+        try:
+            if start is None:
+                start = (
+                    end - timedelta(days=7) if end else ctx.clock.now() - timedelta(days=0 if future else 7)
+                )
+            if end is None:
+                end = start + timedelta(days=7)
+        except OverflowError:
+            fail(400, "Invalid time range.")
     if start and end and (start > end or (days and end - start > timedelta(days=days))):
         fail(400, f"Invalid time range; from must precede to within {days or 'the allowed'} days.")
     return start, end
@@ -211,7 +259,11 @@ def date_range(
 def in_range(value: str, bounds: tuple[datetime | None, datetime | None]) -> bool:
     start, end = bounds
     when = parse_instant(value)
-    return (start is None or when >= start) and (end is None or when <= end)
+    return (start is None or when >= start) and (end is None or when < end)
+
+
+def parent_matches(row: dict[str, Any], key: str) -> bool:
+    return key in (row.get("meetingId"), row.get("scheduledMeetingId"), row.get("meetingSeriesId"))
 
 
 def page(
@@ -222,7 +274,10 @@ def page(
     offset = 0
     if cursor:
         try:
-            offset = int(base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4)).decode())
+            raw = base64.b64decode(cursor + "=" * (-len(cursor) % 4), altchars=b"-_", validate=True)
+            if not raw.isdigit():
+                raise ValueError
+            offset = int(raw)
         except (ValueError, UnicodeError):
             fail(400, "Invalid pagination cursor.")
         if offset < 0:
@@ -238,13 +293,26 @@ def page(
 
 
 async def body(request: Request) -> dict[str, Any]:
+    content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    if content_type != "application/json" and not content_type.endswith("+json"):
+        fail(415, "The request requires a JSON content type.")
     try:
         value = await request.json()
-    except (ValueError, UnicodeError):
+        # JSON permits escaped surrogate code points, but Webex strings and our wire are UTF-8.
+        json.dumps(value, ensure_ascii=False, allow_nan=False).encode("utf-8")
+    except (ValueError, UnicodeError, RecursionError):
         return fail(400, "The request body must contain valid JSON.")
     if not isinstance(value, dict):
         fail(400, "The request body must be a JSON object.")
     return value
+
+
+def strings(payload: dict[str, Any], *keys: str, maximum: int | None = None) -> None:
+    for key in keys:
+        if key in payload and (
+            not isinstance(payload[key], str) or (maximum is not None and len(payload[key]) > maximum)
+        ):
+            fail(400, f"{key} must be a string" + (f" of at most {maximum} characters." if maximum else "."))
 
 
 def required(payload: dict[str, Any], *keys: str) -> None:
@@ -254,4 +322,4 @@ def required(payload: dict[str, Any], *keys: str) -> None:
 
 
 def json_bytes(payload: dict[str, Any]) -> bytes:
-    return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
+    return json.dumps(payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode()

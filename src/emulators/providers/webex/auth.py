@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import timedelta
 from typing import Any
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlparse
 
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
@@ -12,11 +12,19 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Resp
 from emulators.core.auth import OAuthError, redirect_with_params, render_account_picker
 from emulators.core.provider import ProviderContext, external_base
 
-from .common import PERSONAL_SCOPES, SERVICE_SCOPES, fail, person, required
+from .common import PERSONAL_SCOPES, SERVICE_SCOPES, fail, json_bytes, person, required
 
 
 def mint_token(ctx: ProviderContext, payload: dict[str, Any]) -> dict[str, Any]:
     """Resolve world ids and emails to the same Webex subject as OAuth consent."""
+    try:
+        json_bytes(payload)
+    except (ValueError, UnicodeError, RecursionError):
+        fail(400, "Token options must contain valid UTF-8 JSON.")
+    if "app_only" in payload and not isinstance(payload["app_only"], bool):
+        fail(400, "app_only must be a boolean.")
+    if "client_id" in payload:
+        required(payload, "client_id")
     app_only = bool(payload.get("app_only", payload.get("user") is None))
     user = person(ctx, payload.get("user"))
     if not app_only and not user:
@@ -25,7 +33,12 @@ def mint_token(ctx: ProviderContext, payload: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(scopes, list) or not all(isinstance(s, str) for s in scopes):
         fail(400, "scopes must be an array of strings.")
     try:
-        ttl = int(payload.get("expires_in", 1209600))
+        raw = payload.get("expires_in", 1209600)
+        if isinstance(raw, bool) or not isinstance(raw, (int, str)):
+            raise ValueError
+        ttl = int(raw)
+        if not -315360000 <= ttl <= 315360000:
+            raise ValueError
     except (TypeError, ValueError):
         fail(400, "expires_in must be an integer.")
     grant = ctx.tokens.issue_access(
@@ -45,10 +58,19 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
     async def authorize(request: Request) -> Response:
         query = dict(request.query_params)
         required(query, "client_id", "redirect_uri", "response_type")
+        try:
+            uri = urlparse(query["redirect_uri"])
+            if not uri.scheme or uri.fragment or uri.scheme in ("javascript", "data"):
+                raise ValueError
+            query["redirect_uri"].encode("utf-8")
+        except (ValueError, UnicodeError):
+            fail(400, "Invalid redirect_uri.")
         if query["response_type"] != "code":
             fail(400, "response_type must be code.")
         if query.get("code_challenge_method", "plain") not in ("S256", "plain"):
             fail(400, "Unsupported PKCE challenge method.")
+        if "code_challenge_method" in query and not query.get("code_challenge"):
+            fail(400, "code_challenge is required with code_challenge_method.")
         try:
             client = ctx.tokens.authenticate_client(query["client_id"], None, require_secret=False)
         except OAuthError as exc:
@@ -70,7 +92,7 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
                 )
             )
         user = person(ctx, query["login_hint"])
-        if not user or user.get("_external") or user["type"] == "bot" or user["status"] == "inactive":
+        if not user or user.get("_external") or user["type"] == "bot" or not user.get("_loginEnabled", True):
             fail(400, "The requested account cannot authorize this integration.")
         if any("admin" in scope or "compliance" in scope for scope in scopes) and not user.get("_admin"):
             fail(403, "Administrator consent is required for the requested scopes.")
@@ -80,7 +102,7 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
             scopes=scopes,
             redirect_uri=query["redirect_uri"],
             code_challenge=query.get("code_challenge"),
-            code_challenge_method=query.get("code_challenge_method"),
+            code_challenge_method=query.get("code_challenge_method", "plain"),
         )
         return RedirectResponse(
             redirect_with_params(query["redirect_uri"], {"code": code.token, "state": query.get("state")}),
@@ -89,11 +111,20 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
 
     @app.post("/v1/access_token")
     async def token(request: Request) -> JSONResponse:
-        if request.headers.get("content-type", "").split(";")[0] != "application/x-www-form-urlencoded":
+        if (
+            request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+            != "application/x-www-form-urlencoded"
+        ):
             fail(400, "The token endpoint requires application/x-www-form-urlencoded content.")
-        form = {
-            k: v[-1] for k, v in parse_qs((await request.body()).decode(), keep_blank_values=True).items()
-        }
+        try:
+            form = {
+                k: v[-1]
+                for k, v in parse_qs(
+                    (await request.body()).decode(), keep_blank_values=True, errors="strict"
+                ).items()
+            }
+        except (ValueError, UnicodeError):
+            fail(400, "The token request must contain valid UTF-8 form data.")
         try:
             client = ctx.tokens.authenticate_client(form.get("client_id"), form.get("client_secret"))
             if form.get("grant_type") == "authorization_code":

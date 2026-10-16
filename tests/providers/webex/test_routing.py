@@ -24,7 +24,10 @@ async def test_all_absolute_urls_work_in_prefix_and_port_modes(hub: EmulatorHub,
     async with httpx.AsyncClient(
         transport=transport, base_url="http://localhost:44114", headers=bearer("webex-admin-token")
     ) as client:
-        first = await client.get(prefix + "/v1/meetings", params={"meetingType": "meeting", "max": 1})
+        first = await client.get(
+            prefix + "/v1/meetings",
+            params={"meetingType": "meeting", "max": 1, "from": "2026-09-01", "to": "2026-10-16"},
+        )
         link = first.links["next"]["url"]
         assert link.startswith(f"http://localhost:44114{prefix}/v1/meetings?")
         second = await client.get(link)

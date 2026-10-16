@@ -152,8 +152,12 @@ async def test_expired_and_disabled_control_tokens(client: httpx.AsyncClient) ->
 
 
 async def test_ended_seed_schedule_does_not_duplicate_artifacts(client: httpx.AsyncClient) -> None:
-    instance = (await client.get("/v1/meetings", params={"meetingType": "meeting"})).json()["items"][0]
-    schedule = instance["id"].split("_I_")[0]
+    instance = (
+        await client.get(
+            "/v1/meetings", params={"meetingType": "meeting", "from": "2026-09-01", "to": "2026-10-16"}
+        )
+    ).json()["items"][0]
+    schedule = instance["scheduledMeetingId"]
     result = await client.post("/_emulator/actions/end_meeting", json={"meeting_id": schedule})
     assert result.status_code == 200 and result.json()["meeting"]["id"] == instance["id"]
     rows = (await client.get("/v1/recordings", params={"meetingId": instance["id"]})).json()["items"]

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+from datetime import timedelta
 from typing import Any
 
 import httpx
@@ -27,7 +28,7 @@ async def test_end_meeting_creates_artifacts_signed_filtered_hooks(
     meeting = (
         await client.post(
             "/v1/meetings",
-            json={"title": "Meridian status", "start": "2026-10-16T11:00:00Z", "end": "2026-10-16T12:00:00Z"},
+            json={"title": "Meridian status", "start": "2026-10-16T13:00:00Z", "end": "2026-10-16T14:00:00Z"},
         )
     ).json()
     hooks = []
@@ -77,6 +78,7 @@ async def test_end_meeting_creates_artifacts_signed_filtered_hooks(
     assert artifacts["meeting"]["id"].startswith(meeting["id"] + "_I_")
     assert artifacts["recording"]["meetingId"] == artifacts["meeting"]["id"]
     assert len(received) == 3
+    hub.clock.advance(timedelta(seconds=1))
     assert [json.loads(raw)["resource"] for raw, _ in received] == [
         "meetings",
         "recordings",
@@ -128,7 +130,10 @@ async def test_end_meeting_creates_artifacts_signed_filtered_hooks(
     assert journal["count"] == 3 and all(d["status"] == "delivered" for d in journal["deliveries"])
     assert (await client.get(f"/v1/webhooks/{hooks[0]['id']}", headers=outsider)).status_code == 404
     assert (
-        await client.put(f"/v1/webhooks/{hooks[0]['id']}", json={"name": "updated", "status": "inactive"})
+        await client.put(
+            f"/v1/webhooks/{hooks[0]['id']}",
+            json={"name": "updated", "targetUrl": "https://consumer.example/hook", "status": "active"},
+        )
     ).json()["name"] == "updated"
     assert (await client.delete(f"/v1/webhooks/{hooks[0]['id']}")).status_code == 204
     assert (await client.get(f"/v1/webhooks/{hooks[0]['id']}")).status_code == 404
@@ -222,8 +227,8 @@ async def test_org_webhook_privileges_and_host_filter(client: httpx.AsyncClient,
             "/v1/meetings",
             json={
                 "title": "Service app import",
-                "start": "2026-10-16T11:00:00Z",
-                "end": "2026-10-16T12:00:00Z",
+                "start": "2026-10-16T13:00:00Z",
+                "end": "2026-10-16T14:00:00Z",
             },
         )
     ).json()

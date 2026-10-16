@@ -15,10 +15,26 @@ from .common import authenticate, fail, is_admin, page, person, public, require_
 
 def register(app: FastAPI, ctx: ProviderContext) -> None:
     def wire(request: Request, row: dict[str, Any]) -> dict[str, Any]:
-        return {
+        result = {
             **public(row),
             "avatar": url_for_host(request, ctx, "webexapis.com", f"/avatars/{row['id']}.png"),
         }
+        grant = authenticate(request, ctx)
+        user = person(ctx, grant.user_id)
+        same_org = row["orgId"] == (
+            user["orgId"] if user else ctx.store.collection("organizations").values()[0]["id"]
+        )
+        if (
+            not same_org
+            or request.query_params.get("id")
+            or request.query_params.get("excludeStatus", "false").lower() == "true"
+        ):
+            result.pop("status", None)
+            result.pop("lastActivity", None)
+        if not is_admin(ctx, grant, "spark-admin:people_read") and row["id"] != grant.user_id:
+            result.pop("roles", None)
+            result.pop("licenses", None)
+        return result
 
     @app.get("/v1/people/me")
     async def me(request: Request) -> dict[str, Any]:
@@ -40,12 +56,25 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         if grant.app_only and not is_admin(ctx, grant, "spark-admin:people_read"):
             fail(403, "A service app requires spark-admin:people_read.")
         rows = ctx.store.collection("people").values()
+        if query.get("orgId"):
+            own_org = ctx.store.collection("organizations").values()[0]["id"]
+            if query["orgId"] != own_org:
+                fail(403, "The requested organization is not managed by this identity.")
+            rows = [p for p in rows if p["orgId"] == query["orgId"]]
         if query.get("email"):
             rows = [p for p in rows if query["email"].lower() in [e.lower() for e in p["emails"]]]
         if query.get("displayName"):
             rows = [p for p in rows if p["displayName"].lower().startswith(query["displayName"].lower())]
         if query.get("id"):
+            if len(query["id"].split(",")) > 85:
+                fail(400, "At most 85 person IDs can be requested.")
             rows = [p for p in rows if p["id"] in query["id"].split(",")]
+        if query.get("roles"):
+            if not is_admin(ctx, grant, "spark-admin:people_read"):
+                fail(403, "Filtering by roles requires administrator access.")
+            rows = [p for p in rows if set(p["roles"]) & set(query["roles"].split(","))]
+        if query.get("excludeStatus", "false").lower() not in ("true", "false"):
+            fail(400, "excludeStatus must be true or false.")
         # External contacts remain searchable, but aren't members of the Halcyon organization.
         if not any(query.get(k) for k in ("email", "displayName", "id")):
             rows = [p for p in rows if not p.get("_external")]

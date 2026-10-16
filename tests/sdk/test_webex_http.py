@@ -15,7 +15,10 @@ BASE = "https://webexapis.com/v1"
 
 def test_webex_recording_import_over_live_gateway(emulator_intercept: EmulatorServer) -> None:
     with httpx.Client(headers={"Authorization": "Bearer webex-admin-token"}) as client:
-        response = client.get(BASE + "/meetings", params={"meetingType": "meeting", "max": 1})
+        response = client.get(
+            BASE + "/meetings",
+            params={"meetingType": "meeting", "max": 1, "from": "2026-09-01", "to": "2026-10-16"},
+        )
         response.raise_for_status()
         meeting = response.json()["items"][0]
         assert "_I_" in meeting["id"] and response.headers["TrackingId"]
@@ -82,7 +85,9 @@ def test_webex_oauth_recording_scope_over_live_gateway(emulator_intercept: Emula
         client.headers["Authorization"] = "Bearer " + token.json()["access_token"]
         me = client.get(BASE + "/people/me")
         assert me.status_code == 200 and me.json()["displayName"] == "Sofia Alvarez"
-        meetings = client.get(BASE + "/meetings", params={"meetingType": "meeting"})
+        meetings = client.get(
+            BASE + "/meetings", params={"meetingType": "meeting", "from": "2026-09-01", "to": "2026-10-16"}
+        )
         meetings.raise_for_status()
         recording = client.get(BASE + "/recordings", params={"meetingId": meetings.json()["items"][0]["id"]})
         assert recording.status_code == 200 and recording.json()["items"]
@@ -93,3 +98,28 @@ def test_webex_oauth_recording_scope_over_live_gateway(emulator_intercept: Emula
             ).status_code
             == 403
         )
+
+
+def test_webex_parent_recording_filter_and_recycle_operations(emulator_intercept: EmulatorServer) -> None:
+    with httpx.Client(headers={"Authorization": "Bearer webex-admin-token"}) as client:
+        recording = client.get(BASE + "/recordings", params={"from": "2026-09-09", "to": "2026-09-16"})
+        recording.raise_for_status()
+        row = recording.json()["items"][0]
+        by_parent = client.get(
+            BASE + "/recordings",
+            params={"meetingId": row["scheduledMeetingId"], "siteUrl": "ignored.webex.com"},
+        )
+        assert [r["id"] for r in by_parent.json()["items"]] == [row["id"]]
+        url = BASE + "/recordings/" + row["id"]
+        assert (
+            client.post(BASE + "/recordings/softDelete", json={"recordingIds": [row["id"]]}).status_code
+            == 204
+        )
+        assert client.get(url).json()["status"] == "deleted"
+        assert (
+            client.post(BASE + "/recordings/restore", json={"recordingIds": [row["id"]]}).status_code == 204
+        )
+        assert client.get(url).json()["status"] == "available"
+        assert client.delete(url).status_code == 204
+        gone = client.get(url)
+        assert gone.status_code == 404 and gone.headers["TrackingId"] == gone.json()["trackingId"]

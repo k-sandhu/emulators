@@ -129,9 +129,14 @@ async def test_bot_group_visibility_requires_mention(client: httpx.AsyncClient) 
     plain = (
         await client.post("/v1/messages", json={"roomId": room["id"], "text": "Unaddressed conversation"})
     ).json()
-    assert (await client.get("/v1/messages", params={"roomId": room["id"]}, headers=bot_auth)).json() == {
-        "items": []
-    }
+    assert (
+        await client.get("/v1/messages", params={"roomId": room["id"]}, headers=bot_auth)
+    ).status_code == 400
+    assert (
+        await client.get(
+            "/v1/messages", params={"roomId": room["id"], "mentionedPeople": "me"}, headers=bot_auth
+        )
+    ).json() == {"items": []}
     assert (await client.get(f"/v1/messages/{plain['id']}", headers=bot_auth)).status_code == 404
     mention = await client.post(
         "/v1/messages", json={"roomId": room["id"], "markdown": f"<@personId:{bot['id']}> import this"}
@@ -139,9 +144,11 @@ async def test_bot_group_visibility_requires_mention(client: httpx.AsyncClient) 
     assert mention.status_code == 200
     assert [
         m["id"]
-        for m in (await client.get("/v1/messages", params={"roomId": room["id"]}, headers=bot_auth)).json()[
-            "items"
-        ]
+        for m in (
+            await client.get(
+                "/v1/messages", params={"roomId": room["id"], "mentionedPeople": "me"}, headers=bot_auth
+            )
+        ).json()["items"]
     ] == [mention.json()["id"]]
 
 

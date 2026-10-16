@@ -17,6 +17,7 @@ from emulators.world import media
 from .common import (
     SITE,
     authenticate,
+    body,
     date_range,
     fail,
     get_meeting,
@@ -25,9 +26,12 @@ from .common import (
     meeting_access,
     opaque,
     page,
+    parent_matches,
     person,
     public,
     stamp,
+    strings,
+    time_wire,
 )
 from .hooks import emit
 from .meetings import check_scope
@@ -40,7 +44,9 @@ def snippets(ctx: ProviderContext, transcript: dict[str, Any]) -> list[dict[str,
     if not turns:
         turns = [
             {"speaker": meeting["hostUserId"], "offset": c.start_s, "duration": c.duration_s, "text": c.text}
-            for c in media.build_cues([(meeting["hostDisplayName"], meeting["agenda"] or meeting["title"])])
+            for c in media.build_cues(
+                [(meeting["hostDisplayName"], meeting.get("agenda") or meeting["title"])]
+            )
         ]
     result = []
     for i, turn in enumerate(turns):
@@ -111,7 +117,7 @@ def recording_wire(
     )
     if detail and row["status"] == "available":
         expiry = ctx.clock.now() + timedelta(
-            seconds=int(ctx.setting("DOWNLOAD_TTL_SECONDS", "3600") or "3600")
+            seconds=int(ctx.setting("DOWNLOAD_TTL_SECONDS", "10800") or "10800")
         )
         token = secrets.token_urlsafe(32)
         ctx.store.collection("_download_links").put(
@@ -130,7 +136,7 @@ def recording_wire(
                 f"/recordings/{row['id']}/recording.{ext}?" + urlencode({"token": token}),
             )
         result["temporaryDirectDownloadLinks"] = links
-    return result
+    return time_wire(request, result)
 
 
 def transcript_wire(request: Request, ctx: ProviderContext, row: dict[str, Any]) -> dict[str, Any]:
@@ -139,7 +145,7 @@ def transcript_wire(request: Request, ctx: ProviderContext, row: dict[str, Any])
         result[f"{kind}DownloadLink"] = url_for_host(
             request, ctx, "webexapis.com", f"/v1/meetingTranscripts/{row['id']}/download?format={kind}"
         )
-    return result
+    return time_wire(request, result)
 
 
 def binary_response(request: Request, content: bytes, kind: str) -> Response:
@@ -175,10 +181,17 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         grant = authenticate(request, ctx)
         check_scope(grant, "recordings")
         q = request.query_params
-        bounds = date_range(request, ctx, days=30, defaults=not q.get("meetingId"))
+        bounds = date_range(request, ctx, defaults=not q.get("meetingId"))
         status = q.get("status", "available")
-        if status not in ("available", "deleted") or q.get("format", "MP4") != "MP4":
+        if status not in ("available", "deleted") or q.get("format", "MP4") not in ("MP4", "ARF"):
             fail(400, "Invalid recording status or format.")
+        if q.get("serviceType", "MeetingCenter") not in (
+            "MeetingCenter",
+            "EventCenter",
+            "TrainingCenter",
+            "SupportCenter",
+        ):
+            fail(400, "Invalid serviceType.")
         if q.get("meetingId"):
             get_meeting(ctx, q["meetingId"], grant, "recordings")
         if q.get("hostEmail"):
@@ -192,13 +205,21 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
             meeting = ctx.store.collection("meetings").get(row["meetingId"])
             if not meeting or not meeting_access(ctx, grant, meeting, "recordings"):
                 continue
-            if q.get("meetingId") and q["meetingId"] != row["meetingId"]:
+            if q.get("meetingId") and not parent_matches(row, q["meetingId"]):
                 continue
             if row["status"] != status or not in_range(row["createTime"], bounds):
                 continue
-            if q.get("siteUrl", SITE) != row["siteUrl"]:
+            if not q.get("meetingId") and q.get("siteUrl", SITE) != row["siteUrl"]:
                 continue
             if q.get("hostEmail") and q["hostEmail"].lower() != meeting["hostEmail"].lower():
+                continue
+            if q.get("format") and row["format"] != q["format"]:
+                continue
+            if q.get("topic") and q["topic"].casefold() not in row["topic"].casefold():
+                continue
+            if q.get("serviceType") and row["serviceType"] != q["serviceType"]:
+                continue
+            if q.get("integrationTag") and q["integrationTag"] not in row.get("integrationTags", []):
                 continue
             rows.append(row)
         rows.sort(key=lambda r: (r["createTime"], r["id"]), reverse=True)
@@ -211,6 +232,13 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         if not row:
             fail(404)
         get_meeting(ctx, row["meetingId"], grant, "recordings", write=write)
+        host_email = request.query_params.get("hostEmail")
+        meeting = ctx.store.collection("meetings").get(row["meetingId"])
+        assert meeting is not None
+        if host_email and host_email.lower() != meeting["hostEmail"].lower():
+            fail(404)
+        if request.headers.get("siteUrl", row["siteUrl"]) != row["siteUrl"]:
+            fail(404)
         return row
 
     @app.get("/v1/recordings/{recording_id}")
@@ -220,10 +248,55 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
     @app.delete("/v1/recordings/{recording_id}")
     async def delete(recording_id: str, request: Request) -> Response:
         row = get_recording(recording_id, request, write=True)
-        row["status"] = "deleted"
         meeting = ctx.store.collection("meetings").get(row["meetingId"])
         assert meeting is not None
         await emit(ctx, "recordings", "deleted", row, actor=meeting["hostUserId"])
+        ctx.store.collection("recordings").delete(recording_id)
+        return Response(status_code=204)
+
+    @app.post("/v1/recordings/softDelete")
+    @app.post("/v1/recordings/restore")
+    @app.post("/v1/recordings/purge")
+    async def recycle(request: Request) -> Response:
+        grant = authenticate(request, ctx)
+        check_scope(grant, "recordings", write=True)
+        payload = await body(request)
+        strings(payload, "siteUrl")
+        operation = request.url.path.rsplit("/", 1)[-1]
+        all_key = {"restore": "restoreAll", "purge": "purgeAll"}.get(operation)
+        all_rows = payload.get(all_key, False) if all_key else False
+        if not isinstance(all_rows, bool):
+            fail(400, f"{all_key} must be a boolean.")
+        ids = payload.get("recordingIds", [])
+        if (
+            not isinstance(ids, list)
+            or not all(isinstance(i, str) and i for i in ids)
+            or len(ids) > 100
+            or (all_rows and ids)
+            or (not all_rows and not ids)
+        ):
+            fail(400, "Specify 1 to 100 recordingIds, or the applicable all flag.")
+        if all_rows:
+            ids = [
+                r["id"]
+                for r in ctx.store.collection("recordings")
+                if r["status"] == "deleted"
+                and (m := ctx.store.collection("meetings").get(r["meetingId"]))
+                and meeting_access(ctx, grant, m, "recordings", write=True)
+                and r["siteUrl"] == payload.get("siteUrl", SITE)
+            ]
+        rows = [get_recording(i, request, write=True) for i in dict.fromkeys(ids)]
+        expected = "available" if operation == "softDelete" else "deleted"
+        if any(r["status"] != expected or r["siteUrl"] != payload.get("siteUrl", SITE) for r in rows):
+            fail(400, "Recordings must belong to the specified site and have the required status.")
+        for row in rows:
+            if operation == "purge":
+                ctx.store.collection("recordings").delete(row["id"])
+            else:
+                row["status"] = "available" if operation == "restore" else "deleted"
+            # A restored resource gets new capabilities; old public links remain revoked.
+            for link in ctx.store.collection("_download_links").where(recordingId=row["id"]):
+                ctx.store.collection("_download_links").delete(link["id"])
         return Response(status_code=204)
 
     @app.api_route("/recordings/{recording_id}/recording.{kind}", methods=["GET", "HEAD"])
@@ -256,15 +329,23 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         grant = authenticate(request, ctx)
         check_scope(grant, "transcripts")
         q = request.query_params
-        bounds = date_range(request, ctx)
+        bounds = date_range(request, ctx, defaults=not q.get("meetingId"))
         if q.get("meetingId"):
-            get_meeting(ctx, q["meetingId"], grant, "transcripts")
+            meeting = get_meeting(ctx, q["meetingId"], grant, "transcripts")
+            if meeting["meetingType"] != "meeting" or meeting["state"] != "ended":
+                fail(400, "meetingId must identify an ended meeting instance.")
+        if q.get("hostEmail") and not q.get("meetingId"):
+            fail(400, "hostEmail requires meetingId for transcript lists.")
         rows = []
         for row in ctx.store.collection("transcripts"):
             meeting = ctx.store.collection("meetings").get(row["meetingId"])
             if not meeting or not meeting_access(ctx, grant, meeting, "transcripts"):
                 continue
             if q.get("meetingId") and q["meetingId"] != row["meetingId"]:
+                continue
+            if q.get("hostEmail") and q["hostEmail"].lower() != meeting["hostEmail"].lower():
+                continue
+            if q.get("siteUrl", SITE) != row["siteUrl"]:
                 continue
             if in_range(row["startTime"], bounds):
                 rows.append(row)
@@ -278,6 +359,10 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         if not row:
             fail(404)
         get_meeting(ctx, row["meetingId"], grant, "transcripts")
+        if request.query_params.get("hostEmail"):
+            meeting = ctx.store.collection("meetings").get(row["meetingId"])
+            if not meeting or request.query_params["hostEmail"].lower() != meeting["hostEmail"].lower():
+                fail(404)
         return row
 
     @app.get("/v1/meetingTranscripts/{transcript_id}/download")

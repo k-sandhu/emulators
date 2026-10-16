@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from typing import Any
+from urllib.parse import urlparse
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
@@ -24,6 +25,7 @@ from .common import (
     require_scope,
     required,
     stamp,
+    strings,
     subject,
 )
 from .hooks import emit
@@ -98,6 +100,7 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         _, user = identity(request, ctx, "rooms", write=True)
         payload = await body(request)
         required(payload, "title")
+        strings(payload, "teamId")
         if "isLocked" in payload and not isinstance(payload["isLocked"], bool):
             fail(400, "isLocked must be a boolean.")
         room = {
@@ -146,7 +149,13 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
     @app.delete("/v1/rooms/{room_id}")
     async def delete_room(room_id: str, request: Request) -> Response:
         _, user = identity(request, ctx, "rooms", write=True)
-        room = room_access(ctx, room_id, user, moderate=True)
+        room = room_access(ctx, room_id, user)
+        member = ctx.store.collection("memberships").first(roomId=room_id, personId=user["id"])
+        assert member is not None
+        if not member["isModerator"]:
+            await emit(ctx, "memberships", "deleted", member, actor=user["id"])
+            ctx.store.collection("memberships").delete(member["id"])
+            return Response(status_code=204)
         await emit(ctx, "rooms", "deleted", room, actor=user["id"])
         ctx.store.collection("rooms").delete(room_id)
         for collection in ("memberships", "messages"):
@@ -173,6 +182,9 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         _, user = identity(request, ctx, "memberships", write=True)
         payload = await body(request)
         required(payload, "roomId")
+        strings(payload, "personId", "personEmail")
+        if sum(bool(payload.get(k)) for k in ("personId", "personEmail")) != 1:
+            fail(400, "Specify exactly one of personId or personEmail.")
         room = room_access(ctx, payload["roomId"], user)
         if room["type"] == "direct":
             fail(400, "Direct room membership cannot be changed.")
@@ -206,7 +218,9 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
     async def update_member(membership_id: str, request: Request) -> dict[str, Any]:
         _, user = identity(request, ctx, "memberships", write=True)
         row = membership(membership_id, user)
-        room_access(ctx, row["roomId"], user, moderate=True)
+        room = room_access(ctx, row["roomId"], user, moderate=True)
+        if room["type"] == "direct":
+            fail(400, "Direct room membership cannot be changed.")
         payload = await body(request)
         if not isinstance(payload.get("isModerator"), bool):
             fail(400, "isModerator must be a boolean.")
@@ -218,6 +232,9 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
     async def remove_member(membership_id: str, request: Request) -> Response:
         _, user = identity(request, ctx, "memberships", write=True)
         row = membership(membership_id, user)
+        room = room_access(ctx, row["roomId"], user)
+        if room["type"] == "direct":
+            fail(400, "Direct room membership cannot be changed.")
         if row["personId"] != user["id"]:
             room_access(ctx, row["roomId"], user, moderate=True)
         await emit(ctx, "memberships", "deleted", row, actor=user["id"])
@@ -230,7 +247,11 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         q = request.query_params
         if not q.get("roomId"):
             fail(400, "roomId is required.")
-        room_access(ctx, q["roomId"], user)
+        room = room_access(ctx, q["roomId"], user)
+        if user["type"] == "bot" and room["type"] == "group" and not q.get("mentionedPeople"):
+            fail(400, "Bots must specify mentionedPeople for group-room message lists.")
+        if q.get("mentionedPeople") and q["mentionedPeople"] not in ("me", user["id"]):
+            fail(400, "mentionedPeople must identify the current user.")
         rows = ctx.store.collection("messages").where(roomId=q["roomId"])
         rows = [m for m in rows if bot_message_visible(user, m)]
         if q.get("before"):
@@ -245,12 +266,15 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         if q.get("mentionedPeople"):
             target = user["id"] if q["mentionedPeople"] == "me" else q["mentionedPeople"]
             rows = [m for m in rows if target in m.get("mentionedPeople", [])]
-        return page(request, rows, default=50)
+        if q.get("parentId"):
+            rows = [m for m in rows if m.get("parentId") == q["parentId"]]
+        return page(request, rows, default=50, maximum=100 if q.get("mentionedPeople") else 1000)
 
     @app.post("/v1/messages")
     async def send_message(request: Request) -> dict[str, Any]:
         _, user = identity(request, ctx, "messages", write=True)
         payload = await body(request)
+        strings(payload, "roomId", "toPersonId", "toPersonEmail", "parentId")
         targets = [k for k in ("roomId", "toPersonId", "toPersonEmail") if payload.get(k)]
         if len(targets) != 1:
             fail(400, "Specify exactly one of roomId, toPersonId or toPersonEmail.")
@@ -259,13 +283,25 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         for key in ("text", "markdown"):
             if key in payload and not isinstance(payload[key], str):
                 fail(400, f"{key} must be a string.")
+            if key in payload and len(payload[key].encode("utf-8")) > 7439:
+                fail(400, f"{key} must be at most 7439 UTF-8 bytes.")
         if "files" in payload and (
             not isinstance(payload["files"], list)
+            or len(payload["files"]) > 1
             or not all(
                 isinstance(url, str) and url.startswith(("https://", "http://")) for url in payload["files"]
             )
         ):
             fail(400, "files must be an array of HTTP URLs.")
+        for url in payload.get("files", []):
+            try:
+                parsed = urlparse(url)
+                if not parsed.hostname:
+                    raise ValueError
+                _ = parsed.port
+            except ValueError:
+                fail(400, "files must contain valid HTTP URLs.")
+        new_room = False
         if payload.get("roomId"):
             room = room_access(ctx, payload["roomId"], user)
         else:
@@ -275,6 +311,7 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
             key = opaque("ROOM", "/".join(sorted([user["id"], recipient["id"]])))
             room = ctx.store.collection("rooms").get(key)
             if not room:
+                new_room = True
                 room = {
                     "id": key,
                     "type": "direct",
@@ -284,13 +321,16 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
                     "created": stamp(ctx.clock.now()),
                     "lastActivity": stamp(ctx.clock.now()),
                 }
-                ctx.store.collection("rooms").put(room)
-                for p in (user, recipient):
-                    ctx.store.collection("memberships").put(new_membership(ctx, key, p))
         if payload.get("parentId"):
             parent = ctx.store.collection("messages").get(payload["parentId"])
             if not parent or parent["roomId"] != room["id"]:
                 fail(400, "parentId must identify a message in this room.")
+            if not bot_message_visible(user, parent):
+                fail(404)
+        if new_room:
+            ctx.store.collection("rooms").put(room)
+            for p in (user, recipient):
+                ctx.store.collection("memberships").put(new_membership(ctx, room["id"], p))
         row = {
             "id": opaque("MESSAGE", ctx.ids.guid()),
             "roomId": room["id"],
@@ -303,8 +343,12 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         if payload.get("markdown"):
             row.setdefault("text", re.sub(r"[*_`#]", "", payload["markdown"]))
             mentions = re.findall(r"<@personId:([^>]+)>", payload["markdown"])
+            for email in re.findall(r"<@personEmail:([^>]+)>", payload["markdown"]):
+                mentioned = person(ctx, email)
+                if mentioned:
+                    mentions.append(mentioned["id"])
             if mentions:
-                row["mentionedPeople"] = mentions
+                row["mentionedPeople"] = list(dict.fromkeys(mentions))
         ctx.store.collection("messages").put(row)
         room["lastActivity"] = row["created"]
         await emit(ctx, "messages", "created", row, actor=user["id"])

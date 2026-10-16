@@ -15,7 +15,11 @@ ADMIN = bearer("webex-admin-token")
 async def test_recording_import_binary_links_and_speaker_identity(
     client: httpx.AsyncClient, hub: EmulatorHub
 ) -> None:
-    meetings = (await client.get("/v1/meetings", params={"meetingType": "meeting"})).json()["items"]
+    meetings = (
+        await client.get(
+            "/v1/meetings", params={"meetingType": "meeting", "from": "2026-09-01", "to": "2026-10-16"}
+        )
+    ).json()["items"]
     meeting = meetings[0]
     assert len(hub.context("webex").store.blobs) == 0
     listing = await client.get(
@@ -51,10 +55,12 @@ async def test_recording_import_binary_links_and_speaker_identity(
     transcript = (await client.get("/v1/meetingTranscripts", params={"meetingId": meeting["id"]})).json()[
         "items"
     ][0]
-    for path in ("recordings", "meetingTranscripts"):
-        assert (
-            await client.get(f"/v1/{path}", params={"meetingId": recording["scheduledMeetingId"]})
-        ).json() == {"items": []}
+    assert (await client.get("/v1/recordings", params={"meetingId": recording["scheduledMeetingId"]})).json()[
+        "items"
+    ][0]["id"] == recording["id"]
+    assert (
+        await client.get("/v1/meetingTranscripts", params={"meetingId": recording["scheduledMeetingId"]})
+    ).status_code == 400
     assert (await client.get(transcript["vttDownloadLink"])).text == vtt
     assert "Sofia Alvarez:" in (await client.get(transcript["txtDownloadLink"])).text
     response = await client.get(f"/v1/meetingTranscripts/{transcript['id']}/snippets", params={"max": 1})
@@ -68,7 +74,7 @@ async def test_recording_import_binary_links_and_speaker_identity(
     count = len(hub.context("webex").store.blobs)
     assert (await client.get(links["recordingDownloadLink"])).content == downloads["recordingDownloadLink"]
     assert len(hub.context("webex").store.blobs) == count
-    hub.clock.advance(timedelta(hours=2))
+    hub.clock.advance(timedelta(hours=3))
     assert (await client.get(links["recordingDownloadLink"])).status_code == 403
 
 
@@ -96,11 +102,11 @@ async def test_recording_acl_ranges_and_recycle_bin(client: httpx.AsyncClient) -
     assert (await client.get(link.split("?")[0])).status_code == 403
     assert (await client.delete(f"/v1/recordings/{row['id']}", headers=ADMIN)).status_code == 204
     assert (await client.get(link)).status_code == 404
-    assert (await client.get(f"/v1/recordings/{row['id']}", headers=ADMIN)).json()["status"] == "deleted"
+    assert (await client.get(f"/v1/recordings/{row['id']}", headers=ADMIN)).status_code == 404
     deleted = (await client.get("/v1/recordings", params={"status": "deleted"}, headers=ADMIN)).json()[
         "items"
     ]
-    assert [r["id"] for r in deleted] == [row["id"]]
+    assert deleted == []
 
 
 async def test_artifact_list_filters_pagination_and_admin_scope(client: httpx.AsyncClient) -> None:
@@ -134,7 +140,7 @@ async def test_artifact_list_filters_pagination_and_admin_scope(client: httpx.As
     q = {"from": "2026-10-01", "to": "2026-10-16"}
     assert len((await client.get("/v1/meetingTranscripts", params=q, headers=ADMIN)).json()["items"]) == 2
     service = bearer(await mint(client, "https://webexapis.com", app_only=True))
-    assert len((await client.get("/v1/recordings", headers=service)).json()["items"]) == 3
+    assert len((await client.get("/v1/recordings", headers=service)).json()["items"]) == 1
     weak = bearer(
         await mint(client, "https://webexapis.com", app_only=True, scopes=["meeting:recordings_read"])
     )
@@ -143,7 +149,7 @@ async def test_artifact_list_filters_pagination_and_admin_scope(client: httpx.As
 
 @pytest.mark.parametrize(
     "query",
-    [{"from": "2026-01-01", "to": "2026-10-16"}, {"format": "ARF"}, {"status": "bad"}, {"from": "bad"}],
+    [{"from": "2026-10-16", "to": "2026-01-01"}, {"format": "invalid"}, {"status": "bad"}, {"from": "bad"}],
 )
 async def test_recording_bad_filters(client: httpx.AsyncClient, query: dict[str, str]) -> None:
     assert (await client.get("/v1/recordings", params=query)).status_code == 400

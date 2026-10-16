@@ -14,7 +14,11 @@ ADMIN = bearer("webex-admin-token")
 async def test_seeded_series_occurrences_attendance_and_acl(
     client: httpx.AsyncClient, hub: EmulatorHub
 ) -> None:
-    r = await client.get("/v1/meetings", params={"meetingType": "meeting", "max": 1}, headers=ADMIN)
+    r = await client.get(
+        "/v1/meetings",
+        params={"meetingType": "meeting", "max": 1, "from": "2026-09-01", "to": "2026-10-16"},
+        headers=ADMIN,
+    )
     meetings = []
     while True:
         assert r.status_code == 200
@@ -33,7 +37,8 @@ async def test_seeded_series_occurrences_attendance_and_acl(
     )
     assert first["title"] == original.title
     assert first["hostEmail"] == hub.world.person(original.organizer_id).email
-    assert re.fullmatch(r"\d{4} \d{3} \d{4}", first["meetingNumber"])
+    schedule = (await client.get(f"/v1/meetings/{first['scheduledMeetingId']}")).json()
+    assert re.fullmatch(r"\d+", schedule["meetingNumber"])
     for key in (
         "webLink",
         "sipAddress",
@@ -42,7 +47,8 @@ async def test_seeded_series_occurrences_attendance_and_acl(
         "password",
         "enabledAutoRecordMeeting",
     ):
-        assert key in first
+        assert key in schedule
+    assert all(key not in first for key in ("password", "meetingNumber", "telephony"))
     detail = await client.get(f"/v1/meetings/{first['id']}")
     assert detail.json()["id"] == first["id"]
     participants = (await client.get("/v1/meetingParticipants", params={"meetingId": first["id"]})).json()[
@@ -58,11 +64,19 @@ async def test_seeded_series_occurrences_attendance_and_acl(
     assert (
         await client.get("/v1/meetingParticipants", params={"meetingId": first["id"]}, headers=outsider)
     ).status_code == 404
-    assert (await client.get("/v1/meetings", params={"meetingType": "meeting"}, headers=outsider)).json() == {
-        "items": []
-    }
-    series = (await client.get("/v1/meetings", params={"meetingType": "meetingSeries"})).json()["items"]
-    assert len(series) == 1 and re.fullmatch(r"[a-f0-9]{32}", series[0]["id"])
+    assert (
+        await client.get(
+            "/v1/meetings",
+            params={"meetingType": "meeting", "from": "2026-09-01", "to": "2026-10-16"},
+            headers=outsider,
+        )
+    ).json() == {"items": []}
+    series = (
+        await client.get(
+            "/v1/meetings", params={"meetingType": "meetingSeries", "from": "2026-09-01", "to": "2026-11-10"}
+        )
+    ).json()["items"]
+    assert series and all(re.fullmatch(r"[a-f0-9]{32}", m["id"]) for m in series)
 
 
 async def test_meeting_crud_and_host_administration(client: httpx.AsyncClient) -> None:
@@ -128,9 +142,13 @@ async def test_meeting_filters_and_service_scopes(client: httpx.AsyncClient) -> 
     service = bearer(await mint(client, "https://webexapis.com", app_only=True))
     assert (
         len(
-            (await client.get("/v1/meetings", params={"meetingType": "meeting"}, headers=service)).json()[
-                "items"
-            ]
+            (
+                await client.get(
+                    "/v1/meetings",
+                    params={"meetingType": "meeting", "from": "2026-09-01", "to": "2026-10-16"},
+                    headers=service,
+                )
+            ).json()["items"]
         )
         == 4
     )

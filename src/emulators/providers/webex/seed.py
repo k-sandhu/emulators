@@ -31,7 +31,7 @@ def meeting_shape(
     number = str(25520000000 + int(stable_hash(key, length=7), 16) % 10000000)
     return {
         "id": key,
-        "meetingNumber": f"{number[:4]} {number[4:7]} {number[7:]}",
+        "meetingNumber": number,
         "title": title,
         "agenda": "",
         "password": "Halcyon2026!",
@@ -62,8 +62,8 @@ def meeting_shape(
 def add_artifacts(ctx: ProviderContext, meeting: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
     """Artifact ids follow the occurrence so ending twice cannot duplicate an import."""
     key = meeting["id"]
-    recording_id = opaque("RECORDING", key)
-    transcript_id = opaque("TRANSCRIPT", key)
+    recording_id = stable_hash("webex", "RECORDING", key, length=32)
+    transcript_id = stable_hash("webex", "TRANSCRIPT", key, length=32)
     recording = ctx.store.collection("recordings").get(recording_id)
     transcript = ctx.store.collection("transcripts").get(transcript_id)
     start, end = parse_instant(meeting["start"]), parse_instant(meeting["end"])
@@ -100,6 +100,7 @@ def add_artifacts(ctx: ProviderContext, meeting: dict[str, Any]) -> tuple[dict[s
                 "meetingTopic": meeting["title"],
                 "meetingId": key,
                 "scheduledMeetingId": recording["scheduledMeetingId"],
+                "meetingSeriesId": recording["meetingSeriesId"],
                 "hostUserId": meeting["hostUserId"],
                 "status": "available",
             }
@@ -111,8 +112,8 @@ def seed_meeting(ctx: ProviderContext, world: Meeting) -> None:
     people = ctx.store.collection("people")
     host = people.get(opaque("PEOPLE", world.organizer_id))
     assert host is not None
-    scheduled_id = stable_hash("webex", world.id, length=32)
-    series_id = stable_hash("webex", world.series_id, length=32) if world.series_id else scheduled_id
+    series_id = stable_hash("webex", world.series_id or world.id, length=32)
+    scheduled_id = f"{series_id}_{world.start.strftime('%Y%m%dT%H%M%SZ')}"
     shape = meeting_shape(
         ctx,
         scheduled_id,
@@ -122,7 +123,8 @@ def seed_meeting(ctx: ProviderContext, world: Meeting) -> None:
         stamp(world.end),
         world.timezone,
         agenda=world.description,
-        state="ended" if world.happened else "ready",
+        state="ended" if world.happened else "scheduled",
+        meetingSeriesId=series_id,
         _people=[opaque("PEOPLE", p) for p in world.all_attendee_ids()],
         _worldId=world.id,
         _scheduledId=scheduled_id,
@@ -137,26 +139,27 @@ def seed_meeting(ctx: ProviderContext, world: Meeting) -> None:
             for t in world.transcript
         ],
     )
-    if world.series_id:
-        if ctx.store.collection("meetings").get(series_id) is None:
-            ctx.store.collection("meetings").put(
-                {
-                    **shape,
-                    "id": series_id,
-                    "meetingType": "meetingSeries",
-                    "state": "ready",
-                    "recurrence": "FREQ=WEEKLY;INTERVAL=2",
-                }
-            )
-        shape["meetingSeriesId"] = series_id
+    # Even a non-recurring meeting has a series and a dated scheduled occurrence in Webex.
+    series = ctx.store.collection("meetings").get(series_id)
+    if series is None:
+        series = ctx.store.collection("meetings").put(
+            {**shape, "id": series_id, "meetingType": "meetingSeries", "state": "expired"}
+        )
+        series.pop("meetingSeriesId", None)
+        if world.series_id:
+            series["recurrence"] = "FREQ=WEEKLY;INTERVAL=2"
+    series["_people"] = sorted(set(series["_people"]) | set(shape["_people"]))
+    if not world.happened:
+        series.update(state="active", start=shape["start"], end=shape["end"])
     ctx.store.collection("meetings").put(shape)
     if world.happened:
-        shape["_endedInstance"] = f"{scheduled_id}_I_{int(world.start.timestamp() * 1000)}"
+        shape["_endedInstance"] = f"{series_id}_I_{int(world.start.timestamp() * 1000)}"
         shape = {
             **shape,
-            "id": f"{scheduled_id}_I_{int(world.start.timestamp() * 1000)}",
+            "id": shape["_endedInstance"],
             "meetingType": "meeting",
             "state": "ended",
+            "scheduledMeetingId": scheduled_id,
         }
         ctx.store.collection("meetings").put(shape)
     for pid in world.attendee_ids + world.optional_ids:
@@ -239,10 +242,10 @@ def seed(ctx: ProviderContext) -> None:
             "lastName": p.last_name,
             "orgId": opaque("ORGANIZATION", p.company_id) if p.is_external else org,
             "roles": [role_id] if p.is_admin else [],
-            "licenses": [] if p.is_external else [license_id],
+            "licenses": [] if p.is_external or not p.active else [license_id],
             "created": created,
             "lastActivity": stamp(ctx.world.anchor - timedelta(hours=2)),
-            "status": "active" if p.active else "inactive",
+            "status": "inactive",
             "type": "person",
             "siteUrls": [] if p.is_external else [f"{SITE}#attendee"],
             "timezone": p.timezone,
@@ -251,6 +254,7 @@ def seed(ctx: ProviderContext) -> None:
             "_worldId": p.id,
             "_admin": p.is_admin,
             "_external": p.is_external,
+            "_loginEnabled": p.active,
         }
         if p.manager_id:
             record.update(
@@ -291,6 +295,20 @@ def seed(ctx: ProviderContext) -> None:
             and meeting.start >= ctx.world.anchor - timedelta(weeks=6)
         ):
             seed_meeting(ctx, meeting)
+    for series in ctx.store.collection("meetings"):
+        if series["meetingType"] != "meetingSeries":
+            continue
+        upcoming = [
+            m
+            for m in ctx.store.collection("meetings")
+            if m["meetingType"] == "scheduledMeeting"
+            and m["_seriesId"] == series["id"]
+            and m["state"] == "scheduled"
+        ]
+        if upcoming:
+            first = min(upcoming, key=lambda m: m["start"])
+            first["state"] = "ready"
+            series.update(start=first["start"], end=first["end"], _scheduledId=first["id"])
     for team in ctx.world.teams:
         channel = next(c for c in team.channels if c.name.lower() == "general")
         room = {
