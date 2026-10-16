@@ -25,7 +25,9 @@ def render_document(ctx: ProviderContext, doc_id: str, *, revision: int = 0, tot
         if table:
             table = table[: max(2, (len(table) * revision) // total)]
     author = ctx.world.person(doc.owner_id).display_name
-    data, _mime = documents.render(doc.kind, title, paragraphs, author=author, created=doc.created, table=table)
+    data, _mime = documents.render(
+        doc.kind, title, paragraphs, author=author, created=doc.created, table=table
+    )
     return data
 
 

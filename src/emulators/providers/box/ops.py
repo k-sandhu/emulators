@@ -5,11 +5,12 @@ from __future__ import annotations
 import copy
 from typing import Any
 
+from emulators.core.clock import utc
 from emulators.core.provider import ProviderContext
 from emulators.providers.box import content, db, errors, metadata, tree
 from emulators.providers.box.access import Principal
 from emulators.providers.box.shapes import Shaper
-from emulators.providers.box.util import next_id, now_iso, sha1_hex, unique_copy_name
+from emulators.providers.box.util import next_id, now_iso, sha1_hex, try_parse_ts
 
 Record = dict[str, Any]
 
@@ -50,9 +51,30 @@ def check_if_match(request_headers: Any, record: Record) -> None:
         raise errors.precondition_failed()
 
 
+def lock_active(ctx: ProviderContext, record: Record) -> Record | None:
+    lock = record.get("lock")
+    if not lock:
+        return None
+    expires = try_parse_ts(lock.get("expired_at"))
+    if expires and utc(expires) <= ctx.clock.now():
+        record["lock"] = None
+        return None
+    return lock
+
+
+def ensure_unlocked(ctx: ProviderContext, record: Record, p: Principal) -> None:
+    lock = lock_active(ctx, record)
+    if lock and lock["created_by"] != p.uid:
+        raise errors.box_error(403, "access_denied_item_locked", "Access denied - item locked")
+
+
 def record_recent(ctx: ProviderContext, user_id: str, record: Record, interaction: str) -> None:
     recents = ctx.store.collection(db.RECENTS)
-    stale = [r["id"] for r in recents if r["user_id"] == user_id and r["item_id"] == record["id"] and r["item_type"] == record["type"]]
+    stale = [
+        r["id"]
+        for r in recents
+        if r["user_id"] == user_id and r["item_id"] == record["id"] and r["item_type"] == record["type"]
+    ]
     for rid in stale:
         recents.delete(rid)
     rid = next_id(ctx, "recent", recents, start=1_000_000)
@@ -190,7 +212,13 @@ def text_of(data: bytes) -> str:
 
 
 def add_version(
-    p: Principal, record: Record, data: bytes, now: str, *, name: str | None = None, content_modified_at: str | None = None
+    p: Principal,
+    record: Record,
+    data: bytes,
+    now: str,
+    *,
+    name: str | None = None,
+    content_modified_at: str | None = None,
 ) -> Record:
     ctx = p.ctx
     current = db.versions(ctx).get(record["_version"]) or {"number": 0}
@@ -210,7 +238,9 @@ def add_version(
 
 
 # -- copy ------------------------------------------------------------------------------
-def copy_file(p: Principal, source: Record, parent: Record, name: str | None, now: str, version_id: str | None = None) -> Record:
+def copy_file(
+    p: Principal, source: Record, parent: Record, name: str | None, now: str, version_id: str | None = None
+) -> Record:
     ctx = p.ctx
     target_name = name or source["name"]
     ensure_name_free(p, parent["id"], target_name, as_object=True)
@@ -236,14 +266,16 @@ def copy_folder(p: Principal, source: Record, parent: Record, name: str | None, 
     ctx = p.ctx
     if parent["id"] == source["id"] or tree.is_within(ctx, parent, source["id"]):
         raise errors.bad_request(
-            "Folder cannot be copied into itself or one of its descendants", reason="invalid_parameter", name="parent"
+            "Folder cannot be copied into itself or one of its descendants",
+            reason="invalid_parameter",
+            name="parent",
         )
     target = create_folder(p, parent, name or source["name"], now)
     target["description"] = source.get("description", "")
     target["tags"] = list(source.get("tags", []))
     metadata.copy_instances(ctx, source, target, now)
     for child in p.tree.children(source["id"]):
-        if not p.caps(child):
+        if not p.visible(child):
             continue
         if child["type"] == "folder":
             copy_folder(p, child, target, None, now)
@@ -261,11 +293,25 @@ def reown(p: Principal, record: Record, owner: str) -> None:
             reown(p, child, owner)
 
 
+def ensure_not_frozen(ctx: ProviderContext, record: Record, operation: str) -> None:
+    """Folder locks ("freeze") forbid moving or deleting the locked folder."""
+    if record["type"] != "folder":
+        return
+    for lock in ctx.store.collection(db.FOLDER_LOCKS):
+        if lock["folder_id"] == record["id"] and lock["locked_operations"].get(operation):
+            raise errors.box_error(403, "access_denied_item_locked", "Access denied - item locked")
+
+
 def move(p: Principal, record: Record, new_parent: Record, now: str) -> None:
     ctx = p.ctx
-    if record["type"] == "folder" and (new_parent["id"] == record["id"] or tree.is_within(ctx, new_parent, record["id"])):
+    ensure_not_frozen(ctx, record, "move")
+    if record["type"] == "folder" and (
+        new_parent["id"] == record["id"] or tree.is_within(ctx, new_parent, record["id"])
+    ):
         raise errors.bad_request(
-            "Folder cannot be moved into itself or one of its descendants", reason="invalid_parameter", name="parent"
+            "Folder cannot be moved into itself or one of its descendants",
+            reason="invalid_parameter",
+            name="parent",
         )
     ensure_name_free(p, new_parent["id"], record["name"], ignore=record["id"])
     old_parent = tree.parent_of(ctx, record)
@@ -279,6 +325,7 @@ def move(p: Principal, record: Record, new_parent: Record, now: str) -> None:
 
 
 def trash(p: Principal, record: Record, now: str) -> None:
+    ensure_not_frozen(p.ctx, record, "delete")
     record["_trash"] = True
     record["trashed_at"] = now
     record["_trashed_by"] = p.uid
@@ -286,7 +333,9 @@ def trash(p: Principal, record: Record, now: str) -> None:
     p.invalidate()
 
 
-def restore(p: Principal, record: Record, now: str, *, parent: Record | None = None, name: str | None = None) -> None:
+def restore(
+    p: Principal, record: Record, now: str, *, parent: Record | None = None, name: str | None = None
+) -> None:
     ctx = p.ctx
     target_parent = parent or tree.parent_of(ctx, record)
     if target_parent is None or tree.is_trashed(ctx, target_parent):
@@ -308,14 +357,23 @@ def restore(p: Principal, record: Record, now: str, *, parent: Record | None = N
 def drop_item(ctx: ProviderContext, record: Record) -> None:
     """Permanently remove an item and everything hanging off it."""
     if record["type"] == "folder":
-        kids = [r for coll in (db.folders(ctx), db.files(ctx), ctx.store.collection(db.WEB_LINKS)) for r in coll if r.get("_parent") == record["id"]]
+        kids = [
+            r
+            for coll in (db.folders(ctx), db.files(ctx), ctx.store.collection(db.WEB_LINKS))
+            for r in coll
+            if r.get("_parent") == record["id"]
+        ]
         for child in kids:
             drop_item(ctx, child)
         db.folders(ctx).delete(record["id"])
     elif record["type"] == "file":
         for version in [v for v in db.versions(ctx) if v["_file"] == record["id"]]:
             db.versions(ctx).delete(version["id"])
-        for comment in [c for c in ctx.store.collection(db.COMMENTS) if c["item_type"] == "file" and c["item_id"] == record["id"]]:
+        for comment in [
+            c
+            for c in ctx.store.collection(db.COMMENTS)
+            if c["item_type"] == "file" and c["item_id"] == record["id"]
+        ]:
             ctx.store.collection(db.COMMENTS).delete(comment["id"])
         for task in [t for t in ctx.store.collection(db.TASKS) if t["item_id"] == record["id"]]:
             for assignment in [a for a in ctx.store.collection(db.ASSIGNMENTS) if a["task_id"] == task["id"]]:
@@ -324,12 +382,20 @@ def drop_item(ctx: ProviderContext, record: Record) -> None:
         db.files(ctx).delete(record["id"])
     else:
         ctx.store.collection(db.WEB_LINKS).delete(record["id"])
-    for collab in [c for c in db.collabs(ctx) if c["item_type"] == record["type"] and c["item_id"] == record["id"]]:
+    for collab in [
+        c for c in db.collabs(ctx) if c["item_type"] == record["type"] and c["item_id"] == record["id"]
+    ]:
         db.collabs(ctx).delete(collab["id"])
     for inst in metadata.instances_for(ctx, record):
         metadata.delete_instance(ctx, inst)
-    for webhook in [w for w in ctx.store.collection(db.WEBHOOKS) if w["target"]["id"] == record["id"] and w["target"]["type"] == record["type"]]:
+    for webhook in [
+        w
+        for w in ctx.store.collection(db.WEBHOOKS)
+        if w["target"]["id"] == record["id"] and w["target"]["type"] == record["type"]
+    ]:
         ctx.store.collection(db.WEBHOOKS).delete(webhook["id"])
+    for lock in [x for x in ctx.store.collection(db.FOLDER_LOCKS) if x["folder_id"] == record["id"]]:
+        ctx.store.collection(db.FOLDER_LOCKS).delete(lock["id"])
     for coll in ctx.store.collection(db.COLLECTIONS):
         items = coll["items"].get(record["type"], [])
         if record["id"] in items:
@@ -363,3 +429,34 @@ def set_collections(p: Principal, record: Record, value: Any) -> None:
             items.append(record["id"])
         elif coll["id"] not in wanted and record["id"] in items:
             items.remove(record["id"])
+
+
+# -- users created on the fly ---------------------------------------------------------
+def create_external_user(ctx: ProviderContext, login: str, now: str, *, name: str | None = None) -> Record:
+    """A Box account for an invited outsider (client contact, or an unregistered e-mail)."""
+    uid = next_id(ctx, "user", db.users(ctx), start=db.USER_ID_START)
+    display = name or login.split("@", 1)[0].replace(".", " ").title()
+    record: Record = {
+        "type": "user", "id": uid, "name": display, "login": login, "created_at": now, "modified_at": now,
+        "language": "en", "timezone": "America/Toronto", "status": "active", "job_title": "", "phone": "",
+        "address": "", "role": "user", "_pid": None, "_kind": "external", "_root": db.root_id(uid),
+        "_invited": True,
+    }  # fmt: skip
+    db.users(ctx).put(record)
+    db.folders(ctx).put(
+        {
+            "type": "folder", "id": record["_root"], "name": "All Files", "_root_of": uid, "_owner": uid,
+            "_parent": None, "_seq": 0, "created_at": now, "modified_at": now,
+        }
+    )  # fmt: skip
+    ctx.store.collection(db.COLLECTIONS).put(
+        {
+            "type": "collection",
+            "id": next_id(ctx, "collection", ctx.store.collection(db.COLLECTIONS), start=db.SMALL_ID_START),
+            "user_id": uid,
+            "name": "Favorites",
+            "collection_type": "favorites",
+            "items": {"file": [], "folder": []},
+        }
+    )
+    return record

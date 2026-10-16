@@ -32,7 +32,9 @@ STATUS_DEFAULTS: dict[int, tuple[str, str]] = {
     504: ("gateway_timeout", "Gateway Timeout"),
 }
 
-WWW_AUTHENTICATE = 'Bearer realm="Service", error="invalid_token", error_description="The access token provided is invalid."'
+WWW_AUTHENTICATE = (
+    'Bearer realm="Service", error="invalid_token", error_description="The access token provided is invalid."'
+)
 
 
 def request_id() -> str:
@@ -94,7 +96,11 @@ def forbidden(message: str = "Access denied - insufficient permission") -> Emula
 
 
 def bad_request(
-    message: str = "Bad Request", *, reason: str | None = None, name: str | None = None, code: str | None = None
+    message: str = "Bad Request",
+    *,
+    reason: str | None = None,
+    name: str | None = None,
+    code: str | None = None,
 ) -> EmulatorError:
     context: dict[str, Any] | None = None
     if reason or name:
@@ -120,7 +126,11 @@ def invalid_parameter(name: str, message: str | None = None) -> EmulatorError:
         "Bad Request",
         context_info={
             "errors": [
-                {"reason": "invalid_parameter", "name": name, "message": message or f"Invalid value for '{name}'"}
+                {
+                    "reason": "invalid_parameter",
+                    "name": name,
+                    "message": message or f"Invalid value for '{name}'",
+                }
             ]
         },
     )

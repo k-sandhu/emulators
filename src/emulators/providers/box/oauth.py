@@ -18,11 +18,15 @@ import jwt
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
-from emulators.core.auth import Grant, OAuthError, basic_credentials, redirect_with_params, render_account_picker
+from emulators.core.auth import (
+    OAuthError,
+    basic_credentials,
+    redirect_with_params,
+    render_account_picker,
+)
 from emulators.core.provider import ProviderContext
-from emulators.providers.box import access, db, errors, tree
+from emulators.providers.box import access, db, errors, events, tree
 from emulators.providers.box.access import Principal
-from emulators.providers.box.routing import Api
 from emulators.providers.box.util import ALNUM
 
 Record = dict[str, Any]
@@ -126,7 +130,9 @@ def exchange_token(ctx: ProviderContext, form: dict[str, str]) -> dict[str, Any]
     shaper_target: Record | None = None
     if form.get("resource"):
         item_type, item_id = parse_resource(ctx, form["resource"])
-        record = principal.folder_record(item_id) if item_type == "folder" else db.item(ctx, item_type, item_id)
+        record = (
+            principal.folder_record(item_id) if item_type == "folder" else db.item(ctx, item_type, item_id)
+        )
         if record is None or not principal.raw_caps(record) or tree.is_trashed(ctx, record):
             raise OAuthError("invalid_grant", "The resource is not accessible with the subject token")
         shaper_target = record
@@ -151,7 +157,13 @@ def exchange_token(ctx: ProviderContext, form: dict[str, str]) -> dict[str, Any]
     if grant.expires_at is not None:
         remaining = max(1, min(ACCESS_TTL, int((grant.expires_at - ctx.clock.now()).total_seconds())))
     tokens = issue_tokens(
-        ctx, user, grant.client_id, refresh=False, restricted_to=restricted, ttl_seconds=remaining, scopes=scopes
+        ctx,
+        user,
+        grant.client_id,
+        refresh=False,
+        restricted_to=restricted,
+        ttl_seconds=remaining,
+        scopes=scopes,
     )
     tokens["issued_token_type"] = ACCESS_TOKEN_TYPE
     return tokens
@@ -161,7 +173,9 @@ def jwt_claims(assertion: str | None) -> dict[str, Any]:
     if not assertion:
         raise OAuthError("invalid_request", "Missing assertion")
     try:
-        claims = jwt.decode(assertion, options={"verify_signature": False, "verify_aud": False, "verify_exp": False})
+        claims = jwt.decode(
+            assertion, options={"verify_signature": False, "verify_aud": False, "verify_exp": False}
+        )
     except jwt.PyJWTError:
         raise OAuthError("invalid_grant", "Invalid JWT assertion") from None
     for required in ("iss", "sub", "box_sub_type"):
@@ -187,8 +201,6 @@ def token_response(body: dict[str, Any]) -> JSONResponse:
 
 
 def register(app: FastAPI, ctx: ProviderContext) -> None:
-    api = Api(app, ctx)
-
     @app.get("/api/oauth2/authorize")
     async def authorize(request: Request) -> Response:
         q = request.query_params
@@ -269,27 +281,42 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
             sibling = grant.extra.get("access") or grant.extra.get("refresh")
             if sibling:
                 ctx.tokens.revoke(sibling)
+            owner = db.users(ctx).get(grant.user_id or "")
+            if owner is not None and grant.kind == "access":
+                audit(ctx, "OAUTH2_ACCESS_TOKEN_REVOKE", owner)
         return Response(status_code=200)
 
-    del api
+
+def audit(ctx: ProviderContext, event_type: str, user: Record) -> None:
+    """Sign-in activity shows up only in the enterprise ``admin_logs`` stream."""
+    events.append_event(
+        ctx,
+        event_type,
+        created_by=user["id"],
+        source={"type": "user", "id": user["id"], "name": user["name"], "login": user["login"]},
+        admin_only=True,
+    )
 
 
 def handle_grant(ctx: ProviderContext, grant_type: str | None, form: dict[str, str]) -> dict[str, Any]:
     client_id = form.get("client_id")
     if grant_type == "authorization_code":
         client = ctx.tokens.authenticate_client(client_id, form.get("client_secret"))
-        code = ctx.tokens.get(form.get("code"), "code")
-        if code is None or code.revoked or ctx.tokens.resolve(form.get("code"), "code") is None:
-            raise OAuthError("invalid_grant", "Auth code doesn't exist or is invalid for the client")
-        redeemed = ctx.tokens.redeem_code(
-            form.get("code"),
-            client_id=client["id"],
-            redirect_uri=form.get("redirect_uri"),
-            code_verifier=form.get("code_verifier"),
-        )
+        try:
+            redeemed = ctx.tokens.redeem_code(
+                form.get("code"),
+                client_id=client["id"],
+                redirect_uri=form.get("redirect_uri"),
+                code_verifier=form.get("code_verifier"),
+            )
+        except OAuthError:
+            raise OAuthError(
+                "invalid_grant", "Auth code doesn't exist or is invalid for the client"
+            ) from None
         user = db.users(ctx).get(redeemed.user_id or "")
         if user is None:
             raise OAuthError("invalid_grant", "Auth code doesn't exist or is invalid for the client")
+        audit(ctx, "LOGIN", user)
         return issue_tokens(ctx, user, client["id"], refresh=True, scopes=redeemed.scopes)
     if grant_type == "refresh_token":
         client = ctx.tokens.authenticate_client(client_id, form.get("client_secret"))
@@ -303,6 +330,7 @@ def handle_grant(ctx: ProviderContext, grant_type: str | None, form: dict[str, s
         old_access = refresh.extra.get("access")
         if old_access:
             ctx.tokens.revoke(old_access)
+        audit(ctx, "USER_AUTHENTICATE_OAUTH2_TOKEN_REFRESH", user)
         return issue_tokens(ctx, user, client["id"], refresh=True, scopes=refresh.scopes)
     if grant_type == "client_credentials":
         client = ctx.tokens.authenticate_client(client_id, form.get("client_secret"))
@@ -310,16 +338,16 @@ def handle_grant(ctx: ProviderContext, grant_type: str | None, form: dict[str, s
         return issue_tokens(ctx, user, client["id"], refresh=False)
     if grant_type == JWT_BEARER:
         claims = jwt_claims(form.get("assertion"))
-        client = ctx.tokens.authenticate_client(form.get("client_id") or claims["iss"], form.get("client_secret"))
+        client = ctx.tokens.authenticate_client(
+            form.get("client_id") or claims["iss"], form.get("client_secret")
+        )
         user = resolve_subject(ctx, claims["box_sub_type"], str(claims["sub"]))
         return issue_tokens(ctx, user, client["id"], refresh=False)
     if grant_type == TOKEN_EXCHANGE:
-        ctx.tokens.authenticate_client(client_id or "token-exchange", form.get("client_secret"), require_secret=False)
+        ctx.tokens.authenticate_client(
+            client_id or "token-exchange", form.get("client_secret"), require_secret=False
+        )
         return exchange_token(ctx, form)
     if not grant_type:
         raise OAuthError("invalid_request", "Invalid grant_type parameter or parameter missing")
     raise OAuthError("unsupported_grant_type", f"Unsupported grant_type: {grant_type}")
-
-
-def grant_user(ctx: ProviderContext, grant: Grant) -> Record | None:
-    return db.users(ctx).get(grant.user_id or "")

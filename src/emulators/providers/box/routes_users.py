@@ -41,7 +41,7 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
 
     def user_or_404(p: Principal, user_id: str) -> Record:
         record = p.user if user_id == "me" else db.users(ctx).get(user_id)
-        if record is None or record.get("_kind") == "service" and not p.is_privileged:
+        if record is None or (record.get("_kind") == "service" and not p.is_privileged):
             raise errors.not_found()
         if not p.can_see_user(record):
             raise errors.forbidden()
@@ -141,7 +141,9 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         ctx.store.collection(db.COLLECTIONS).put(
             {
                 "type": "collection",
-                "id": next_id(ctx, "collection", ctx.store.collection(db.COLLECTIONS), start=db.SMALL_ID_START),
+                "id": next_id(
+                    ctx, "collection", ctx.store.collection(db.COLLECTIONS), start=db.SMALL_ID_START
+                ),
                 "user_id": uid,
                 "name": "Favorites",
                 "collection_type": "favorites",
@@ -165,7 +167,14 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         own = record["id"] == p.uid
         if not p.is_privileged and not own:
             raise errors.forbidden()
-        restricted = {"role", "status", "enterprise", "is_exempt_from_device_limits", "space_amount", "can_see_managed_users"}
+        restricted = {
+            "role",
+            "status",
+            "enterprise",
+            "is_exempt_from_device_limits",
+            "space_amount",
+            "can_see_managed_users",
+        }
         if not p.is_privileged and restricted & set(body):
             raise errors.forbidden()
         if "role" in body:
@@ -175,14 +184,21 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
                 raise errors.forbidden()
             record["role"] = body["role"]
         if "status" in body:
-            if body["status"] not in ("active", "inactive", "cannot_delete_edit", "cannot_delete_edit_upload"):
+            if body["status"] not in (
+                "active",
+                "inactive",
+                "cannot_delete_edit",
+                "cannot_delete_edit_upload",
+            ):
                 raise errors.invalid_parameter("status", "Invalid status")
             record["status"] = "active" if body["status"] == "active" else "inactive"
             if record["status"] == "inactive":
                 ctx.tokens.revoke_user(record["id"])
         if "login" in body and p.is_privileged:
             if db.user_by_login(ctx, body["login"]) not in (None, record):
-                raise errors.box_error(409, "user_login_already_used", "Item with the same name already exists")
+                raise errors.box_error(
+                    409, "user_login_already_used", "Item with the same name already exists"
+                )
             record["login"] = body["login"]
         for key in USER_UPDATABLE:
             if key in body:
@@ -193,7 +209,9 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         if "enterprise" in body and body["enterprise"] is None and p.is_privileged:
             record["_kind"] = "external"
         record["modified_at"] = now_iso(ctx)
-        events.append_event(ctx, "EDIT_USER", created_by=p.uid, source=Shaper(p, request).user_mini(record["id"]))
+        events.append_event(
+            ctx, "EDIT_USER", created_by=p.uid, source=Shaper(p, request).user_mini(record["id"])
+        )
         return Shaper(p, request).user(record, parse_fields(request), full=True)
 
     @api.delete("/users/{user_id}")
@@ -218,7 +236,11 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
             db.folders(ctx).delete(root["id"])
         for membership in [m for m in db.memberships(ctx) if m["user_id"] == record["id"]]:
             db.memberships(ctx).delete(membership["id"])
-        for collab in [c for c in db.collabs(ctx) if c["accessible_type"] == "user" and c["accessible_id"] == record["id"]]:
+        for collab in [
+            c
+            for c in db.collabs(ctx)
+            if c["accessible_type"] == "user" and c["accessible_id"] == record["id"]
+        ]:
             db.collabs(ctx).delete(collab["id"])
         ctx.tokens.revoke_user(record["id"])
         db.users(ctx).delete(record["id"])
@@ -234,9 +256,8 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         record = user_or_404(p, user_id)
         return avatar_response(record)
 
-    @app.get("/api/avatar/large/{user_id}")
-    @app.get("/api/avatar/small/{user_id}")
-    async def avatar_public(user_id: str) -> Any:
+    @app.get("/api/avatar/{size}/{user_id}", operation_id="public_avatar")
+    async def avatar_public(size: str, user_id: str) -> Any:
         record = db.users(ctx).get(user_id)
         if record is None:
             raise errors.not_found()
@@ -352,7 +373,14 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         group = group_or_404(p, group_id, manage=True)
         body = await json_body(request)
         validate_group_body(body)
-        for key in ("name", "provenance", "external_sync_identifier", "description", "invitability_level", "member_viewability_level"):
+        for key in (
+            "name",
+            "provenance",
+            "external_sync_identifier",
+            "description",
+            "invitability_level",
+            "member_viewability_level",
+        ):
             if key in body:
                 group[key] = body[key]
         group["modified_at"] = now_iso(ctx)
@@ -364,10 +392,14 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         group = group_or_404(p, group_id, manage=True)
         for membership in [m for m in db.memberships(ctx) if m["group_id"] == group_id]:
             db.memberships(ctx).delete(membership["id"])
-        for collab in [c for c in db.collabs(ctx) if c["accessible_type"] == "group" and c["accessible_id"] == group_id]:
+        for collab in [
+            c for c in db.collabs(ctx) if c["accessible_type"] == "group" and c["accessible_id"] == group_id
+        ]:
             db.collabs(ctx).delete(collab["id"])
         db.groups(ctx).delete(group_id)
-        events.append_event(ctx, "GROUP_DELETION", created_by=p.uid, source=Shaper(p, request).group_mini(group))
+        events.append_event(
+            ctx, "GROUP_DELETION", created_by=p.uid, source=Shaper(p, request).group_mini(group)
+        )
         return no_content()
 
     @api.get("/groups/{group_id}/memberships")
@@ -444,4 +476,3 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         events.append_event(ctx, "GROUP_REMOVE_USER", created_by=p.uid, source=shaper.user_mini(record["user_id"]),
                             additional_details={"group": shaper.group_mini(group)} if group else None)  # fmt: skip
         return no_content()
-

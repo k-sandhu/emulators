@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from typing import Any
 
@@ -28,8 +29,14 @@ class Api:
         self, path: str, methods: list[str], *, prefix: str = API, status_code: int = 200
     ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
         def decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
+            slug = re.sub(r"\W+", "_", f"{fn.__name__}{prefix}{path}_{'_'.join(methods)}").strip("_")
             self.app.add_api_route(
-                prefix + path, fn, methods=methods, status_code=status_code, response_model=None
+                prefix + path,
+                fn,
+                methods=methods,
+                status_code=status_code,
+                response_model=None,
+                operation_id=slug,
             )
             return fn
 

@@ -30,6 +30,8 @@ RECENTS = "box_recent_items"
 WEB_LINKS = "box_web_links"
 ZIPS = "box_zip_downloads"
 CHANNELS = "box_longpoll_channels"
+FOLDER_LOCKS = "box_folder_locks"
+INVITES = "box_invites"
 
 ROOT_PREFIX = "root_"
 ROOT_WIRE_ID = "0"
@@ -102,5 +104,27 @@ def item(ctx: ProviderContext, item_type: str, item_id: str) -> Record | None:
     return None
 
 
-def item_key(record: Record) -> str:
-    return f"{record['type']}:{record['id']}"
+class Live:
+    """A collection handle that survives ``reset``: it re-resolves the collection on every use.
+
+    ``Store.restore`` replaces the collection objects, so route closures must never keep one.
+    """
+
+    def __init__(self, ctx: ProviderContext, name: str) -> None:
+        self._ctx = ctx
+        self._name = name
+
+    def _target(self) -> Collection:
+        return self._ctx.store.collection(self._name)
+
+    def __getattr__(self, attr: str) -> Any:
+        return getattr(self._target(), attr)
+
+    def __iter__(self) -> Any:
+        return iter(self._target())
+
+    def __len__(self) -> int:
+        return len(self._target())
+
+    def __contains__(self, record_id: object) -> bool:
+        return record_id in self._target()

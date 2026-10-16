@@ -9,12 +9,10 @@ live in ``routes_*`` modules, each exposing ``register(app, ctx)``.
 from __future__ import annotations
 
 import importlib
-import json
 from typing import Any
 
 from fastapi import FastAPI
 
-from emulators.core.middleware import FaultRule
 from emulators.core.provider import Provider, ProviderContext
 from emulators.providers.box import errors
 
@@ -31,19 +29,13 @@ MODULES = (
     "routes_social",  # comments, tasks, task assignments, web links
     "routes_misc",  # collections (favourites), recent items, zip downloads
     "routes_webhooks",  # webhooks v2
+    "routes_extras",  # content transfer, watermarks, folder locks, representations
     "actions",  # /_emulator/actions/*
 )
 
 
 def _modules() -> list[Any]:
-    loaded = []
-    for name in MODULES:
-        try:
-            loaded.append(importlib.import_module(f"{__name__}.{name}"))
-        except ModuleNotFoundError as exc:
-            if exc.name != f"{__name__}.{name}":
-                raise
-    return loaded
+    return [importlib.import_module(f"{__name__}.{name}") for name in MODULES]
 
 
 class BoxProvider(Provider):
@@ -79,20 +71,25 @@ class BoxProvider(Provider):
 
     def error_body(self, status: int, code: str, message: str) -> Any:
         default_code, default_message = errors.STATUS_DEFAULTS.get(status, ("error", message))
-        return errors.error_body(status, default_code, default_message if status != 400 else message)
+        if status == 400 and message.startswith("Invalid request"):
+            return errors.error_body(
+                400, "bad_request", "Bad Request",
+                context_info={"errors": [{"reason": "invalid_parameter", "message": message}]},
+            )  # fmt: skip
+        return errors.error_body(status, default_code, default_message)
 
-    def fault_response(self, rule: FaultRule) -> tuple[int, dict[str, str], bytes]:
-        status = rule.status or 500
-        headers = {"content-type": "application/json", **rule.headers}
-        if status == 429 and not any(k.lower() == "retry-after" for k in headers):
-            headers["Retry-After"] = "2"
-        if status == 401 and not any(k.lower() == "www-authenticate" for k in headers):
-            headers["WWW-Authenticate"] = errors.WWW_AUTHENTICATE
-        if rule.body is not None:
-            body = rule.body if isinstance(rule.body, (bytes, str)) else json.dumps(rule.body)
-        else:
-            body = json.dumps(self.error_body(status, "", ""))
-        return status, headers, body.encode() if isinstance(body, str) else body
+    def error_body_for(self, scope: dict[str, Any] | None, status: int, code: str, message: str) -> Any:
+        if _is_oauth(scope):
+            return {
+                "error": "invalid_request" if status < 500 else "server_error",
+                "error_description": message,
+            }
+        return self.error_body(status, code, message)
+
+    def error_headers_for(self, scope: dict[str, Any] | None, status: int) -> dict[str, str]:
+        if status == 401 and not _is_oauth(scope):
+            return {"WWW-Authenticate": errors.WWW_AUTHENTICATE}
+        return {}
 
     def seed(self, ctx: ProviderContext) -> None:
         from emulators.providers.box import seed
@@ -103,6 +100,10 @@ class BoxProvider(Provider):
         for module in _modules():
             if hasattr(module, "register"):
                 module.register(app, ctx)
+
+
+def _is_oauth(scope: dict[str, Any] | None) -> bool:
+    return "/oauth2/" in (scope or {}).get("path", "")
 
 
 PROVIDER = BoxProvider()

@@ -19,10 +19,9 @@ import hashlib
 from datetime import UTC, datetime, time, timedelta
 from typing import Any
 
-from emulators.core.ids import stable_hash
+from emulators.core.ids import stable_guid, stable_hash
 from emulators.core.provider import ProviderContext
 from emulators.providers.box import content, db, events, metadata
-from emulators.providers.box.access import Principal
 from emulators.providers.box.util import derived_number, sha1_hex, to_iso
 from emulators.world.model import Document, Person, Share, Space
 
@@ -42,10 +41,6 @@ ENGAGEMENT_TYPES = [
 ]  # fmt: skip
 
 LANGUAGE = {"en-CA": "en", "en-US": "en", "en-GB": "en", "fr-CA": "fr-CA"}
-
-
-def enterprise_id(ctx: ProviderContext) -> str:
-    return ctx.world.org.box_enterprise_id
 
 
 class Seeder:
@@ -104,7 +99,9 @@ class Seeder:
                 "name": person.display_name,
                 "login": person.email,
                 "created_at": self.stamp(created),
-                "modified_at": self.stamp(created + timedelta(days=30 + int(stable_hash(person.id, length=2), 16) % 200)),
+                "modified_at": self.stamp(
+                    created + timedelta(days=30 + int(stable_hash(person.id, length=2), 16) % 200)
+                ),
                 "language": LANGUAGE.get(person.locale, person.locale.split("-")[0]),
                 "timezone": person.timezone,
                 "status": "active" if person.active else "inactive",
@@ -191,7 +188,9 @@ class Seeder:
                     "provenance": None,
                     "external_sync_identifier": None,
                     "description": group.description,
-                    "invitability_level": "admins_and_members" if group.kind == "department" else "admins_only",
+                    "invitability_level": "admins_and_members"
+                    if group.kind == "department"
+                    else "admins_only",
                     "member_viewability_level": "admins_and_members",
                     "_wid": group.id,
                 }
@@ -213,7 +212,9 @@ class Seeder:
                 )
 
     # -- folders and files ----------------------------------------------------------------
-    def ensure_folder(self, owner: str, parent_id: str, name: str, path_key: str, creator: str, created: str) -> str:
+    def ensure_folder(
+        self, owner: str, parent_id: str, name: str, path_key: str, creator: str, created: str
+    ) -> str:
         key = (parent_id, name.lower())
         existing = self.folder_index.get(key)
         if existing:
@@ -246,7 +247,9 @@ class Seeder:
         self.folder_index[key] = fid
         return fid
 
-    def folder_chain(self, owner: str, root_parent: str, base_key: str, parts: list[str], creator: str, created: str) -> str:
+    def folder_chain(
+        self, owner: str, root_parent: str, base_key: str, parts: list[str], creator: str, created: str
+    ) -> str:
         parent = root_parent
         path = base_key
         for part in parts:
@@ -284,7 +287,12 @@ class Seeder:
                 continue
             created = self.stamp(self.anchor - timedelta(days=900))
             fid = self.ensure_folder(
-                self.admin_uid, db.root_id(self.admin_uid), space.name, f"team/{space.id}", self.admin_uid, created
+                self.admin_uid,
+                db.root_id(self.admin_uid),
+                space.name,
+                f"team/{space.id}",
+                self.admin_uid,
+                created,
             )
             self.team_folder[space.id] = fid
             folder = db.folders(self.ctx).get(fid)
@@ -395,7 +403,11 @@ class Seeder:
                 "access": "open" if share.link == "anyone" else "company",
                 "password": None,
                 "unshared_at": self.stamp(share.expires) if share.expires else None,
-                "permissions": {"can_download": True, "can_preview": True, "can_edit": share.role == "editor"},
+                "permissions": {
+                    "can_download": True,
+                    "can_preview": True,
+                    "can_edit": share.role == "editor",
+                },
                 "download_count": 0,
                 "preview_count": 0,
                 "vanity_name": None,
@@ -411,10 +423,6 @@ class Seeder:
                 continue
             folder["created_at"] = folder["content_created_at"] = created
             folder["modified_at"] = folder["content_modified_at"] = modified
-        for fid in self.team_folder.values():
-            folder = db.folders(self.ctx).get(fid)
-            if folder and fid not in self.span:
-                continue
 
     # -- collaborations ----------------------------------------------------------------
     def collab(
@@ -447,7 +455,9 @@ class Seeder:
             "modified_at": created,
             "expires_at": expires,
             "invite_email": invite_email,
-            "acknowledged_at": self.stamp(datetime.fromisoformat(created) + timedelta(days=1)) if status == "accepted" else None,
+            "acknowledged_at": self.stamp(datetime.fromisoformat(created) + timedelta(days=1))
+            if status == "accepted"
+            else None,
             "is_access_only": False,
         }
         db.collabs(self.ctx).put(record)
@@ -462,17 +472,46 @@ class Seeder:
             seen_owner = False
             for principal, role in space.members:
                 box_role = ROLE_MAP[role]
-                if principal in self.gid_map():
-                    self.collab(f"space/{space.id}/{principal}", "folder", folder_id, "group", self.gid[principal], box_role, self.admin_uid, created)
+                if principal in self.gid:
+                    self.collab(
+                        f"space/{space.id}/{principal}",
+                        "folder",
+                        folder_id,
+                        "group",
+                        self.gid[principal],
+                        box_role,
+                        self.admin_uid,
+                        created,
+                    )
                 elif principal in self.uid:
                     seen_owner = seen_owner or principal == space.owner_id
-                    self.collab(f"space/{space.id}/{principal}", "folder", folder_id, "user", self.uid[principal], box_role, self.admin_uid, created)
+                    self.collab(
+                        f"space/{space.id}/{principal}",
+                        "folder",
+                        folder_id,
+                        "user",
+                        self.uid[principal],
+                        box_role,
+                        self.admin_uid,
+                        created,
+                    )
+            # Like a real integration, the app's service account is a co-owner of every team folder.
+            self.collab(
+                f"space/{space.id}/service", "folder", folder_id, "user", self.service["id"], "co-owner",
+                self.admin_uid, created,
+            )  # fmt: skip
             owner_uid = self.uid.get(space.owner_id)
             if owner_uid and owner_uid != self.admin_uid and not seen_owner:
-                self.collab(f"space/{space.id}/owner", "folder", folder_id, "user", owner_uid, "co-owner", self.admin_uid, created)
-
-    def gid_map(self) -> dict[str, str]:
-        return self.gid
+                self.collab(
+                    f"space/{space.id}/owner",
+                    "folder",
+                    folder_id,
+                    "user",
+                    owner_uid,
+                    "co-owner",
+                    self.admin_uid,
+                    created,
+                )
 
     def seed_shares(self) -> None:
         for doc in self.world.documents:
@@ -510,7 +549,6 @@ class Seeder:
     # -- favorites ---------------------------------------------------------------------
     def seed_collections(self) -> None:
         for user in db.users(self.ctx):
-            db.users(self.ctx)  # keep ordering explicit
             cid = self.number("collection", user["id"], 10_000_000, 99_999_999)
             self.ctx.store.collection(db.COLLECTIONS).put(
                 {
@@ -526,7 +564,9 @@ class Seeder:
             if not doc.starred:
                 continue
             user_id = self.uid.get(doc.owner_id)
-            coll = next((c for c in self.ctx.store.collection(db.COLLECTIONS) if c["user_id"] == user_id), None)
+            coll = next(
+                (c for c in self.ctx.store.collection(db.COLLECTIONS) if c["user_id"] == user_id), None
+            )
             if coll is not None:
                 coll["items"]["file"].append(self.file_of_doc[doc.id])
 
@@ -543,7 +583,13 @@ class Seeder:
             "hidden": False,
             "copyInstanceOnItemCopy": False,
             "fields": [
-                {"id": "0f6b3b3e-1f0a-4d1c-8d3e-3a1f6a9b0001", "type": "string", "key": "clientName", "displayName": "Client Name", "hidden": False},
+                {
+                    "id": "0f6b3b3e-1f0a-4d1c-8d3e-3a1f6a9b0001",
+                    "type": "string",
+                    "key": "clientName",
+                    "displayName": "Client Name",
+                    "hidden": False,
+                },
                 {
                     "id": "0f6b3b3e-1f0a-4d1c-8d3e-3a1f6a9b0002",
                     "type": "enum",
@@ -555,10 +601,17 @@ class Seeder:
                         for i, name in enumerate(ENGAGEMENT_TYPES)
                     ],
                 },
-                {"id": "0f6b3b3e-1f0a-4d1c-8d3e-3a1f6a9b0003", "type": "float", "key": "fiscalYear", "displayName": "Fiscal Year", "hidden": False},
+                {
+                    "id": "0f6b3b3e-1f0a-4d1c-8d3e-3a1f6a9b0003",
+                    "type": "float",
+                    "key": "fiscalYear",
+                    "displayName": "Fiscal Year",
+                    "hidden": False,
+                },
             ],
         }
         ctx.store.collection(db.TEMPLATES).put(template)
+        self.seed_classification(scope)
         for doc in self.world.documents:
             if not doc.client_id:
                 continue
@@ -585,6 +638,70 @@ class Seeder:
                 }
             )
 
+    def seed_classification(self, scope: str) -> None:
+        """Box's built-in security classification template, applied by data sensitivity."""
+        ctx = self.ctx
+        levels = {
+            "Public": ("Data that can be shared outside the firm.", 2),
+            "Internal": ("Firm-internal working material.", 3),
+            "Confidential": ("Restricted to named people; client or partner confidential.", 5),
+        }
+        ctx.store.collection(db.TEMPLATES).put(
+            {
+                "id": "8c1d7a4e-2f0b-4b53-9d6e-5a1c7e9f0b21",
+                "type": "metadata_template",
+                "templateKey": metadata.CLASSIFICATION_KEY,
+                "scope": scope,
+                "displayName": "Classification",
+                "hidden": False,
+                "copyInstanceOnItemCopy": True,
+                "fields": [
+                    {
+                        "id": "a3f2c1d0-7b6e-4a58-8c9d-0e1f2a3b4c5d",
+                        "type": "enum",
+                        "key": metadata.CLASSIFICATION_FIELD,
+                        "displayName": "Classification",
+                        "hidden": False,
+                        "options": [
+                            {
+                                "id": stable_guid("box-classification", name),
+                                "key": name,
+                                "staticConfig": {
+                                    "classification": {"classificationDefinition": text, "colorID": color}
+                                },
+                            }
+                            for name, (text, color) in levels.items()
+                        ],
+                    }
+                ],
+            }
+        )
+        by_space = {
+            "leadership": "Confidential",
+            "finance": "Internal",
+            "people": "Internal",
+            "it": "Internal",
+            "knowledge": "Public",
+        }
+        for doc in self.world.documents:
+            label = "Confidential" if doc.restricted else by_space.get(doc.space_id)
+            if label is None:
+                continue
+            ctx.store.collection(db.METADATA).put(
+                {
+                    "id": f"{stable_hash('cls', doc.id, length=8)}-0000-4000-8000-{stable_hash('cls2', doc.id, length=12)}",
+                    "item_type": "file",
+                    "item_id": self.file_of_doc[doc.id],
+                    "scope": scope,
+                    "template": metadata.CLASSIFICATION_KEY,
+                    "values": {metadata.CLASSIFICATION_FIELD: label},
+                    "version": 0,
+                    "typeVersion": 0,
+                    "created_at": self.stamp(doc.created),
+                    "can_edit": True,
+                }
+            )
+
     # -- comments and tasks -------------------------------------------------------------
     def seed_social(self) -> None:
         ctx = self.ctx
@@ -599,7 +716,9 @@ class Seeder:
         ]
         count = 0
         for doc in self.world.documents:
-            if not doc.engagement_id or not (doc.name.startswith(("Draft", "Management Letter", "Trial Balance"))):
+            if not doc.engagement_id or not (
+                doc.name.startswith(("Draft", "Management Letter", "Trial Balance"))
+            ):
                 continue
             engagement = self.world.engagement(doc.engagement_id)
             file_id = self.file_of_doc[doc.id]
@@ -673,42 +792,37 @@ class Seeder:
 
     # -- events ------------------------------------------------------------------------
     def seed_events(self) -> None:
+        """A believable audit trail: creations, uploads, shares and invitations, oldest first."""
         ctx = self.ctx
-        admin = Principal(ctx, db.users(ctx).get(self.admin_uid), db.users(ctx).get(self.admin_uid))  # type: ignore[arg-type]
-        pending: list[tuple[str, str, str, Record | None, Any, str | None]] = []
+        pending: list[tuple[str, str, str, Record, Record | None]] = []
         for folder in db.folders(ctx):
-            if db.is_root(folder):
-                continue
-            pending.append((folder["created_at"], "ITEM_CREATE", folder["created_by"], folder, None, None))
+            if not db.is_root(folder):
+                pending.append((folder["created_at"], "ITEM_CREATE", folder["created_by"], folder, None))
         for record in db.files(ctx):
-            pending.append((record["created_at"], "ITEM_UPLOAD", record["created_by"], record, None, None))
+            pending.append((record["created_at"], "ITEM_UPLOAD", record["created_by"], record, None))
             if record["_seq"] > 0:
-                pending.append((record["modified_at"], "ITEM_UPLOAD", record["modified_by"], record, None, None))
-        for collab in db.collabs(ctx):
-            record = db.item(ctx, collab["item_type"], collab["item_id"])
-            kind = "COLLAB_ADD_COLLABORATOR" if collab["status"] == "accepted" else "COLLAB_INVITE_COLLABORATOR"
-            pending.append((collab["created_at"], kind, collab["created_by"], record, None, "collab"))
-        for record in db.files(ctx):
+                pending.append((record["modified_at"], "ITEM_UPLOAD", record["modified_by"], record, None))
             link = record.get("shared_link")
             if link:
-                pending.append((link["created_at"], "ITEM_SHARED_CREATE", link["created_by"], record, None, None))
-        pending.sort(key=lambda row: (row[0], row[1]))
-        from emulators.providers.box.shapes import Shaper
-
-        shaper = Shaper(admin)
-        for created_at, event_type, actor, record, _unused, kind in pending:
-            if record is None:
-                continue
-            source = events.item_source(admin, record)
-            additional = None
-            if kind == "collab":
-                additional = {"role": None}
-                additional = None
+                pending.append((link["created_at"], "ITEM_SHARED_CREATE", link["created_by"], record, None))
+        for collab in db.collabs(ctx):
+            item = db.item(ctx, collab["item_type"], collab["item_id"])
+            if item is not None:
+                kind = (
+                    "COLLAB_ADD_COLLABORATOR"
+                    if collab["status"] == "accepted"
+                    else "COLLAB_INVITE_COLLABORATOR"
+                )
+                pending.append((collab["created_at"], kind, collab["created_by"], item, collab))
+        pending.sort(key=lambda row: (row[0], row[1], row[3]["id"]))
+        for index, (created_at, event_type, actor, record, collab) in enumerate(pending):
+            lazy = ("collaboration", collab["id"]) if collab else (record["type"], record["id"])
             events.append_event(
-                ctx, event_type, created_by=actor, source=source, item=record, created_at=created_at,
-                additional_details=additional,
+                ctx, event_type, created_by=actor, source=None, item=record, created_at=created_at,
+                event_id=stable_guid(self.seed_key, "box-event", index),
+                session_id=stable_hash("box-session", index, length=12),
+                lazy=lazy,
             )  # fmt: skip
-        del shaper
         # Recent items: last 45 days of uploads/modifications per acting user.
         recents = ctx.store.collection(db.RECENTS)
         horizon = self.stamp(self.anchor - timedelta(days=45))

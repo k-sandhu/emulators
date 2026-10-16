@@ -93,8 +93,12 @@ def append_event(
     item: Record | None = None,
     created_at: str | None = None,
     additional_details: Any = None,
+    event_id: str | None = None,
+    session_id: str | None = None,
+    lazy: tuple[str, str] | None = None,
+    admin_only: bool = False,
 ) -> Record:
-    """Write one event to the log; returns the stored record."""
+    """Write one event to the log; returns the stored record. Seeding passes stable ids."""
     pos = current_position(ctx) + 1
     ctx.store.meta[EVENT_POS_KEY] = pos
     stamp = created_at or now_iso(ctx)
@@ -102,15 +106,17 @@ def append_event(
     event = {
         "id": f"ev{pos}",
         "type": "event",
-        "event_id": str(uuid.uuid4()),
+        "event_id": event_id or str(uuid.uuid4()),
         "created_by": created_by,
         "created_at": stamp,
         "recorded_at": stamp,
         "event_type": event_type,
-        "session_id": random_lower(12),
+        "session_id": session_id or random_lower(12),
         "source": source,
         "additional_details": additional_details,
         "ip_address": "10.0.0.1",
+        "_lazy": lazy,
+        "_admin_only": admin_only,
         "_pos": pos,
         "_item_type": item["type"] if item else None,
         "_item_id": item["id"] if item else None,
@@ -118,6 +124,17 @@ def append_event(
     }
     ctx.store.collection(db.EVENTS).put(event)
     return event
+
+
+def lazy_source(shaper: Shaper, lazy: tuple[str, str]) -> Any:
+    """Seeded events keep a reference instead of a snapshot (cheap resets); render it on read."""
+    kind, ref = lazy
+    ctx = shaper.ctx
+    if kind == "collaboration":
+        collab = db.collabs(ctx).get(ref)
+        return shaper.collaboration(collab) if collab else {"type": "collaboration", "id": ref}
+    record = db.item(ctx, kind, ref)
+    return item_source(shaper.p, record) if record else {"type": kind, "id": ref}
 
 
 def render_event(shaper: Shaper, event: Record) -> Record:
@@ -129,7 +146,7 @@ def render_event(shaper: Shaper, event: Record) -> Record:
         "recorded_at": box_ts(event["recorded_at"]),
         "event_type": event["event_type"],
         "session_id": event["session_id"],
-        "source": event["source"],
+        "source": lazy_source(shaper, event["_lazy"]) if event.get("_lazy") else event["source"],
     }
     if event.get("additional_details") is not None:
         out["additional_details"] = event["additional_details"]
@@ -137,12 +154,14 @@ def render_event(shaper: Shaper, event: Record) -> Record:
 
 
 def event_visible(p: Principal, event: Record) -> bool:
-    """User streams carry events the caller caused or can currently see."""
+    """User streams carry events the caller caused or can currently see (never audit-only events)."""
+    if event.get("_admin_only"):
+        return False
     if event["created_by"] == p.uid or event.get("_owner") == p.uid:
         return True
     if event["_item_type"] in ("file", "folder"):
         record = db.item(p.ctx, event["_item_type"], event["_item_id"])
-        return bool(record and p.caps(record))
+        return bool(record and p.visible(record))
     return False
 
 

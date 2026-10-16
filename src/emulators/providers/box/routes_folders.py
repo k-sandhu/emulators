@@ -29,7 +29,15 @@ SORTS = ("id", "name", "date", "size")
 def register(app: FastAPI, ctx: ProviderContext) -> None:
     api = Api(app, ctx)
 
-    def listing_body(p: access.Principal, shaper: Shaper, request: Request, records: list[Record], *, sort: str | None, direction: str) -> dict[str, Any]:
+    def listing_body(
+        p: access.Principal,
+        shaper: Shaper,
+        request: Request,
+        records: list[Record],
+        *,
+        sort: str | None,
+        direction: str,
+    ) -> dict[str, Any]:
         offset, limit, use_marker = page_window(request, default_limit=100, max_limit=1000)
         fields = parse_fields(request)
         order = [{"by": sort, "direction": direction.upper()}] if sort else list(FOLDER_ITEM_ORDER)
@@ -57,7 +65,12 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
             for r in coll
             if r.get("_trash") and r.get("_owner") == p.uid
         ]
-        key = {"id": lambda r: int(r["id"]), "name": lambda r: r["name"].lower(), "date": lambda r: r.get("trashed_at") or "", "size": lambda r: int(r.get("size", 0))}
+        key = {
+            "id": lambda r: int(r["id"]),
+            "name": lambda r: r["name"].lower(),
+            "date": lambda r: r.get("trashed_at") or "",
+            "size": lambda r: int(r.get("size", 0)),
+        }
         records.sort(key=key.get(sort or "date", key["date"]), reverse=direction == "DESC" if sort else True)
         return listing_body(p, api.shaper(p, request), request, records, sort=sort, direction=direction)
 
@@ -100,7 +113,7 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
     @api.put("/folders/{folder_id}")
     async def update_folder(request: Request, folder_id: str) -> Any:
         p = api.principal(request)
-        body = await json_body(request)
+        body = await json_body(request, required=False)
         record = p.get_item("folder", folder_id)
         if db.is_root(record):
             raise errors.forbidden()
@@ -119,7 +132,13 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
                 p.require(record, access.RENAME)
                 ops.move(p, record, new_parent, now)
                 emitted.append(("ITEM_MOVE", None))
-        for key in ("description", "can_non_owners_invite", "can_non_owners_view_collaborators", "is_collaboration_restricted_to_enterprise", "sync_state"):
+        for key in (
+            "description",
+            "can_non_owners_invite",
+            "can_non_owners_view_collaborators",
+            "is_collaboration_restricted_to_enterprise",
+            "sync_state",
+        ):
             if key in body:
                 p.require(record, access.RENAME)
                 if key == "description" and not isinstance(body[key], str):
@@ -195,11 +214,9 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
     async def purge_folder(request: Request, folder_id: str) -> Any:
         p = api.principal(request)
         record = p.get_item("folder", folder_id, access.DELETE, allow_trashed=True, only_trashed=True)
-        snapshot = events.item_source(p, record)
+        await events.emit(p, "DELETE", record, source=events.item_source(p, record))
         ops.purge(p, record)
-        events.append_event(ctx, "DELETE", created_by=p.uid, source=snapshot, item=None)
         return no_content()
-
 
 
 def upload_email(record: Record, value: Any) -> Record | None:
@@ -207,8 +224,9 @@ def upload_email(record: Record, value: Any) -> Record | None:
         return None
     level = value.get("access") if isinstance(value, dict) else None
     if level not in ("open", "collaborators"):
-        raise errors.invalid_parameter("folder_upload_email.access", "access must be 'open' or 'collaborators'")
+        raise errors.invalid_parameter(
+            "folder_upload_email.access", "access must be 'open' or 'collaborators'"
+        )
     existing = record.get("folder_upload_email")
     address = existing["email"] if existing else f"upload.{record['id']}@u.box.com"
     return {"access": level, "email": address}
-

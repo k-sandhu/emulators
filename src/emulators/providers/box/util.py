@@ -21,8 +21,6 @@ BOX_TZ = ZoneInfo("America/Los_Angeles")
 ALNUM = string.ascii_letters + string.digits
 LOWER_ALNUM = string.ascii_lowercase + string.digits
 
-ENTERPRISE_TYPE = "enterprise"
-
 
 # -- time ------------------------------------------------------------------------------
 def to_iso(dt: datetime) -> str:
@@ -104,10 +102,6 @@ def sha1_b64(data: bytes) -> str:
     return base64.b64encode(hashlib.sha1(data, usedforsecurity=False).digest()).decode()
 
 
-def etag_of(seq: int) -> str:
-    return str(seq)
-
-
 # -- query helpers ---------------------------------------------------------------------
 def parse_fields(request: Request) -> list[str] | None:
     raw = request.query_params.get("fields")
@@ -117,7 +111,9 @@ def parse_fields(request: Request) -> list[str] | None:
     return fields or None
 
 
-def query_int(request: Request, name: str, default: int, *, minimum: int = 0, maximum: int | None = None) -> int:
+def query_int(
+    request: Request, name: str, default: int, *, minimum: int = 0, maximum: int | None = None
+) -> int:
     raw = request.query_params.get(name)
     if raw is None or raw == "":
         return default
@@ -249,24 +245,12 @@ def validate_name(name: Any, field: str = "name") -> str:
     if len(name) > 255:
         raise errors.invalid_parameter(field, "Item name is too long (maximum 255 characters)")
     if name != name.strip() or name in (".", "..") or _RESERVED.search(name) or not name.strip():
-        raise errors.invalid_parameter(field, f"Invalid value '{name}'. Item names must not contain / or \\, or start or end with whitespace.")
+        raise errors.invalid_parameter(
+            field,
+            f"Invalid value '{name}'. Item names must not contain / or \\, or start or end with whitespace.",
+        )
     return name
 
 
 def extension_of(name: str) -> str:
     return name.rsplit(".", 1)[1].lower() if "." in name.strip(".") else ""
-
-
-def unique_copy_name(name: str, taken: set[str]) -> str:
-    """Name for an auto-renamed duplicate: ``a.docx`` -> ``a (1).docx``."""
-    if name.lower() not in taken:
-        return name
-    stem, dot, ext = name.rpartition(".")
-    if not dot:
-        stem, ext = name, ""
-    n = 1
-    while True:
-        candidate = f"{stem} ({n}){'.' + ext if ext else ''}"
-        if candidate.lower() not in taken:
-            return candidate
-        n += 1

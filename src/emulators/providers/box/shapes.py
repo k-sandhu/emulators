@@ -16,13 +16,15 @@ from fastapi import Request
 from emulators.core.provider import ProviderContext, url_for_host
 from emulators.providers.box import access, db, tree
 from emulators.providers.box.access import Principal
-from emulators.providers.box.util import box_ts, extension_of, try_parse_ts
+from emulators.providers.box.util import box_ts, extension_of
 
 Record = dict[str, Any]
 Thunks = dict[str, Callable[[], Any]]
 
 ALL_FILES = {"type": "folder", "id": "0", "sequence_id": None, "etag": None, "name": "All Files"}
 TRASH = {"type": "folder", "id": "1", "sequence_id": None, "etag": None, "name": "Trash"}
+#: Box reports the root folder as created by nobody.
+EMPTY_USER = {"type": "user", "id": "", "name": "", "login": ""}
 
 USER_MINI = ("type", "id", "name", "login")
 USER_ORDER = (
@@ -67,17 +69,17 @@ WEB_LINK_ORDER = (
 )  # fmt: skip
 WEB_LINK_MINI = ("type", "id", "sequence_id", "etag", "name", "url")
 
+FILE_INVITEE_ROLES = ("editor", "viewer", "previewer", "co-owner")
 FOLDER_ITEM_ORDER = [{"by": "type", "direction": "ASC"}, {"by": "name", "direction": "ASC"}]
-ALL_INVITEE_ROLES = [
-    "editor", "viewer", "previewer", "uploader", "previewer uploader", "viewer uploader", "co-owner",
-]  # fmt: skip
 
 DEFAULT_SPACE = 999_999_999_999_999
 MAX_UPLOAD_MANAGED = 16_106_127_360
 MAX_UPLOAD_EXTERNAL = 262_144_000
 
 
-def pick(order: tuple[str, ...], requested: list[str] | None, standard: tuple[str, ...], mini: tuple[str, ...]) -> list[str]:
+def pick(
+    order: tuple[str, ...], requested: list[str] | None, standard: tuple[str, ...], mini: tuple[str, ...]
+) -> list[str]:
     """Field names to emit, in Box's canonical order."""
     if requested is None:
         return list(dict.fromkeys(standard))
@@ -108,6 +110,8 @@ class Shaper:
     def user_mini(self, user_id: str | None) -> Record | None:
         if not user_id:
             return None
+        if user_id == "anonymous":
+            return {"type": "user", "id": "2", "name": "Anonymous User", "login": ""}
         user = db.users(self.ctx).get(user_id)
         if user is None:
             return {"type": "user", "id": user_id, "name": "Deleted User", "login": ""}
@@ -149,9 +153,11 @@ class Shaper:
             "is_external_collab_restricted": lambda: bool(user.get("is_external_collab_restricted", False)),
             "is_exempt_from_device_limits": lambda: False,
             "is_exempt_from_login_verification": lambda: False,
-            "enterprise": lambda: None
-            if external
-            else {"type": "enterprise", "id": enterprise.box_enterprise_id, "name": enterprise.name},
+            "enterprise": lambda: (
+                None
+                if external
+                else {"type": "enterprise", "id": enterprise.box_enterprise_id, "name": enterprise.name}
+            ),
             "my_tags": lambda: [],
             "hostname": lambda: "https://app.box.com/",
             "is_platform_access_only": lambda: user.get("_kind") == "service",
@@ -258,7 +264,9 @@ class Shaper:
         }
 
     def has_collaborations(self, record: Record) -> bool:
-        return any(c["item_type"] == record["type"] and c["item_id"] == record["id"] for c in db.collabs(self.ctx))
+        return any(
+            c["item_type"] == record["type"] and c["item_id"] == record["id"] for c in db.collabs(self.ctx)
+        )
 
     def is_externally_owned(self, record: Record) -> bool:
         owner = db.users(self.ctx).get(record.get("_owner", ""))
@@ -269,7 +277,13 @@ class Shaper:
         if not link or not access.link_is_live(self.ctx, record):
             return None
         perms = link["permissions"]
-        effective = "can_edit" if perms.get("can_edit") else "can_download" if perms.get("can_download") else "can_preview"
+        effective = (
+            "can_edit"
+            if perms.get("can_edit")
+            else "can_download"
+            if perms.get("can_download")
+            else "can_preview"
+        )
         ext = extension_of(record["name"]) if record["type"] == "file" else ""
         download = (
             self.host_url("app.box.com", f"/shared/static/{link['hash']}{'.' + ext if ext else ''}")
@@ -300,7 +314,14 @@ class Shaper:
         out = []
         for coll in self.ctx.store.collection(db.COLLECTIONS):
             if coll["user_id"] == self.p.uid and record["id"] in coll["items"].get(record["type"], []):
-                out.append({"type": "collection", "id": coll["id"], "name": coll["name"], "collection_type": coll["collection_type"]})
+                out.append(
+                    {
+                        "type": "collection",
+                        "id": coll["id"],
+                        "name": coll["name"],
+                        "collection_type": coll["collection_type"],
+                    }
+                )
         return out
 
     def metadata_field(self, record: Record, requested: list[str] | None) -> Record:
@@ -385,20 +406,22 @@ class Shaper:
             "item_status": lambda: self.item_status(record),
             "extension": lambda: extension_of(record["name"]),
             "version_number": lambda: str(version.get("number", 1)),
-            "comment_count": lambda: sum(1 for c in self.ctx.store.collection(db.COMMENTS) if c["item_id"] == record["id"] and c["item_type"] == "file"),
+            "comment_count": lambda: self.comment_count(record),
             "permissions": lambda: self.permissions(record),
             "tags": lambda: list(record.get("tags", [])),
             "lock": lambda: self.lock(record),
             "has_collaborations": lambda: self.has_collaborations(record),
             "is_externally_owned": lambda: self.is_externally_owned(record),
             "expires_at": lambda: box_ts(record.get("expires_at")),
-            "allowed_invitee_roles": lambda: list(access.ROLES[:2] + ("previewer", "co-owner")) if access.INVITE in self.p.caps(record) else [],
-            "watermark_info": lambda: {"is_watermarked": False, "is_watermark_inherited": False},
+            "allowed_invitee_roles": lambda: (
+                list(FILE_INVITEE_ROLES) if access.INVITE in self.p.caps(record) else []
+            ),
+            "watermark_info": lambda: self.watermark_info(record),
             "is_accessible_via_shared_link": lambda: bool(self.shared_link(record)),
             "collections": lambda: self.collections_of(record),
             "metadata": lambda: self.metadata_field(record, fields),
             "representations": lambda: self.representations(record),
-            "classification": lambda: None,
+            "classification": lambda: self.classification(record),
             "uploader_display_name": lambda: (self.user_mini(record.get("created_by")) or {}).get("name"),
             "disposition_at": lambda: box_ts(record.get("disposition_at")),
             "shared_link_permission_options": lambda: ["can_preview", "can_download", "can_edit"],
@@ -406,9 +429,61 @@ class Shaper:
         }
         return build(pick(FILE_ORDER, fields, FILE_STANDARD, FILE_MINI), thunks)
 
+    def comment_count(self, record: Record) -> int:
+        """Comments on the file, replies included."""
+        comments = self.ctx.store.collection(db.COMMENTS)
+        count = 0
+        for comment in comments:
+            if comment["item_type"] == "file" and comment["item_id"] == record["id"]:
+                count += 1
+            elif comment["item_type"] == "comment":
+                parent = comments.get(comment["item_id"])
+                if parent and parent["item_type"] == "file" and parent["item_id"] == record["id"]:
+                    count += 1
+        return count
+
+    def watermark_info(self, record: Record) -> Record:
+        own = bool(record.get("watermark"))
+        inherited = (not own) and any(a.get("watermark") for a in tree.ancestors(self.ctx, record))
+        return {"is_watermarked": own or inherited, "is_watermark_inherited": inherited}
+
+    def classification(self, record: Record) -> Record | None:
+        from emulators.providers.box import metadata as md
+
+        instance = md.find_instance(self.ctx, record, "enterprise", md.CLASSIFICATION_KEY)
+        if instance is None:
+            return None
+        label = instance["values"].get(md.CLASSIFICATION_FIELD)
+        template = md.find_template(self.ctx, "enterprise", md.CLASSIFICATION_KEY)
+        if template is None or label is None:
+            return None
+        field = next((f for f in template["fields"] if f["key"] == md.CLASSIFICATION_FIELD), None)
+        option = next((o for o in (field or {}).get("options", []) if o["key"] == label), None)
+        config = ((option or {}).get("staticConfig") or {}).get("classification", {})
+        return {
+            "name": label,
+            "definition": config.get("classificationDefinition", ""),
+            "color": md.CLASSIFICATION_COLORS.get(config.get("colorID", 0), "#cccccc"),
+        }
+
     def representations(self, record: Record) -> Record:
-        base = f"/2.0/internal_files/{record['id']}/versions/{record.get('_version')}/representations"
-        return {"entries": [], "info": {"url": self.host_url("api.box.com", base)}}
+        from emulators.providers.box import representations as reps
+
+        root = f"/2.0/internal_files/{record['id']}/versions/{record.get('_version')}/representations"
+        hints = reps.parse_hints(self.request.headers.get("x-rep-hints") if self.request else None)
+        entries = []
+        for kind, params in hints:
+            name = reps.rep_name(kind, params)
+            entries.append(
+                reps.entry(
+                    record,
+                    kind,
+                    params,
+                    self.host_url("api.box.com", f"{root}/{name}"),
+                    self.host_url("public.boxcloud.com", f"/api{root}/{name}/content"),
+                )
+            )
+        return {"entries": entries, "info": {"url": self.host_url("api.box.com", root)}}
 
     # -- folders -----------------------------------------------------------------------
     def item_collection(self, folder: Record, limit: int = 100) -> Record:
@@ -435,8 +510,10 @@ class Shaper:
             "modified_at": lambda: None if root else box_ts(record["modified_at"]),
             "description": lambda: record.get("description", ""),
             "size": lambda: self.p.tree.size(record["id"]),
-            "path_collection": lambda: {"total_count": 0, "entries": []} if root else self.path_collection(record),
-            "created_by": lambda: None if root else self.user_mini(record.get("created_by")),
+            "path_collection": lambda: (
+                {"total_count": 0, "entries": []} if root else self.path_collection(record)
+            ),
+            "created_by": lambda: EMPTY_USER if root else self.user_mini(record.get("created_by")),
             "modified_by": lambda: self.user_mini(record.get("modified_by") or record.get("_owner")),
             "trashed_at": lambda: box_ts(record.get("trashed_at")),
             "purged_at": lambda: box_ts(record.get("purged_at")),
@@ -458,11 +535,15 @@ class Shaper:
                 record.get("is_collaboration_restricted_to_enterprise", False)
             ),
             "allowed_shared_link_access_levels": lambda: ["open", "company", "collaborators"],
-            "allowed_invitee_roles": lambda: list(access.ROLES) if access.INVITE in self.p.caps(record) else [],
-            "watermark_info": lambda: {"is_watermarked": False, "is_watermark_inherited": False},
+            "allowed_invitee_roles": lambda: (
+                list(access.ROLES) if access.INVITE in self.p.caps(record) else []
+            ),
+            "watermark_info": lambda: self.watermark_info(record),
             "is_accessible_via_shared_link": lambda: bool(self.shared_link(record)),
-            "can_non_owners_view_collaborators": lambda: bool(record.get("can_non_owners_view_collaborators", True)),
-            "classification": lambda: None,
+            "can_non_owners_view_collaborators": lambda: bool(
+                record.get("can_non_owners_view_collaborators", True)
+            ),
+            "classification": lambda: self.classification(record),
             "collections": lambda: self.collections_of(record),
             "metadata": lambda: self.metadata_field(record, fields),
             "expires_at": lambda: None,
@@ -502,16 +583,16 @@ class Shaper:
         return self.folder_mini(record)
 
     def item(self, record: Record, fields: list[str] | None = None, *, listing: bool = False) -> Record:
-        """``listing`` renders folder-list entries: mini unless ``fields`` ask for more."""
+        """Render any item. ``listing`` entries are mini unless ``fields`` ask for more."""
+        if listing and not fields:
+            return self.item_mini(record)
         if record["type"] == "file":
-            return self.file(record, fields) if fields or not listing else self.file_mini(record)
+            return self.file(record, fields)
         if record["type"] == "web_link":
-            return self.web_link(record, fields) if fields or not listing else self.item_mini(record)
-        if fields or not listing:
-            if listing and fields:
-                return self.folder(record, [f for f in fields if f != "item_collection"] or ["name"])
-            return self.folder(record, fields)
-        return self.folder_mini(record)
+            return self.web_link(record, fields)
+        if listing and fields:
+            fields = [f for f in fields if f != "item_collection"]  # no nested listings inside a listing
+        return self.folder(record, fields)
 
     # -- collaborations ----------------------------------------------------------------
     def accessible_by(self, collab: Record) -> Record | None:
@@ -568,7 +649,7 @@ def sorted_children(
     principal: Principal, folder: Record, *, sort: str | None = None, direction: str = "ASC"
 ) -> list[Record]:
     """Children the caller can see, in Box's order (folders first, then name; or ``sort``)."""
-    items = [c for c in principal.tree.children(folder["id"]) if principal.caps(c)]
+    items = [c for c in principal.tree.children(folder["id"]) if principal.visible(c)]
     if db.is_root(folder) and folder["_root_of"] == principal.uid:
         items += shared_with_me(principal)
     reverse = direction.upper() == "DESC"
@@ -597,7 +678,12 @@ def shared_with_me(principal: Principal) -> list[Record]:
     out: list[Record] = []
     for (item_type, item_id), _ in principal._collab_index().items():
         record = db.item(ctx, item_type, item_id)
-        if record is None or record.get("_trash") or record.get("_owner") == principal.uid or (item_type, item_id) in seen:
+        if (
+            record is None
+            or record.get("_trash")
+            or record.get("_owner") == principal.uid
+            or (item_type, item_id) in seen
+        ):
             continue
         parent = tree.parent_of(ctx, record)
         if parent is not None and not db.is_root(parent) and principal.raw_caps(parent, with_links=False):

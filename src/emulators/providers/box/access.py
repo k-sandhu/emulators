@@ -47,7 +47,9 @@ ROLES = (
 ROLE_CAPS: dict[str, frozenset[str]] = {
     "owner": ALL_CAPS,
     "co-owner": ALL_CAPS,
-    "editor": frozenset({PREVIEW, DOWNLOAD, UPLOAD, COMMENT, RENAME, DELETE, SHARE, SET_SHARE_ACCESS, INVITE}),
+    "editor": frozenset(
+        {PREVIEW, DOWNLOAD, UPLOAD, COMMENT, RENAME, DELETE, SHARE, SET_SHARE_ACCESS, INVITE}
+    ),
     "viewer uploader": frozenset({PREVIEW, DOWNLOAD, UPLOAD, COMMENT, SHARE}),
     "previewer uploader": frozenset({PREVIEW, UPLOAD}),
     "viewer": frozenset({PREVIEW, DOWNLOAD, COMMENT, SHARE}),
@@ -235,7 +237,15 @@ class Principal:
         if record.get("_owner") == self.uid:
             return "owner"
         best: str | None = None
-        order = ["previewer", "uploader", "previewer uploader", "viewer", "viewer uploader", "editor", "co-owner"]
+        order = [
+            "previewer",
+            "uploader",
+            "previewer uploader",
+            "viewer",
+            "viewer uploader",
+            "editor",
+            "co-owner",
+        ]
         for item in [record, *tree.ancestors(self.ctx, record)]:
             for collab in self._collab_index().get((item["type"], item["id"]), []):
                 if best is None or order.index(collab["role"]) > order.index(best):
@@ -243,7 +253,11 @@ class Principal:
         return best
 
     def visible(self, record: Record) -> bool:
-        return bool(self.caps(record))
+        """Can the caller see the item at all? Upload-only roles see a folder but not files."""
+        caps = self.caps(record)
+        if record["type"] == "folder":
+            return bool(caps)
+        return PREVIEW in caps or DOWNLOAD in caps
 
     # -- item lookup ---------------------------------------------------------------------
     def folder_record(self, folder_id: str) -> Record | None:
@@ -263,11 +277,15 @@ class Principal:
         only_trashed: bool = False,
     ) -> Record:
         """Resolve an item the caller may see, else raise Box's 404; ``need`` adds a 403 check."""
-        record = self.folder_record(str(item_id)) if item_type == "folder" else db.item(self.ctx, item_type, str(item_id))
+        record = (
+            self.folder_record(str(item_id))
+            if item_type == "folder"
+            else db.item(self.ctx, item_type, str(item_id))
+        )
         if record is None or record.get("_purged"):
             raise errors.not_found()
         caps = self.caps(record)
-        if not caps:
+        if not self.visible(record):
             raise errors.not_found()
         trashed = tree.is_trashed(self.ctx, record)
         if only_trashed and not record.get("_trash"):
@@ -288,9 +306,24 @@ class Principal:
             raise errors.forbidden()
 
     def can_see_user(self, other: Record) -> bool:
+        """Managed users see each other; outsiders only through a collaboration; admins see everyone."""
         if self.is_privileged or other["id"] == self.uid:
             return True
-        return other.get("_kind") != "service" and not self.is_external
+        if other.get("_kind") == "service":
+            return False
+        if self.is_external:
+            return any(
+                c["accessible_id"] == self.uid and c["created_by"] == other["id"]
+                for c in db.collabs(self.ctx)
+            )
+        if other.get("_kind") != "external":
+            return True
+        return any(
+            c["accessible_type"] == "user"
+            and c["accessible_id"] == other["id"]
+            and c["created_by"] == self.uid
+            for c in db.collabs(self.ctx)
+        )
 
 
 # -- authentication ---------------------------------------------------------------------
@@ -340,16 +373,17 @@ def resolve_link(ctx: ProviderContext, request: Request, user: Record | None) ->
     access = link["access"]
     if access == "collaborators":
         return None
-    if access == "company" and (user is None or user.get("_kind") not in ("managed", "service")):
-        raise errors.not_found()
+    if access == "company":
+        if user is None:
+            raise errors.unauthorized_missing()
+        if user.get("_kind") not in ("managed", "service"):
+            raise errors.not_found()
     if link.get("password") and password != link["password"]:
         raise errors.forbidden()
     return LinkGrant(record, bool(link["permissions"].get("can_download", True)))
 
 
-def authenticate(
-    request: Request, ctx: ProviderContext, *, allow_anonymous: bool = False
-) -> Principal:
+def authenticate(request: Request, ctx: ProviderContext, *, allow_anonymous: bool = False) -> Principal:
     """Resolve the bearer token (and ``As-User`` / ``BoxApi``) into a :class:`Principal`."""
     token = bearer_token(request) or request.query_params.get("access_token")
     grant = ctx.tokens.resolve(token) if token else None

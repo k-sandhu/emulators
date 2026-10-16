@@ -59,16 +59,24 @@ def apply_shared_link(p: Principal, record: Record, value: Any, now: str) -> str
         password = value["password"]
         if password is not None:
             if not isinstance(password, str) or len(password) < 6:
-                raise errors.invalid_parameter("shared_link.password", "Password must be at least 6 characters")
+                raise errors.invalid_parameter(
+                    "shared_link.password", "Password must be at least 6 characters"
+                )
             if link["access"] != "open":
-                raise errors.invalid_parameter("shared_link.password", "Passwords are only allowed on 'open' links")
+                raise errors.invalid_parameter(
+                    "shared_link.password", "Passwords are only allowed on 'open' links"
+                )
         link["password"] = password
     if "unshared_at" in value:
-        link["unshared_at"] = input_ts(value["unshared_at"], "shared_link.unshared_at") if value["unshared_at"] else None
+        link["unshared_at"] = (
+            input_ts(value["unshared_at"], "shared_link.unshared_at") if value["unshared_at"] else None
+        )
     if "vanity_name" in value:
         name = value["vanity_name"]
         if name is not None and (not isinstance(name, str) or len(name) < 12):
-            raise errors.invalid_parameter("shared_link.vanity_name", "Vanity names must be at least 12 characters")
+            raise errors.invalid_parameter(
+                "shared_link.vanity_name", "Vanity names must be at least 12 characters"
+            )
         link["vanity_name"] = name
     perms = value.get("permissions")
     if isinstance(perms, dict):

@@ -63,9 +63,6 @@ class Tree:
                 return child
         return None
 
-    def taken_names(self, parent_id: str) -> set[str]:
-        return {c["name"].lower() for c in self.children(parent_id)}
-
 
 def parent_of(ctx: ProviderContext, record: Record) -> Record | None:
     parent = record.get("_parent")

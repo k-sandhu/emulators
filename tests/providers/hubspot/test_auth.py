@@ -128,7 +128,9 @@ async def test_scope_errors_and_expiry(client: httpx.AsyncClient) -> None:
     assert (await client.get("/crm/v3/objects/deals")).status_code == 200
 
 
-@pytest.mark.parametrize("token", ["", "bad", "pat-na1-" + "-".join(["0" * 8, "0" * 4, "0" * 4, "0" * 4, "0" * 12])])
+@pytest.mark.parametrize(
+    "token", ["", "bad", "pat-na1-" + "-".join(["0" * 8, "0" * 4, "0" * 4, "0" * 4, "0" * 12])]
+)
 async def test_invalid_tokens(client: httpx.AsyncClient, token: str) -> None:
     result = await client.get("/crm/v3/objects/contacts", headers=bearer(token))
     assert result.status_code == 401

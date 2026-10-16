@@ -15,6 +15,18 @@ Record = dict[str, Any]
 
 FIELD_TYPES = ("string", "float", "date", "enum", "multiSelect")
 GLOBAL_PROPERTIES = "properties"
+CLASSIFICATION_KEY = "securityClassification-6VMVochwUWo"
+CLASSIFICATION_FIELD = "Box__Security__Classification__Key"
+CLASSIFICATION_COLORS = {
+    0: "#e0e0e0",
+    1: "#c1d8ee",
+    2: "#a6e3b5",
+    3: "#fff3a8",
+    4: "#ffc9a6",
+    5: "#f7a1a1",
+    6: "#cfb6f0",
+    7: "#9eb4c8",
+}
 
 
 def enterprise_scope(ctx: ProviderContext) -> str:
@@ -25,7 +37,7 @@ def normalize_scope(ctx: ProviderContext, scope: str) -> str:
     return enterprise_scope(ctx) if scope == "enterprise" else scope
 
 
-def templates(ctx: ProviderContext):  # noqa: ANN201
+def templates(ctx: ProviderContext):
     return ctx.store.collection(db.TEMPLATES)
 
 
@@ -79,9 +91,7 @@ def instances_for(ctx: ProviderContext, item: Record) -> list[Record]:
 
 def find_instance(ctx: ProviderContext, item: Record, scope: str, key: str) -> Record | None:
     scope = normalize_scope(ctx, scope)
-    return next(
-        (i for i in instances_for(ctx, item) if i["scope"] == scope and i["template"] == key), None
-    )
+    return next((i for i in instances_for(ctx, item) if i["scope"] == scope and i["template"] == key), None)
 
 
 def render_instance(ctx: ProviderContext, inst: Record) -> Record:
@@ -124,7 +134,9 @@ def coerce_value(field: Record, value: Any) -> Any:
             )
         return value
     if not isinstance(value, list) or any(v not in options for v in value):
-        raise errors.bad_request(f"Invalid value for multiSelect '{key}'", reason="invalid_parameter", name=key)
+        raise errors.bad_request(
+            f"Invalid value for multiSelect '{key}'", reason="invalid_parameter", name=key
+        )
     return value
 
 
@@ -148,15 +160,21 @@ def validate_values(ctx: ProviderContext, scope: str, key: str, values: dict[str
     return clean
 
 
-def apply_patch(ctx: ProviderContext, scope: str, key: str, values: dict[str, Any], ops: Any) -> dict[str, Any]:
+def apply_patch(
+    ctx: ProviderContext, scope: str, key: str, values: dict[str, Any], ops: Any
+) -> dict[str, Any]:
     """Apply an RFC 6902 JSON patch (``add``, ``replace``, ``remove``, ``test``, ``move``, ``copy``)."""
     if not isinstance(ops, list) or not ops:
-        raise errors.bad_request("Request body must be a non-empty JSON patch array", reason="invalid_request_body")
+        raise errors.bad_request(
+            "Request body must be a non-empty JSON patch array", reason="invalid_request_body"
+        )
     result = copy.deepcopy(values)
 
     def path_key(path: Any) -> str:
         if not isinstance(path, str) or not path.startswith("/") or path.count("/") != 1:
-            raise errors.bad_request(f"Unsupported patch path '{path}'", reason="invalid_parameter", name="path")
+            raise errors.bad_request(
+                f"Unsupported patch path '{path}'", reason="invalid_parameter", name="path"
+            )
         return path[1:].replace("~1", "/").replace("~0", "~")
 
     for op in ops:
@@ -184,7 +202,9 @@ def apply_patch(ctx: ProviderContext, scope: str, key: str, values: dict[str, An
                 del result[source]
             result.update(validate_values(ctx, scope, key, {target: value}))
         else:
-            raise errors.bad_request(f"Unsupported patch operation '{kind}'", reason="invalid_parameter", name="op")
+            raise errors.bad_request(
+                f"Unsupported patch operation '{kind}'", reason="invalid_parameter", name="op"
+            )
     return result
 
 
