@@ -361,9 +361,7 @@ async def test_shared_link_access_levels_and_expiry(box):
     ).json()["shared_link"]
     header = {"BoxApi": f"shared_link={company['url']}"}
     assert (await box.get("/shared_items", "p044", headers=header)).status_code == 200  # a colleague
-    external = (await box.get("/users", params={"user_type": "external", "limit": 1}, headers={})).json()[
-        "entries"
-    ][0]
+    external = (await box.externals())[0]
     ext_token = (await box.action("mint_token", {"user": external["id"]}))["access_token"]
     assert (await box.get("/shared_items", ext_token, headers=header)).status_code == 404
     assert (await box.client.get("https://api.box.com/2.0/shared_items", headers=header)).status_code == 401

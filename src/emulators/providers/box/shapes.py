@@ -99,6 +99,9 @@ class Shaper:
         self.ctx: ProviderContext = principal.ctx
         self.request = request
         self._space_used: dict[str, int] | None = None
+        #: ``(offset, limit, sort, direction)`` for the ``item_collection`` of the folder being rendered
+        #: (``GET /folders/{id}`` accepts them); other renderings show Box's first page of 100.
+        self.item_window: tuple[int, int, str | None, str] = (0, 100, None, "ASC")
 
     # -- urls --------------------------------------------------------------------------
     def host_url(self, host: str, path: str) -> str:
@@ -160,7 +163,9 @@ class Shaper:
             ),
             "my_tags": lambda: [],
             "hostname": lambda: "https://app.box.com/",
-            "is_platform_access_only": lambda: user.get("_kind") == "service",
+            "is_platform_access_only": lambda: (
+                bool(user.get("is_platform_access_only")) or user.get("_kind") == "service"
+            ),
             "notification_email": lambda: user.get("notification_email"),
         }
         names = pick(USER_ORDER, fields, USER_ORDER if full else USER_STANDARD, USER_MINI)
@@ -182,7 +187,7 @@ class Shaper:
             "description": group.get("description", ""),
             "invitability_level": group.get("invitability_level", "admins_and_members"),
             "member_viewability_level": group.get("member_viewability_level", "admins_and_members"),
-            "permissions": {"can_invite_as_collaborator": self.p.is_privileged},
+            "permissions": {"can_invite_as_collaborator": self.p.can_invite_group(group)},
         }
         if fields is None:
             return {**full, **extras} if self.p.is_privileged else full
@@ -205,6 +210,8 @@ class Shaper:
             return [dict(ALL_FILES), dict(TRASH)]
         if record.get("_owner") == self.p.uid:
             return [self.folder_mini(a) for a in chain]
+        if self.p.can_view_path(record):
+            return [dict(ALL_FILES), *[self.folder_mini(a) for a in chain if not db.is_root(a)]]
         # A collaborator sees only the contiguous run of ancestors they can reach.
         tail: list[Record] = []
         for ancestor in reversed(chain):
@@ -277,17 +284,19 @@ class Shaper:
         if not link or not access.link_is_live(self.ctx, record):
             return None
         perms = link["permissions"]
+        # Downloading through a link is only possible for open and company links.
+        downloadable = bool(perms.get("can_download", True)) and link["access"] != "collaborators"
         effective = (
             "can_edit"
-            if perms.get("can_edit")
+            if perms.get("can_edit") and downloadable
             else "can_download"
-            if perms.get("can_download")
+            if downloadable
             else "can_preview"
         )
         ext = extension_of(record["name"]) if record["type"] == "file" else ""
         download = (
             self.host_url("app.box.com", f"/shared/static/{link['hash']}{'.' + ext if ext else ''}")
-            if record["type"] == "file" and perms.get("can_download")
+            if record["type"] == "file" and downloadable
             else None
         )
         vanity = link.get("vanity_name")
@@ -302,9 +311,9 @@ class Shaper:
             "unshared_at": box_ts(link.get("unshared_at")),
             "is_password_enabled": bool(link.get("password")),
             "permissions": {
-                "can_download": bool(perms.get("can_download", True)),
+                "can_download": downloadable,
                 "can_preview": True,
-                "can_edit": bool(perms.get("can_edit", False)),
+                "can_edit": bool(perms.get("can_edit", False)) and downloadable,
             },
             "download_count": int(link.get("download_count", 0)),
             "preview_count": int(link.get("preview_count", 0)),
@@ -486,14 +495,16 @@ class Shaper:
         return {"entries": entries, "info": {"url": self.host_url("api.box.com", root)}}
 
     # -- folders -----------------------------------------------------------------------
-    def item_collection(self, folder: Record, limit: int = 100) -> Record:
-        children = sorted_children(self.p, folder)
+    def item_collection(self, folder: Record) -> Record:
+        offset, limit, sort, direction = self.item_window
+        children = sorted_children(self.p, folder, sort=sort, direction=direction)
+        order = [{"by": sort, "direction": direction}] if sort else list(FOLDER_ITEM_ORDER)
         return {
             "total_count": len(children),
-            "entries": [self.item_mini(c) for c in children[:limit]],
-            "offset": 0,
+            "entries": [self.item_mini(c) for c in children[offset : offset + limit]],
+            "offset": offset,
             "limit": limit,
-            "order": list(FOLDER_ITEM_ORDER),
+            "order": order,
         }
 
     def folder(self, record: Record, fields: list[str] | None = None) -> Record:
@@ -534,7 +545,7 @@ class Shaper:
             "is_collaboration_restricted_to_enterprise": lambda: bool(
                 record.get("is_collaboration_restricted_to_enterprise", False)
             ),
-            "allowed_shared_link_access_levels": lambda: ["open", "company", "collaborators"],
+            "allowed_shared_link_access_levels": lambda: [] if root else ["open", "company", "collaborators"],
             "allowed_invitee_roles": lambda: (
                 list(access.ROLES) if access.INVITE in self.p.caps(record) else []
             ),
@@ -599,7 +610,11 @@ class Shaper:
         if collab["accessible_type"] == "group":
             group = db.groups(self.ctx).get(collab["accessible_id"])
             return self.group_mini(group) if group else None
-        return self.user_mini(collab["accessible_id"])
+        mini = self.user_mini(collab["accessible_id"])
+        if mini is not None and collab["status"] == "pending" and collab["accessible_id"] != self.p.uid:
+            # Box redacts a pending invitee: no name, and no login unless the invite was sent by e-mail.
+            mini = {**mini, "name": "", "login": mini["login"] if collab.get("_by_login") else ""}
+        return mini
 
     def collaboration(self, collab: Record, fields: list[str] | None = None) -> Record:
         record = db.item(self.ctx, collab["item_type"], collab["item_id"])
@@ -617,6 +632,7 @@ class Shaper:
             "acknowledged_at": lambda: box_ts(collab.get("acknowledged_at")),
             "item": lambda: self.item_mini(record) if record and not record.get("_purged") else None,
             "is_access_only": lambda: bool(collab.get("is_access_only", False)),
+            "can_view_path": lambda: bool(collab.get("can_view_path", False)),
         }
         order = tuple(thunks)
         mini = ("type", "id")
@@ -653,11 +669,11 @@ def sorted_children(
     if db.is_root(folder) and folder["_root_of"] == principal.uid:
         items += shared_with_me(principal)
     reverse = direction.upper() == "DESC"
-    folders_ = [i for i in items if i["type"] != "file"]
-    files_ = [i for i in items if i["type"] == "file"]
+    # Box lists folders, then files, then web links; the sort key orders within each kind.
+    groups = [[i for i in items if i["type"] == kind] for kind in ("folder", "file", "web_link")]
     if not sort:
         by_name = lambda r: r["name"].lower()  # noqa: E731
-        return sorted(folders_, key=by_name, reverse=reverse) + sorted(files_, key=by_name, reverse=reverse)
+        return [r for group in groups for r in sorted(group, key=by_name, reverse=reverse)]
     keys: dict[str, Callable[[Record], Any]] = {
         "id": lambda r: int(r["id"]),
         "name": lambda r: r["name"].lower(),
@@ -665,7 +681,7 @@ def sorted_children(
         "size": lambda r: int(r.get("size", 0)) if r["type"] == "file" else principal.tree.size(r["id"]),
     }
     key = keys.get(sort, keys["name"])
-    return sorted(folders_, key=key, reverse=reverse) + sorted(files_, key=key, reverse=reverse)
+    return [r for group in groups for r in sorted(group, key=key, reverse=reverse)]
 
 
 def shared_with_me(principal: Principal) -> list[Record]:

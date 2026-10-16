@@ -38,10 +38,27 @@ async def test_user_list_is_admin_only_with_filters_and_pagination(box):
     assert everyone["total_count"] == len(everyone["entries"]) > 45
     assert everyone["order"] == [{"by": "name", "direction": "ASC"}]
     managed = (await box.get("/users", params={"user_type": "managed", "limit": 1000})).json()
-    external = (await box.get("/users", params={"user_type": "external", "limit": 1000})).json()
-    assert all(e["login"].endswith("@halcyonadvisory.example") for e in managed["entries"])
-    assert external["total_count"] == 22
-    assert all("@halcyonadvisory.example" not in e["login"] for e in external["entries"])
+    assert all(
+        e["login"].endswith("@halcyonadvisory.example") or e["login"].startswith("Automation")
+        for e in managed["entries"]
+    )
+    assert everyone["total_count"] == managed["total_count"]  # outsiders are never listed with the enterprise
+    # ... they are found by an exact login, and only then
+    ingram = "christopher.ingram@northwindlogistics.example"
+    exact = (await box.get("/users", params={"user_type": "external", "filter_term": ingram})).json()
+    assert [e["login"] for e in exact["entries"]] == [ingram]
+    loose = (await box.get("/users", params={"user_type": "external", "filter_term": "ingram"})).json()
+    assert (
+        loose["entries"] == []
+        and (await box.get("/users", params={"user_type": "external"})).json()["entries"] == []
+    )
+    assert [
+        e["login"] for e in (await box.get("/users", params={"filter_term": ingram})).json()["entries"]
+    ] == [ingram]
+    assert all(
+        e["login"] != ingram
+        for e in (await box.get("/users", params={"filter_term": "ingram"})).json()["entries"]
+    )
     found = (await box.get("/users", params={"filter_term": "maya"})).json()
     assert [e["name"] for e in found["entries"]] == ["Maya Chen"]
     first = (await box.get("/users", params={"limit": 5, "usemarker": "true"})).json()
@@ -66,7 +83,7 @@ async def test_get_user_visibility(box):
     maya = (await box.get("/users/me", "p018")).json()
     other = (await box.get("/users/me", "p019")).json()
     assert (await box.get(f"/users/{maya['id']}", "p019")).status_code == 200
-    externals = (await box.get("/users", params={"user_type": "external"})).json()["entries"]
+    externals = await box.externals()
     seen_by_p019 = {(await box.get(f"/users/{e['id']}", "p019")).status_code for e in externals}
     assert 403 in seen_by_p019  # outsiders are visible only to the people who invited them
     assert {(await box.get(f"/users/{e['id']}", "p035")).status_code for e in externals} == {200}

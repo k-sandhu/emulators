@@ -7,6 +7,7 @@ the OAuth token endpoint uses RFC 6749 ``{"error", "error_description"}``.
 from __future__ import annotations
 
 import secrets
+from contextvars import ContextVar
 from typing import Any
 
 from emulators.core.errors import EmulatorError
@@ -37,8 +38,17 @@ WWW_AUTHENTICATE = (
 )
 
 
-def request_id() -> str:
+#: Id of the request being served; set by ``BoxResponseMiddleware`` so the ``request_id`` in an
+#: error body is the same value as the ``Box-Request-Id`` response header, as in Box.
+CURRENT_REQUEST_ID: ContextVar[str | None] = ContextVar("box_request_id", default=None)
+
+
+def new_request_id() -> str:
     return secrets.token_hex(8)
+
+
+def request_id() -> str:
+    return CURRENT_REQUEST_ID.get() or new_request_id()
 
 
 def error_body(

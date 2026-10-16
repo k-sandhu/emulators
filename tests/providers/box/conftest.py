@@ -76,6 +76,19 @@ class Box:
         assert r.status_code == 201, r.text
         return r.json()["id"]
 
+    async def externals(self) -> list[dict[str, Any]]:
+        """Every external (client contact) account. ``GET /users`` never lists outsiders, as in Box:
+        they are found by exact login or through collaborations, so tests read them from the store."""
+        from emulators.providers.box import db
+
+        ids = [u["id"] for u in db.users(self.hub.context("box")) if u.get("_kind") == "external"]
+        users = []
+        for user_id in ids:
+            r = await self.get(f"/users/{user_id}")
+            assert r.status_code == 200, r.text
+            users.append(r.json())
+        return users
+
     async def action(self, name: str, payload: dict[str, Any] | None = None) -> Any:
         r = await self.client.post(f"{API.replace('/2.0', '')}/_emulator/actions/{name}", json=payload or {})
         assert r.status_code == 200, r.text

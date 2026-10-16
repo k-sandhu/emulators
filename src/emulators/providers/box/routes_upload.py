@@ -22,7 +22,9 @@ from emulators.providers.box.util import (
     input_ts,
     json_body,
     now_iso,
+    opt_str,
     parse_fields,
+    query_int,
     ref_id,
     require_str,
     sha1_b64,
@@ -69,6 +71,12 @@ async def read_multipart(request: Request) -> tuple[dict[str, Any], bytes, str]:
         raise errors.bad_request("Invalid multipart request", reason="invalid_request_body") from None
     attributes_raw = form.get("attributes")
     upload = form.get("file")
+    order = [name for name, _ in form.multi_items()]
+    if "attributes" in order and "file" in order and order.index("file") < order.index("attributes"):
+        # Box: "The attributes part of the body must come before the file part".
+        raise errors.bad_request(
+            "The 'attributes' part must come before the 'file' part", reason="invalid_request_body"
+        )
     if upload is None or isinstance(upload, str):
         raise errors.missing_parameter("file")
     data = await upload.read()
@@ -79,7 +87,7 @@ async def read_multipart(request: Request) -> tuple[dict[str, Any], bytes, str]:
                 attributes_raw if isinstance(attributes_raw, str) else (await attributes_raw.read()).decode()
             )
             attributes = json.loads(text)
-        except ValueError:
+        except (ValueError, RecursionError):
             raise errors.invalid_parameter("attributes", "'attributes' must be valid JSON") from None
         if not isinstance(attributes, dict):
             raise errors.invalid_parameter("attributes", "'attributes' must be a JSON object")
@@ -139,7 +147,7 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
             p, parent, name, data, now_iso(ctx),
             content_created_at=input_ts(attributes["content_created_at"], "content_created_at") if attributes.get("content_created_at") else None,
             content_modified_at=input_ts(attributes["content_modified_at"], "content_modified_at") if attributes.get("content_modified_at") else None,
-            description=str(attributes.get("description", "")),
+            description=opt_str(attributes, "description", "")[:255],  # Box keeps the first 255 characters
         )  # fmt: skip
         return await finish(request, p, record, "ITEM_UPLOAD")
 
@@ -300,8 +308,8 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         session = session_or_404(session_id, p)
         parts = sorted(session["parts"].values(), key=lambda part: part["offset"])
         public = [{k: v for k, v in part.items() if not k.startswith("_")} for part in parts]
-        offset = int(request.query_params.get("offset", 0))
-        limit = int(request.query_params.get("limit", 1000))
+        offset = query_int(request, "offset", 0, maximum=10_000)
+        limit = query_int(request, "limit", 1000, maximum=1000)
         return {
             "entries": public[offset : offset + limit],
             "limit": limit,
@@ -330,7 +338,7 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
             ordered = []
             known = {part["part_id"]: part for part in by_offset.values()}
             for entry in wanted:
-                part = known.get(str(entry.get("part_id")))
+                part = known.get(str(entry.get("part_id"))) if isinstance(entry, dict) else None
                 if part is None:
                     raise errors.bad_request(
                         "Unknown part_id in commit request", reason="invalid_parameter", name="parts"

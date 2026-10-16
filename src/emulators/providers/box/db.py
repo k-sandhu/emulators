@@ -71,6 +71,19 @@ def versions(ctx: ProviderContext) -> Collection:
     return ctx.store.collection(VERSIONS)
 
 
+#: Statuses of an account that may sign in; the two restricted ones are active accounts that
+#: cannot delete or edit (and, for the second, upload) content.
+ACTIVE_STATUSES = ("active", "cannot_delete_edit", "cannot_delete_edit_upload")
+RESTRICTED_STATUSES: dict[str, tuple[str, ...]] = {
+    "cannot_delete_edit": ("rename", "delete"),
+    "cannot_delete_edit_upload": ("rename", "delete", "upload"),
+}
+
+
+def is_active(user: Record | None) -> bool:
+    return bool(user) and user.get("status") in ACTIVE_STATUSES  # type: ignore[union-attr]
+
+
 def user_by_login(ctx: ProviderContext, login: str) -> Record | None:
     wanted = login.strip().lower()
     for user in users(ctx):

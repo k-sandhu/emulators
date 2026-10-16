@@ -84,7 +84,8 @@ Any `client_id` / `client_secret` pair works (lenient client registry). The seed
     `item_delete`, `base_explorer`, ...), `resource` (a file or folder URL) or `box_shared_link`.
     Returns the usual body plus `issued_token_type` and a populated `restricted_to`. **The scoping is
     enforced**: the token only sees the resource (and its subtree for folders) and only the operations the
-    scopes allow.
+    scopes allow. An already downscoped token cannot be exchanged again (`invalid_grant`), so a narrow token
+    can never be widened.
 * `POST /oauth2/revoke` - revokes the access token and the refresh token paired with it.
 
 Token errors use `{"error", "error_description"}`; API errors use Box's envelope
@@ -95,6 +96,13 @@ validation problems, `context_info.conflicts` for `409 item_name_in_use`). A bad
 **As-User**: admins, co-admins and the service account may send `As-User: <user id>`; the request is then
 evaluated as that user (permissions, root folder, events). Anyone else gets
 `403 access_denied_insufficient_permissions`; an unknown target is `404`.
+
+**Response headers**: every response carries `Box-Request-Id` (the same value as `request_id` in an error body,
+including injected faults and the OAuth endpoints). A request with an `Origin` header gets
+`Access-Control-Allow-Origin: *` and `Access-Control-Expose-Headers`; CORS preflights (an `OPTIONS` with
+`Access-Control-Request-Method`) are answered `204` for any path, so browser clients such as Box UI Elements
+work. Box's own upload pre-flight (`OPTIONS /files/content` without those headers) is unaffected. An unexpected
+server error is Box's JSON `internal_server_error` envelope (status 500) rather than a bare text response.
 
 ## Permissions model
 
@@ -120,6 +128,9 @@ delete, share, invite (not co-owners); `viewer uploader` upload+download+preview
   view is `GET /search?scope=enterprise_content` (admin only) and the `admin_logs` event stream.
 * Group membership changes, collaboration changes, expiry (`expires_at`) and pending invitations take
   effect immediately. Pending invitations grant nothing until accepted.
+* Folder policies are enforced: `can_non_owners_invite: false` (on the folder or an ancestor) leaves
+  invitations to the owner and co-owners (editors lose `can_invite_collaborator` and get `403`), and
+  `is_collaboration_restricted_to_enterprise: true` rejects external invitations (`403`).
 * Moving an item into another owner's tree changes its `owned_by`. Items uploaded by a collaborator are owned
   by the folder owner (`created_by` is the uploader).
 * Downscoped tokens (`restricted_to`) intersect the above with their scopes.
@@ -135,40 +146,43 @@ in Box (default limits 100, folder items/users/groups up to 1000, search 30/200,
 | Method | Path | Notes |
 | --- | --- | --- |
 | GET | `/users/me`, `/users/{id}` | full user object; non-admins may read colleagues but not outsiders they did not invite |
-| GET | `/users` | admin/co-admin/service account; `filter_term`, `user_type=all\|managed\|external`, offset or marker paging |
-| POST, PUT, DELETE | `/users`, `/users/{id}` | admin; `DELETE` needs `force=true` when the user owns files; deactivating revokes tokens |
+| GET | `/users` | admin/co-admin/service account. Lists the enterprise's managed and app users (the service account included); `filter_term` partially matches name or login (case-insensitive); outsiders are never listed: `user_type=external` (or `all`) returns an external user only when `filter_term` equals their login exactly, and then only that user. Offset (max 10000) or marker paging |
+| POST, PUT, DELETE | `/users`, `/users/{id}` | admin; `login` must be an e-mail address (app users with `is_platform_access_only` get an `AppUser_...@boxdevedition.com` login); field types are validated (`400`) and a rejected request changes nothing; `DELETE` needs `force=true` when the user owns files; `status` is `active`, `inactive` (revokes tokens) or the restricted `cannot_delete_edit` / `cannot_delete_edit_upload` (still signs in, but renames and deletes - and uploads - on content they can reach are `403`); co-admins manage ordinary users and themselves, never an admin or another co-admin, and only an admin changes `role` (`user` or `coadmin`: Box has no call that makes an admin) |
 | PUT | `/users/{id}/folders/0` | content transfer (`{"owned_by": {"id"}}`): moves the user's content into "<name>'s Files and Folders" of the new owner |
-| GET | `/users/{id}/avatar`, `https://app.box.com/api/avatar/large/{id}` | deterministic PNG |
+| GET | `/users/{id}/avatar`, `https://app.box.com/api/avatar/large/{id}` | the uploaded avatar, else a deterministic PNG |
+| POST, DELETE | `/users/{id}/avatar` | multipart `pic` (PNG, JPEG or GIF, at most 1 MB) -> `{pic_urls: {small, large, preview}}`; admins and the user themself; `DELETE` is 204 (404 without an upload) |
 | GET | `/users/{id}/memberships` | group memberships |
+| GET, POST | `/users/{id}/email_aliases` | admin; `{email}`; 409 when the address is a login or alias already |
+| DELETE | `/users/{id}/email_aliases/{alias_id}` | admin |
 | POST, GET | `/invites`, `/invites/{id}` | admin; invite an e-mail/Box account to join the enterprise (stays `pending`; an external placeholder user is created) |
-| GET, POST | `/groups` | admin only; names are unique |
-| GET, PUT, DELETE | `/groups/{id}` | members may read their group |
+| GET, POST | `/groups` | admin only; names are unique; `invitability_level` (who may invite the group onto items) and `member_viewability_level` (who may list its members) are enforced: `admins_only` = enterprise admins and the group's admins, `admins_and_members` adds its members, `all_managed_users` every managed user |
+| GET, PUT, DELETE | `/groups/{id}` | members may read their group; its admins (and enterprise admins) edit it; names stay unique (409 on rename); only enterprise admins delete |
 | GET | `/groups/{id}/memberships`, `/groups/{id}/collaborations` | |
 | POST | `/group_memberships` | `role` member\|admin; 409 if already a member |
-| GET, PUT, DELETE | `/group_memberships/{id}` | |
+| GET, PUT, DELETE | `/group_memberships/{id}` | the member, the group's admins and enterprise admins read; group and enterprise admins change or remove |
 
 ### Folders
 
 | Method | Path | Notes |
 | --- | --- | --- |
-| GET | `/folders/{id}` | `0` = the caller's root ("All Files"); `item_collection` in the standard fields; `If-None-Match` -> 304 |
-| GET | `/folders/{id}/items` | `fields`, `limit` (default 100, max 1000), `offset`, `usemarker`/`marker`, `sort=id\|name\|date\|size`, `direction`; folders first then name by default |
+| GET | `/folders/{id}` | `0` = the caller's root ("All Files"); `item_collection` in the standard fields, paged by `offset` (max 10000), `limit`, `sort` and `direction`; `If-None-Match` -> 304 |
+| GET | `/folders/{id}/items` | `fields`, `limit` (default 100, max 1000), `offset`, `usemarker`/`marker`, `sort=id\|name\|date\|size`, `direction`; folders, then files, then web links, each by name by default (`sort` orders within each kind) |
 | POST | `/folders` | `{name, parent: {id}}`; 409 `item_name_in_use` with `context_info.conflicts` (a list); name validation |
-| PUT | `/folders/{id}` | rename, move (`parent`), `description`, `tags`, `shared_link`, `folder_upload_email`, `collections`; `If-Match` -> 412; cannot move into a descendant |
+| PUT | `/folders/{id}` | rename, move (`parent`), `description`, `tags`, `shared_link`, `folder_upload_email`, `collections`; `If-Match` -> 412; cannot move into a descendant; a rejected update (any field) changes nothing; `can_non_owners_view_collaborators: false` needs `can_non_owners_invite: false` and then hides `GET .../collaborations` from non-owners |
 | DELETE | `/folders/{id}?recursive=true` | moves to trash; non-empty without `recursive` is 400 `folder_not_empty` |
 | POST | `/folders/{id}/copy` | deep copy; 409 on name clash |
 | GET | `/folders/{id}/collaborations` | |
 | GET | `/folders/trash/items` | the caller's trash (items they own), same paging/sorting |
 | GET, POST, DELETE | `/folders/{id}/trash`, `/folders/{id}` (restore), `/folders/{id}/trash` (purge) | restore takes optional `{name, parent}`; 409 on clash, 403 when the old parent is gone |
 | GET, POST, PUT, DELETE | `/folders/{id}/metadata/{scope}/{template}`, `/folders/{id}/watermark` | |
-| POST, GET, DELETE | `/folder_locks`, `/folder_locks?folder_id=`, `/folder_locks/{id}` | freeze move/delete of a folder (owner/co-owner) |
+| POST, GET, DELETE | `/folder_locks`, `/folder_locks?folder_id=`, `/folder_locks/{id}` | freeze move/delete of a folder (owner/co-owner); `locked_operations`, when sent, must set both `move` and `delete` to true |
 
 ### Files
 
 | Method | Path | Notes |
 | --- | --- | --- |
 | GET | `/files/{id}` | standard fields; `fields=` adds `extension`, `version_number`, `comment_count`, `permissions`, `tags`, `lock`, `has_collaborations`, `is_externally_owned`, `collections`, `metadata.<scope>.<template>`, `classification`, `watermark_info`, `representations` ... |
-| PUT | `/files/{id}` | rename, move, `description` (<= 256), `tags`, `lock` (`{access: "lock", expires_at, is_download_prevented}` or `null`), `shared_link`, `collections`; `If-Match` |
+| PUT | `/files/{id}` | rename, move, `description` (a file keeps the first 255 characters of a longer one, as Box does), `tags` (at most 100), `lock` (`{access: "lock", expires_at, is_download_prevented}` or `null`), `shared_link`, `collections`, `disposition_at` (can be extended, never shortened), `permissions.can_download` (`open` or `company`; `company` withdraws downloads from external collaborators); `If-Match`; a rejected update changes nothing; while a file is locked only the lock's owner can change its name, location, description, tags, retention date, download permission or shared link (`403 access_denied_item_locked`) |
 | DELETE | `/files/{id}` | to trash; 204; `If-Match`; blocked by another user's lock |
 | GET | `/files/{id}/content` | `302` to `https://dl.boxcloud.com/d/1/b1!<token>/download` (valid 15 minutes, no auth needed, supports `Range`, `HEAD`); `?version=<id>`; `?access_token=`; honours `BoxApi`, locks with `is_download_prevented` |
 | POST | `/files/{id}/copy` | `{parent, name, version}` |
@@ -177,7 +191,7 @@ in Box (default limits 100, folder items/users/groups up to 1000, search 30/200,
 | POST | `/files/{id}/versions/current` | promote an old version (creates a new version) |
 | PUT, DELETE | `/files/{id}/versions/{vid}` | restore (`{trashed_at: null}`) / trash a version; the current version cannot be deleted |
 | GET | `/files/{id}/thumbnail.png`, `.jpg` | PNG for both; sizes 32/64/128/256 (+ 94/160/320/1024/2048 for jpg) else 400; types that cannot be rendered (`.bin`, `.zip`, ...) get `302` to a generic icon on `app.box.com/static/img/file_icons/` |
-| GET | `/files/{id}/collaborations`, `/comments`, `/tasks` | |
+| GET | `/files/{id}/collaborations`, `/comments`, `/tasks`, `/app_item_associations` | the last is always empty (there are no app items); the folder equivalent exists too |
 | GET, POST, PUT, DELETE | `/files/{id}/metadata/{scope}/{template}`, `/files/{id}/watermark` | |
 | GET | `/internal_files/{id}/versions/{vid}/representations/{name}` and `https://public.boxcloud.com/api/2.0/internal_files/.../representations/{name}/content/...` | with `X-Rep-Hints: [pdf][extracted_text][png?dimensions=...]`; PDF, text and PNG are generated (the jpg hint serves PNG bytes) |
 | OPTIONS | `/files/content`, `/files/{id}/content` | pre-flight: 200 `{upload_token, upload_url}` or 409 / 413 |
@@ -186,7 +200,7 @@ in Box (default limits 100, folder items/users/groups up to 1000, search 30/200,
 
 | Method | Path | Notes |
 | --- | --- | --- |
-| POST | `/files/content` | multipart `attributes` (`name`, `parent.id`, `content_created_at`, `content_modified_at`, `description`) + `file`; `Content-MD5` (the SHA-1 hex) is verified (400 `bad_digest`); 409 with `context_info.conflicts` as an object; 413 above 50 MB; returns `{total_count: 1, entries: [file]}` |
+| POST | `/files/content` | multipart `attributes` (`name`, `parent.id`, `content_created_at`, `content_modified_at`, `description`) **before** the `file` part (the other order is a 400, as in Box); `Content-MD5` (the SHA-1 hex) is verified (400 `bad_digest`); 409 with `context_info.conflicts` as an object; 413 above 50 MB; returns `{total_count: 1, entries: [file]}` |
 | POST | `/files/{id}/content` | new version; `If-Match`; optional `attributes.name` rename |
 | POST | `/files/upload_sessions`, `/files/{id}/upload_sessions` | `{folder_id, file_size, file_name}` -> `{id, part_size, total_parts, num_parts_processed, session_endpoints, session_expires_at}` |
 | PUT | `/files/upload_sessions/{id}` | one part: `Digest: sha=<base64 sha1>` and `Content-Range: bytes a-b/total`; parts in any order; returns `{part: {part_id, offset, size, sha1}}` |
@@ -201,7 +215,7 @@ tests exercise multi-part uploads with tiny payloads.
 
 | Method | Path | Notes |
 | --- | --- | --- |
-| POST | `/collaborations` | `{item: {type, id}, accessible_by: {type: user\|group, id \| login}, role, expires_at}`; managed users are `accepted`, external or unknown logins become `pending` invitations (an external account is created for an unknown e-mail); `user_already_collaborator`; `co-owner` needs an owner/co-owner inviter; `notify` is accepted and ignored |
+| POST | `/collaborations` | `{item: {type, id}, accessible_by: {type: user\|group, id \| login}, role, expires_at, can_view_path}` (`can_view_path`: folders only, owner/co-owner inviters only; shows the invitee the full parent path); managed users are `accepted`, external or unknown logins become `pending` invitations (an external account is created for an unknown e-mail; `login` must be an e-mail address). A pending invitee is redacted as in Box - `name` is empty, and `login` too unless the invite was sent by e-mail - for everyone except the invitee; `user_already_collaborator`; `co-owner` needs an owner/co-owner inviter; `notify` is accepted and ignored |
 | GET, PUT, DELETE | `/collaborations/{id}` | PUT changes `role`, `expires_at`, and lets the invitee set `status` `accepted`/`rejected` (rejecting returns 204 and removes it); collaborators can delete themselves |
 | GET | `/collaborations?status=pending` | the caller's pending invitations |
 | GET | `/shared_items` | `BoxApi: shared_link=<url>&shared_link_password=<pw>`; open links need no token; `company` needs a managed user; wrong password 403; expired/removed 404 |
@@ -211,21 +225,26 @@ Shared links are set with `PUT /files/{id}?fields=shared_link` (or `/folders/{id
 "permissions": {"can_download", "can_edit"}}}`, removed with `{"shared_link": null}`. Links look like
 `https://app.box.com/s/<32 hex>`; files also get `download_url` (`/shared/static/<hash>.<ext>`). Setting an
 `open` or `company` link needs `can_set_share_access` (editor and above); viewers can only manage
-`collaborators` links.
+`collaborators` links. As in Box: a password needs `access: open` and is at least eight characters with a number,
+an upper-case letter or a symbol; `unshared_at` must be in the future; `can_edit` needs `can_download` (and a
+file); `collaborators` links cannot be downloadable (`can_download` is reported `false`).
 
 ### Search
 
-`GET /search` - `query` (words are ANDed; `AND`/`OR`/`NOT`, quoted phrases, word-prefix matching,
-case-insensitive), `type`, `file_extensions`, `ancestor_folder_ids`, `content_types=name,description,
-file_content,comments,tag`, `created_at_range`/`updated_at_range` (`start,end`), `size_range`,
-`owner_user_ids`, `recent_updater_user_ids`, `trash_content`, `mdfilters`, `scope`
-(`enterprise_content`: admin only), `sort=relevance|modified_at`, `direction`, `limit` (30, max 200),
-`offset`. Returns `{total_count, limit, offset, entries, type: "search_results_items"}`; only items the
-caller can see are searched. File content search covers the text the world generator put in each document.
+`GET /search` - `query` (a multi-word query is an implicit `OR`, as Box documents; upper-case `AND`/`OR`/`NOT`,
+`a NOT b` reads as `a AND NOT b`, quoted phrases, word-prefix matching, case-insensitive), `type`, `file_extensions`,
+`ancestor_folder_ids` (`0` is the whole account; an unknown or unreachable folder is a 404; the folder itself is not a
+hit), `content_types=name,description,file_content,comments,tags`, `created_at_range`/`updated_at_range`
+(`start,end`), `size_range` (`low,high`, files and folders), `owner_user_ids`, `recent_updater_user_ids`,
+`trash_content`, `deleted_user_ids` / `deleted_at_range` (only with `trash_content=trashed_only`), `mdfilters` (a JSON
+list of exactly one `{scope, templateKey, filters}`), `scope` (`enterprise_content`: admin only), `sort=relevance|modified_at`
+(`relevance` is always best-first and ignores `direction`), `direction`, `limit` (30, max 200), `offset` (max 10000).
+Returns `{total_count, limit, offset, entries, type: "search_results_items"}`; only items the caller can see are
+searched. File content search covers the text the world generator put in each document.
 
 `POST /metadata_queries/execute_read` - `from` (`enterprise_336533359.clientInfo`), `ancestor_folder_id`,
 `query` (`clientName = :name AND fiscalYear >= :year`, `LIKE`, `OR`, `NOT`, parentheses), `query_params`,
-`order_by`, `limit` (max 100), `marker`, `fields`.
+`order_by` (one direction, `asc` or `desc`, for every entry), `limit` (0-100), `marker`, `fields`. Classification templates cannot be queried.
 
 ### Events
 
@@ -233,14 +252,23 @@ caller can see are searched. File content search covers the text the world gener
   -> `{chunk_size, next_stream_position, entries}`. Positions are monotonically increasing numeric strings.
   User streams (`all`, `changes`, `sync`) carry events the caller caused, on items they own, or on items
   they can currently see; `changes`/`sync` carry only tree-changing events. `admin_logs` is enterprise wide
-  (admin, co-admin and the service account only) with `event_type`, `created_after`, `created_before`.
-* Event types: `ITEM_CREATE`, `ITEM_UPLOAD`, `ITEM_DOWNLOAD`, `ITEM_MOVE`, `ITEM_COPY`, `ITEM_TRASH`,
-  `ITEM_UNDELETE_VIA_TRASH`, `ITEM_RENAME`, `DELETE`, `LOCK`, `UNLOCK`, `COLLAB_ADD_COLLABORATOR`,
-  `COLLAB_INVITE_COLLABORATOR`, `COLLAB_ROLE_CHANGE`, `COLLAB_REMOVE_COLLABORATOR`, `COLLAB_ACCEPT`,
-  `COLLAB_REJECT`, `ITEM_SHARED_CREATE`, `ITEM_SHARED_UPDATE`, `ITEM_SHARED_UNSHARE`, `COMMENT_*`,
-  `TASK_ASSIGNMENT_*`, `METADATA_INSTANCE_*`, `NEW_USER`, `EDIT_USER`, `DELETE_USER`, `GROUP_CREATION`,
-  `GROUP_DELETION`, `GROUP_ADD_USER`, `GROUP_REMOVE_USER`. The seeded history (about 1,100 events, oldest
-  first, dated like the world's documents) is available from position `0`.
+  (admin, co-admin and the service account only) with `event_type`, `created_after`, `created_before` (these three apply to `admin_logs` only and are ignored on the per-user streams, as in Box). Long polling serves user streams only: `OPTIONS /events?stream_type=admin_logs` is a 400.
+* Event types use Box's documented names: `ITEM_CREATE`, `ITEM_UPLOAD`, `ITEM_DOWNLOAD`, `ITEM_MOVE`,
+  `ITEM_COPY`, `ITEM_TRASH`, `ITEM_UNDELETE_VIA_TRASH`, `ITEM_RENAME`, `ITEM_MAKE_CURRENT_VERSION` (version
+  promotion), `DELETE` (purge), `LOCK`, `UNLOCK`, `LOCK_CREATE` / `LOCK_DESTROY` (folder freeze locks),
+  `COLLAB_ADD_COLLABORATOR`, `COLLAB_INVITE_COLLABORATOR`, `COLLAB_ROLE_CHANGE`, `COLLAB_REMOVE_COLLABORATOR`
+  (also what a rejected invitation records), `COLLABORATION_ACCEPT`, `ITEM_SHARED_CREATE`, `ITEM_SHARED_UPDATE`,
+  `ITEM_SHARED_UNSHARE`, `COMMENT_CREATE` / `COMMENT_DELETE` (an edit writes no event, only the
+  `COMMENT.UPDATED` webhook), `TASK_CREATE`, `TASK_UPDATE`, `TASK_ASSIGNMENT_CREATE|UPDATE|DELETE`,
+  `METADATA_INSTANCE_*`. Enterprise-level activity appears only in `admin_logs`: `NEW_USER`, `EDIT_USER`,
+  `DELETE_USER`, `GROUP_CREATION`, `GROUP_EDITED`, `GROUP_DELETION`, `GROUP_ADD_USER`, `GROUP_REMOVE_USER`,
+  `METADATA_TEMPLATE_CREATE|UPDATE|DELETE`, `WATERMARK_LABEL_CREATE|DELETE`, `LOGIN` and
+  `USER_AUTHENTICATE_OAUTH2_ACCESS_TOKEN_CREATE` (an authorization-code exchange or a refresh; revoking a token
+  is not an event). The `admin_logs` stream names file and sharing activity the enterprise way, as Box does:
+  `UPLOAD`, `DOWNLOAD`, `PREVIEW`, `COPY`, `MOVE`, `RENAME`, `DELETE` (a trashed item), `UNDELETE`, `SHARE`,
+  `UNSHARE`, `COLLABORATION_INVITE`, `COLLABORATION_ACCEPT`, `COLLABORATION_REMOVE`,
+  `COLLABORATION_ROLE_CHANGE`; its `event_type` filter accepts either family. The seeded history (about 1,100
+  events, oldest first, dated like the world's documents) is available from position `0`.
 * `OPTIONS /events` returns `{chunk_size: 1, entries: [{type: "realtime_server", url, ttl, max_retries,
   retry_timeout}]}`. The URL (`https://realtime.box.com/subscribe?channel=...`) is a long-poll endpoint: it
   answers `{"message": "new_change"}` as soon as an event visible to the channel's user is newer than the
@@ -259,7 +287,7 @@ triggers: `FILE.UPLOADED`, `FILE.PREVIEWED`, `FILE.DOWNLOADED`, `FILE.TRASHED`, 
 `FOLDER.MOVED`, `FOLDER.TRASHED`, `FOLDER.RENAMED`, `COMMENT.CREATED|UPDATED|DELETED`,
 `TASK_ASSIGNMENT.CREATED|UPDATED`, `METADATA_INSTANCE.CREATED|UPDATED|DELETED`,
 `COLLABORATION.CREATED|ACCEPTED|REJECTED|REMOVED|UPDATED`, `SHARED_LINK.CREATED|UPDATED|DELETED`,
-`WEBHOOK.DELETED`.
+`WEBHOOK.DELETED`, plus the `SIGN_REQUEST.*` triggers (valid subscriptions that never fire: Box Sign is not emulated).
 
 A webhook on a folder fires for events on the folder and everything beneath it (including nested uploads);
 a webhook on `0` covers the creator's whole tree; a file webhook only its file.
@@ -274,7 +302,7 @@ attempts with the same delivery id) are JSON:
  "source": {"type": "file", "id": "...", "name": "...", "...": "the file object"}}
 ```
 
-with headers `BOX-DELIVERY-ID`, `BOX-DELIVERY-TIMESTAMP` (`2026-10-16T07:26:54.752Z`),
+with headers `BOX-DELIVERY-ID`, `BOX-DELIVERY-TIMESTAMP` (`2026-10-16T00:26:54-07:00`, Box's Pacific-offset form),
 `BOX-SIGNATURE-VERSION: 1`, `BOX-SIGNATURE-ALGORITHM: HmacSHA256`, `BOX-SIGNATURE-PRIMARY` and
 `BOX-SIGNATURE-SECONDARY` where each is `base64(hmac_sha256(key, body_bytes + timestamp_bytes))`.
 `WebhooksManager.validate_message` from the SDK accepts them. Keys default to the values in the credentials
@@ -291,7 +319,7 @@ table; change them with the `configure_webhook_keys` action (an empty secondary 
 | Web links | `POST /web_links`, `GET/PUT/DELETE /web_links/{id}` (+ trash, restore, purge); they appear in folder listings |
 | Collections | `GET /collections` (one "Favorites" per user), `/collections/{id}`, `/collections/{id}/items`; set with `collections: [{id}]` on a file/folder update |
 | Recent items | `GET /recent_items` (marker paging) |
-| Zip downloads | `POST /zip_downloads` (202), `GET /zip_downloads/{id}/status`, content on `dl.boxcloud.com`; duplicate names get `name (1).ext` and are reported in `name_conflicts` |
+| Zip downloads | `POST /zip_downloads` (202), `GET /zip_downloads/{id}/status`, content on `dl.boxcloud.com`; items sharing a name are **all** renamed (`name (1).ext`, `name (2).ext`) and reported together in `name_conflicts` |
 | Watermarks | `GET/PUT/DELETE /files/{id}/watermark`, `/folders/{id}/watermark`; folder watermarks are inherited (`watermark_info`) |
 | Classification | the standard `securityClassification-6VMVochwUWo` template (Public / Internal / Confidential) and the `classification` field |
 
@@ -299,7 +327,7 @@ table; change them with the `configure_webhook_keys` action (an empty secondary 
 
 Everything is projected from the shared world (deterministic; the full seed takes about half a second).
 
-* **Users** (70): 45 active employees + 2 departed (`inactive`) as managed users with `login` = e-mail,
+* **Users** (70 accounts, of which `GET /users` lists the 48 managed and app ones): 45 active employees + 2 departed (`inactive`) as managed users with `login` = e-mail,
   `job_title`, office address, phone, language and time zone; Arjun Mehta `admin`, Sarah Johansson `coadmin`
   (`box-dev-p035`, `box-dev-p036`). 22 client contacts who collaborate on files are external users
   (`enterprise: null`), e.g. `christopher.ingram@northwindlogistics.example`. One service account
@@ -337,7 +365,7 @@ Everything is projected from the shared world (deterministic; the full seed take
 | `configure_webhook_keys` | `{primary, secondary}` | replaces the signature keys (reset restores the defaults) |
 | `configure_uploads` | `{part_size}` | chunked-upload `part_size` in bytes |
 | `simulate_upload` | `{user, parent_id, name, content \| content_base64}` | another user uploads (a new version when the name exists), firing events and webhooks |
-| `accept_collaboration` | `{collaboration_id}` | the invitee accepts a pending invitation, firing `COLLAB_ACCEPT` / `COLLABORATION.ACCEPTED` |
+| `accept_collaboration` | `{collaboration_id}` | the invitee accepts a pending invitation, firing `COLLABORATION_ACCEPT` / `COLLABORATION.ACCEPTED` |
 | `expire_token` | `{token}` | revokes an access or refresh token |
 
 The standard control plane (`/_emulator/reset`, `/state`, `/requests`, `/faults`, `/webhooks`...) is
@@ -348,10 +376,23 @@ faults on `/oauth2/*` are OAuth-shaped.
 
 * Not implemented: Box AI, Box Sign, Hubs, Doc Gen, retention policies, legal holds, terms of service,
   storage policies, shield information barriers, device pinners, collaboration allowlists, integration
-  mappings, file requests, skills cards, e-mail aliases, `GET /shared_items` for web links, ownership
+  mappings, file requests, skills cards, workflows, metadata cascade policies, app items (their
+  `app_item_associations` listings are always empty), `GET /shared_items` for web links and app items, ownership
   transfer through `role: owner`, and enterprise admin-console settings. Notifications (`notify`) are ignored.
 * Chunked sessions accept any `file_size >= 1` and any `part_size` (real Box requires files of at least
   20 MB and 8 MB parts); the part size is configurable for tests.
+* Real Box falls back to the app's registered redirect URI when `redirect_uri` is omitted from the authorize
+  URL; the emulator has no registered redirect URIs, so `redirect_uri` is required there. Refreshing a token
+  also revokes the access token it was paired with (Box keeps the old access token valid until it expires).
+  `client_credentials` without `box_subject_type` is accepted and acts as the enterprise.
+* A collaboration `status` change (`accepted` / `rejected`) is accepted from the invitee or from anyone who
+  manages the item; Box documents it for the invitee only.
+* Seeded activity from the anchor day is stamped up to 09:00 UTC (the shared world's "this morning"); before
+  that wall-clock time the newest files, folders, events and comments read as slightly in the future. The seeded
+  accounts are never younger than their first activity (a user's `created_at` moves back to the day before
+  they first appear in the document history), collaborations never pre-date the item, group or user they
+  involve, and a document's owner keeps an `editor` collaboration on a file authored outside their spaces (Box files in a
+  team folder belong to the folder's owner, so the author would otherwise lose sight of their own document).
 * Simple uploads are limited to 50 MB; sessions to 50 GB. `GET .../thumbnail.jpg` and `jpg` representations
   return PNG bytes. Representations are generated on demand and never "pending".
 * Scopes of the registered application are not enforced for regular tokens; only downscoped

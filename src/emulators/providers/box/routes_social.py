@@ -18,6 +18,7 @@ from emulators.providers.box.util import (
     json_body,
     next_id,
     now_iso,
+    opt_str,
     page_window,
     paginate,
     parse_fields,
@@ -93,8 +94,8 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
             or not target.get("id")
         ):
             raise errors.missing_parameter("item")
-        tagged = body.get("tagged_message")
-        message = body.get("message")
+        tagged = opt_str(body, "tagged_message", "", max_len=10_000) or None
+        message = opt_str(body, "message", "", max_len=10_000) or None
         if not message and not tagged:
             raise errors.missing_parameter("message")
         if tagged:
@@ -162,8 +163,9 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
             "COMMENT_UPDATE",
             None,
             source=comment_body(shaper, comment),
-            kind="comment",
             webhook_item=record,
+            trigger="COMMENT.UPDATED",
+            log=False,  # Box has no COMMENT_UPDATE event, only the webhook trigger
         )
         return comment_body(shaper, comment, parse_fields(request))
 
@@ -258,7 +260,7 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
             "id": next_id(ctx, "task", tasks, start=db.SMALL_ID_START * 100),
             "item_id": record["id"],
             "action": action,
-            "message": body.get("message", ""),
+            "message": opt_str(body, "message", "", max_len=10_000),
             "due_at": input_ts(body["due_at"], "due_at") if body.get("due_at") else None,
             "completion_rule": rule,
             "created_by": p.uid,
@@ -266,7 +268,11 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
             "is_completed": False,
         }
         tasks.put(task)
-        return created(task_body(Shaper(p, request), task, parse_fields(request)))
+        shaper = Shaper(p, request)
+        await events.emit(
+            p, "TASK_CREATE", None, source=task_body(shaper, task), kind="task", webhook_item=record
+        )
+        return created(task_body(shaper, task, parse_fields(request)))
 
     @api.get("/tasks/{task_id}")
     async def get_task(request: Request, task_id: str) -> Any:
@@ -286,12 +292,18 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
                 raise errors.invalid_parameter("action")
             task["action"] = body["action"]
         if "message" in body:
-            task["message"] = body["message"]
+            task["message"] = opt_str(body, "message", "", max_len=10_000)
         if "due_at" in body:
             task["due_at"] = input_ts(body["due_at"], "due_at") if body["due_at"] else None
         if "completion_rule" in body:
+            if body["completion_rule"] not in ("all_assignees", "any_assignee"):
+                raise errors.invalid_parameter("completion_rule")
             task["completion_rule"] = body["completion_rule"]
-        return task_body(Shaper(p, request), task, parse_fields(request))
+        shaper = Shaper(p, request)
+        await events.emit(
+            p, "TASK_UPDATE", None, source=task_body(shaper, task), kind="task", webhook_item=_record
+        )
+        return task_body(shaper, task, parse_fields(request))
 
     @api.delete("/tasks/{task_id}")
     async def delete_task(request: Request, task_id: str) -> Any:
@@ -320,10 +332,11 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         target = body.get("assign_to")
         if not isinstance(target, dict):
             raise errors.missing_parameter("assign_to")
+        login = target.get("login")
+        if not target.get("id") and not isinstance(login, str):
+            raise errors.missing_parameter("assign_to.id")
         user = (
-            db.users(ctx).get(str(target["id"]))
-            if target.get("id")
-            else db.user_by_login(ctx, target.get("login", ""))
+            db.users(ctx).get(str(target["id"])) if target.get("id") else db.user_by_login(ctx, login or "")
         )
         if user is None:
             raise errors.not_found("User not found")
@@ -374,10 +387,21 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
             raise errors.forbidden()
         body = await json_body(request)
         if "message" in body:
-            assignment["message"] = body["message"]
+            assignment["message"] = opt_str(body, "message", "", max_len=10_000)
         if "resolution_state" in body:
             if body["resolution_state"] not in ("completed", "incomplete", "approved", "rejected"):
                 raise errors.invalid_parameter("resolution_state")
+            parent_task = tasks.get(assignment["task_id"])
+            allowed = (
+                ("incomplete", "completed")
+                if parent_task and parent_task["action"] == "complete"
+                else ("incomplete", "approved", "rejected")
+            )
+            if body["resolution_state"] not in allowed:
+                raise errors.invalid_parameter(
+                    "resolution_state",
+                    f"A '{(parent_task or {}).get('action', 'review')}' task takes: {', '.join(allowed)}",
+                )
             assignment["resolution_state"] = body["resolution_state"]
             assignment["completed_at"] = now_iso(ctx) if body["resolution_state"] != "incomplete" else None
             task = tasks.get(assignment["task_id"])
@@ -401,10 +425,18 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
     @api.delete("/task_assignments/{assignment_id}")
     async def delete_assignment(request: Request, assignment_id: str) -> Any:
         p = api.principal(request)
-        assignment, _record = assignment_or_404(p, assignment_id)
+        assignment, record = assignment_or_404(p, assignment_id)
         if assignment["assigned_by"] != p.uid and assignment["assigned_to"] != p.uid:
             raise errors.forbidden()
         assignments.delete(assignment["id"])
+        await events.emit(
+            p,
+            "TASK_ASSIGNMENT_DELETE",
+            None,
+            source=assignment_body(Shaper(p, request), assignment),
+            kind="task_assignment",
+            webhook_item=record,
+        )
         return no_content()
 
     # -- web links -----------------------------------------------------------------------
@@ -429,7 +461,7 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
             "id": next_id(ctx, "web_link", links, start=db.FILE_ID_START * 2),
             "name": name,
             "url": url,
-            "description": body.get("description", ""),
+            "description": opt_str(body, "description", ""),
             "_parent": parent["id"],
             "_owner": parent.get("_owner") or p.uid,
             "created_by": p.uid,
@@ -462,9 +494,12 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
             ops.ensure_name_free(p, record["_parent"], name, ignore=record["id"])
             record["name"] = name
         if "url" in body:
-            record["url"] = body["url"]
+            url = require_str(body, "url")
+            if not re.match(r"^https?://", url):
+                raise errors.invalid_parameter("url", "'url' must be an http(s) URL")
+            record["url"] = url
         if "description" in body:
-            record["description"] = body["description"]
+            record["description"] = opt_str(body, "description", "")
         if isinstance(body.get("parent"), dict) and "id" in body["parent"]:
             ops.move(p, record, p.get_item("folder", str(body["parent"]["id"]), access.UPLOAD), now)
         ops.touch(record, p, now)

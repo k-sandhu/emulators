@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from fastapi import FastAPI, Request
@@ -16,6 +17,10 @@ from emulators.providers.box.util import (
     json_body,
     next_id,
     now_iso,
+    object_or_empty,
+    opt_bool,
+    opt_int,
+    opt_str,
     page_window,
     paginate,
     parse_fields,
@@ -27,13 +32,50 @@ from emulators.providers.box.util import (
 from emulators.world import documents
 
 Record = dict[str, Any]
-ROLES = ("user", "coadmin", "admin")
-USER_UPDATABLE = (
-    "name", "job_title", "phone", "address", "language", "timezone", "tracking_codes",
-    "can_see_managed_users", "is_sync_enabled", "is_external_collab_restricted",
-    "is_exempt_from_device_limits", "is_exempt_from_login_verification", "space_amount",
-)  # fmt: skip
+#: Roles the API can hand out: Box has no call that makes someone an enterprise admin.
+ROLES = ("user", "coadmin")
+MAX_AVATAR = 1024 * 1024
+IMAGE_MAGIC = (
+    (bytes.fromhex("89504e470d0a1a0a"), "image/png"),
+    (bytes.fromhex("ffd8ff"), "image/jpeg"),
+    (b"GIF8", "image/gif"),
+)
 GROUP_LEVELS = ("admins_only", "admins_and_members", "all_managed_users")
+USER_STATUSES = ("active", "inactive", "cannot_delete_edit", "cannot_delete_edit_upload")
+EMAIL = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
+USER_STRINGS = ("name", "job_title", "phone", "address", "language", "timezone")
+USER_FLAGS = (
+    "can_see_managed_users", "is_sync_enabled", "is_external_collab_restricted",
+    "is_exempt_from_device_limits", "is_exempt_from_login_verification",
+)  # fmt: skip
+
+
+def user_fields(body: dict[str, Any]) -> dict[str, Any]:
+    """The editable user attributes present in ``body``, type-checked as Box does (400 otherwise)."""
+    clean: dict[str, Any] = {}
+    for key in USER_STRINGS:
+        if key in body:
+            value = opt_str(body, key)
+            if key == "name" and not value.strip():
+                raise errors.invalid_parameter("name", "'name' must not be empty")
+            clean[key] = value
+    for key in USER_FLAGS:
+        if key in body:
+            clean[key] = opt_bool(body, key, True)
+    if "space_amount" in body:
+        clean["space_amount"] = opt_int(body, "space_amount", -1, minimum=-1)
+    if "tracking_codes" in body:
+        codes = body["tracking_codes"]
+        if codes is not None and (not isinstance(codes, list) or not all(isinstance(c, dict) for c in codes)):
+            raise errors.invalid_parameter("tracking_codes", "'tracking_codes' must be an array of objects")
+        clean["tracking_codes"] = list(codes or [])
+    return clean
+
+
+def valid_login(value: Any, *, name: str = "login") -> str:
+    if not isinstance(value, str) or not EMAIL.fullmatch(value.strip()):
+        raise errors.invalid_parameter(name, f"'{name}' must be an e-mail address")
+    return value.strip()
 
 
 def register(app: FastAPI, ctx: ProviderContext) -> None:
@@ -59,24 +101,26 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
     async def list_users(request: Request) -> Any:
         p = api.principal(request)
         p.require_privileged()
-        term = (request.query_params.get("filter_term") or "").lower()
+        term = (request.query_params.get("filter_term") or "").strip().lower()
         kind = request.query_params.get("user_type", "all")
         if kind not in ("all", "managed", "external"):
             raise errors.invalid_parameter("user_type", "'user_type' must be all, managed or external")
         wanted = query_list(request, "external_app_user_id")
-        records = []
-        for user in db.users(ctx):
-            if user.get("_kind") == "service" and kind != "all":
-                continue
-            if kind == "managed" and user.get("_kind") == "external":
-                continue
-            if kind == "external" and user.get("_kind") != "external":
-                continue
-            if term and term not in user["name"].lower() and not user["login"].lower().startswith(term):
-                continue
-            if wanted and user.get("external_app_user_id") not in wanted:
-                continue
-            records.append(user)
+        everyone = list(db.users(ctx))
+        # Outsiders are never listed with the enterprise: only an exact login match finds one.
+        exact_external = [
+            u for u in everyone if u.get("_kind") == "external" and term and u["login"].lower() == term
+        ]
+        if kind == "external" or (kind == "all" and exact_external):
+            records = exact_external
+        else:
+            records = [
+                u
+                for u in everyone
+                if u.get("_kind") != "external"
+                and (not term or term in u["name"].lower() or term in u["login"].lower())
+                and (not wanted or u.get("external_app_user_id") in wanted)
+            ]
         records.sort(key=lambda u: (u["name"].lower(), u["id"]))
         offset, limit, use_marker = page_window(request, default_limit=100, max_limit=1000)
         body = paginate(records, offset, limit, use_marker, order=[{"by": "name", "direction": "ASC"}])
@@ -91,15 +135,21 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         p.require_privileged()
         body = await json_body(request)
         name = require_str(body, "name")
-        app_user = bool(body.get("is_platform_access_only"))
+        app_user = opt_bool(body, "is_platform_access_only")
         login = body.get("login")
         if not app_user and not login:
             raise errors.missing_parameter("login")
+        if login:
+            login = valid_login(login)
         role = body.get("role", "user")
-        if role not in ROLES:
-            raise errors.invalid_parameter("role", "'role' must be user, coadmin or admin")
         if role != "user" and not p.is_admin:
             raise errors.forbidden()
+        if role not in ROLES:
+            raise errors.invalid_parameter("role", "'role' must be user or coadmin")
+        status = body.get("status", "active")
+        if status not in USER_STATUSES:
+            raise errors.invalid_parameter("status", "Invalid status")
+        fields = user_fields(body)
         uid = next_id(ctx, "user", db.users(ctx), start=db.USER_ID_START)
         if not login:
             login = f"AppUser_{uid}_{random_alnum(10)}@boxdevedition.com"
@@ -116,21 +166,19 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
             "login": login,
             "created_at": now,
             "modified_at": now,
-            "language": body.get("language", "en"),
-            "timezone": body.get("timezone", "America/Toronto"),
-            "status": body.get("status", "active"),
-            "job_title": body.get("job_title", ""),
-            "phone": body.get("phone", ""),
-            "address": body.get("address", ""),
+            "language": "en",
+            "timezone": "America/Toronto",
+            "status": status,
+            "job_title": "",
+            "phone": "",
+            "address": "",
             "role": role,
             "_pid": None,
             "_kind": "managed",
             "_root": db.root_id(uid),
             "is_platform_access_only": app_user,
         }
-        for key in USER_UPDATABLE:
-            if key in body and key not in record:
-                record[key] = body[key]
+        record.update(fields)
         db.users(ctx).put(record)
         db.folders(ctx).put(
             {
@@ -177,34 +225,39 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         }
         if not p.is_privileged and restricted & set(body):
             raise errors.forbidden()
+        if not own and not p.can_manage_user(record):
+            raise errors.forbidden()
+        # Validate everything first: a rejected request must change nothing.
+        fields = user_fields(body)
         if "role" in body:
-            if body["role"] not in ROLES:
-                raise errors.invalid_parameter("role", "'role' must be user, coadmin or admin")
             if not p.is_admin:
                 raise errors.forbidden()
-            record["role"] = body["role"]
-        if "status" in body:
-            if body["status"] not in (
-                "active",
-                "inactive",
-                "cannot_delete_edit",
-                "cannot_delete_edit_upload",
-            ):
-                raise errors.invalid_parameter("status", "Invalid status")
-            record["status"] = "active" if body["status"] == "active" else "inactive"
-            if record["status"] == "inactive":
-                ctx.tokens.revoke_user(record["id"])
+            if body["role"] not in ROLES:
+                raise errors.invalid_parameter("role", "'role' must be user or coadmin")
+        if "status" in body and body["status"] not in USER_STATUSES:
+            raise errors.invalid_parameter("status", "Invalid status")
+        login = None
         if "login" in body and p.is_privileged:
-            if db.user_by_login(ctx, body["login"]) not in (None, record):
+            login = valid_login(body["login"])
+            if db.user_by_login(ctx, login) not in (None, record):
                 raise errors.box_error(
                     409, "user_login_already_used", "Item with the same name already exists"
                 )
-            record["login"] = body["login"]
-        for key in USER_UPDATABLE:
-            if key in body:
-                record[key] = body[key]
+        email: Any = None
         if "notification_email" in body:
-            email = (body["notification_email"] or {}).get("email") if body["notification_email"] else None
+            email = object_or_empty(body["notification_email"], "notification_email").get("email")
+            if email is not None:
+                email = valid_login(email, name="notification_email.email")
+        if "role" in body:
+            record["role"] = body["role"]
+        if "status" in body:
+            record["status"] = body["status"]
+            if not db.is_active(record):
+                ctx.tokens.revoke_user(record["id"])
+        if login is not None:
+            record["login"] = login
+        record.update(fields)
+        if "notification_email" in body:
             record["notification_email"] = {"email": email, "is_confirmed": True} if email else None
         if "enterprise" in body and body["enterprise"] is None and p.is_privileged:
             record["_kind"] = "external"
@@ -221,6 +274,8 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         record = db.users(ctx).get(user_id)
         if record is None:
             raise errors.not_found()
+        if not p.can_manage_user(record):
+            raise errors.forbidden()
         force = request.query_params.get("force", "false").lower() == "true"
         owned = [f for f in db.files(ctx) if f["_owner"] == record["id"]]
         if owned and not force:
@@ -264,8 +319,112 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         return avatar_response(record)
 
     def avatar_response(record: Record) -> Response:
+        uploaded = record.get("_avatar")
+        if uploaded:
+            return Response(ctx.store.blobs.get(uploaded["blob"]), media_type=uploaded["media_type"])
         seed = int(record["id"]) % 1_000_000
         return Response(documents.make_png(64, 64, seed=seed), media_type="image/png")
+
+    def avatar_target(p: Principal, user_id: str) -> Record:
+        """Admins and the user themself change an avatar (managed accounts only)."""
+        record = user_or_404(p, user_id)
+        if not (p.is_privileged or record["id"] == p.uid) or record.get("_kind") == "service":
+            raise errors.forbidden()
+        return record
+
+    @api.post("/users/{user_id}/avatar")
+    async def upload_avatar(request: Request, user_id: str) -> Any:
+        p = api.principal(request)
+        record = avatar_target(p, user_id)
+        try:
+            form = await request.form()
+        except Exception:  # malformed multipart body
+            raise errors.bad_request("Invalid multipart request", reason="invalid_request_body") from None
+        pic = form.get("pic")
+        if pic is None or isinstance(pic, str):
+            raise errors.missing_parameter("pic")
+        data = await pic.read()
+        if len(data) > MAX_AVATAR:
+            raise errors.box_error(413, "request_entity_too_large", "The avatar must be 1MB or smaller")
+        media_type = next((kind for magic, kind in IMAGE_MAGIC if data.startswith(magic)), None)
+        if media_type is None:
+            raise errors.box_error(400, "bad_request", "The avatar must be a PNG, JPEG or GIF image")
+        record["_avatar"] = {"blob": ctx.store.blobs.put(data), "media_type": media_type}
+        shaper = Shaper(p, request)
+        return {
+            "pic_urls": {
+                size: shaper.host_url("app.box.com", f"/api/avatar/{size}/{record['id']}")
+                for size in ("small", "large", "preview")
+            }
+        }
+
+    @api.delete("/users/{user_id}/avatar")
+    async def delete_avatar(request: Request, user_id: str) -> Any:
+        p = api.principal(request)
+        record = avatar_target(p, user_id)
+        if not record.get("_avatar"):
+            raise errors.not_found("The user has no uploaded avatar")
+        record.pop("_avatar")
+        return no_content()
+
+    # -- e-mail aliases ------------------------------------------------------------------
+    def alias_body(alias: Record) -> Record:
+        return {
+            "type": "email_alias",
+            "id": alias["id"],
+            "is_confirmed": bool(alias.get("is_confirmed", True)),
+            "email": alias["email"],
+        }
+
+    def managed_target(p: Principal, user_id: str) -> Record:
+        p.require_privileged()
+        record = db.users(ctx).get(user_id)
+        if record is None or record.get("_kind") in ("external", "service"):
+            raise errors.not_found()
+        if not p.can_manage_user(record):
+            raise errors.forbidden()
+        return record
+
+    @api.get("/users/{user_id}/email_aliases")
+    async def list_email_aliases(request: Request, user_id: str) -> Any:
+        p = api.principal(request)
+        record = managed_target(p, user_id)
+        rows = [alias_body(a) for a in record.get("_aliases", [])]
+        return {"total_count": len(rows), "entries": rows}
+
+    @api.post("/users/{user_id}/email_aliases")
+    async def create_email_alias(request: Request, user_id: str) -> Any:
+        p = api.principal(request)
+        record = managed_target(p, user_id)
+        body = await json_body(request)
+        email = valid_login(body.get("email"), name="email")
+        taken = db.user_by_login(ctx, email) is not None or any(
+            a["email"].lower() == email.lower() for u in db.users(ctx) for a in u.get("_aliases", [])
+        )
+        if taken:
+            raise errors.box_error(
+                409,
+                "conflict",
+                "Email alias already exists",
+                context_info={"errors": [{"reason": "email_alias_conflict", "name": "email"}]},
+            )
+        alias = {
+            "id": next_id(ctx, "alias", {}, start=db.SMALL_ID_START),
+            "email": email,
+            "is_confirmed": True,
+        }
+        record.setdefault("_aliases", []).append(alias)
+        return created(alias_body(alias))
+
+    @api.delete("/users/{user_id}/email_aliases/{alias_id}")
+    async def delete_email_alias(request: Request, user_id: str, alias_id: str) -> Any:
+        p = api.principal(request)
+        record = managed_target(p, user_id)
+        aliases = record.get("_aliases", [])
+        if not any(a["id"] == alias_id for a in aliases):
+            raise errors.not_found()
+        record["_aliases"] = [a for a in aliases if a["id"] != alias_id]
+        return no_content()
 
     @api.get("/users/{user_id}/memberships")
     async def user_memberships(request: Request, user_id: str) -> Any:
@@ -300,12 +459,15 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
 
         return box_ts(value)
 
-    def group_or_404(p: Principal, group_id: str, *, manage: bool = False) -> Record:
+    def group_or_404(
+        p: Principal, group_id: str, *, manage: bool = False, admins_may: bool = False
+    ) -> Record:
+        """``manage`` is for enterprise admins only; ``admins_may`` also lets the group's own admins in."""
         group = db.groups(ctx).get(group_id)
         if group is None:
             raise errors.not_found()
         member = group_id in p.groups
-        if manage and not p.is_privileged:
+        if manage and not (p.is_privileged or (admins_may and p.is_group_admin(group_id))):
             raise errors.forbidden()
         if not (p.is_privileged or member):
             raise errors.forbidden()
@@ -315,6 +477,11 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         for key in ("invitability_level", "member_viewability_level"):
             if key in body and body[key] not in GROUP_LEVELS:
                 raise errors.invalid_parameter(key, f"'{key}' must be one of {', '.join(GROUP_LEVELS)}")
+        if "name" in body and not opt_str(body, "name").strip():
+            raise errors.invalid_parameter("name", "'name' must not be empty")
+        for key in ("description", "provenance", "external_sync_identifier"):
+            if key in body:
+                opt_str(body, key)
 
     @api.get("/groups")
     async def list_groups(request: Request) -> Any:
@@ -370,9 +537,16 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
     @api.put("/groups/{group_id}")
     async def update_group(request: Request, group_id: str) -> Any:
         p = api.principal(request)
-        group = group_or_404(p, group_id, manage=True)
+        group = group_or_404(p, group_id, manage=True, admins_may=True)
         body = await json_body(request)
         validate_group_body(body)
+        if "name" in body and any(
+            g["id"] != group["id"] and g["name"].lower() == body["name"].lower() for g in db.groups(ctx)
+        ):
+            raise errors.box_error(
+                409, "conflict", "A group with this name already exists",
+                context_info={"errors": [{"reason": "name_already_exists", "name": "name"}]},
+            )  # fmt: skip
         for key in (
             "name",
             "provenance",
@@ -384,7 +558,9 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
             if key in body:
                 group[key] = body[key]
         group["modified_at"] = now_iso(ctx)
-        return Shaper(p, request).group(group, parse_fields(request))
+        shaper = Shaper(p, request)
+        events.append_event(ctx, "GROUP_EDITED", created_by=p.uid, source=shaper.group_mini(group))
+        return shaper.group(group, parse_fields(request))
 
     @api.delete("/groups/{group_id}")
     async def delete_group(request: Request, group_id: str) -> Any:
@@ -406,6 +582,8 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
     async def group_memberships(request: Request, group_id: str) -> Any:
         p = api.principal(request)
         group = group_or_404(p, group_id)
+        if not p.can_view_members(group):
+            raise errors.forbidden()
         rows = [m for m in db.memberships(ctx) if m["group_id"] == group["id"]]
         offset, limit, use_marker = page_window(request, default_limit=100, max_limit=1000)
         body = paginate(rows, offset, limit, use_marker)
@@ -443,7 +621,7 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         record = db.memberships(ctx).get(membership_id)
         if record is None:
             raise errors.not_found()
-        if not (p.is_privileged or record["user_id"] == p.uid):
+        if not (p.is_privileged or record["user_id"] == p.uid or p.is_group_admin(record["group_id"])):
             raise errors.forbidden()
         return record
 
@@ -455,8 +633,9 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
     @api.put("/group_memberships/{membership_id}")
     async def update_membership(request: Request, membership_id: str) -> Any:
         p = api.principal(request)
-        p.require_privileged()
         record = membership_or_404(p, membership_id)
+        if not (p.is_privileged or p.is_group_admin(record["group_id"])):
+            raise errors.forbidden()
         body = await json_body(request)
         if "role" in body:
             if body["role"] not in ("member", "admin"):
@@ -468,8 +647,9 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
     @api.delete("/group_memberships/{membership_id}")
     async def remove_member(request: Request, membership_id: str) -> Any:
         p = api.principal(request)
-        p.require_privileged()
         record = membership_or_404(p, membership_id)
+        if not (p.is_privileged or p.is_group_admin(record["group_id"])):
+            raise errors.forbidden()
         db.memberships(ctx).delete(record["id"])
         shaper = Shaper(p, request)
         group = db.groups(ctx).get(record["group_id"])

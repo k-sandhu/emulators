@@ -52,10 +52,11 @@ class Seeder:
         self.used: dict[str, set[int]] = {}
         self.uid: dict[str, str] = {}  # world person id -> box user id
         self.folder_index: dict[tuple[str, str], str] = {}  # (parent id, lowercase name) -> folder id
-        self.span: dict[str, list[str]] = {}  # folder id -> [min created, max modified]
+        self.span: dict[str, list[str]] = {}  # folder id -> [min created, max modified, creator, modifier]
         self.file_names: dict[str, set[str]] = {}
         self.file_of_doc: dict[str, str] = {}
         self.admin_uid = ""
+        self.active_since: dict[str, datetime] = {}
 
     # -- ids ---------------------------------------------------------------------------
     def number(self, kind: str, key: str, low: int, high: int) -> str:
@@ -87,10 +88,39 @@ class Seeder:
         self.seed_events()
 
     # -- users -------------------------------------------------------------------------
+    def first_seen(self) -> dict[str, datetime]:
+        """Earliest moment each person appears in the document history (owner, editor, recipient,
+        reviewer). A Box account cannot be younger than its first activity."""
+        seen: dict[str, datetime] = {}
+
+        def note(person_id: str | None, when: datetime) -> None:
+            if person_id and (person_id not in seen or when < seen[person_id]):
+                seen[person_id] = when
+
+        for doc in self.world.documents:
+            note(doc.owner_id, doc.created)
+            note(doc.modified_by_id, doc.modified)
+            for share in doc.shares:
+                note(share.principal_id, share.created or doc.created)
+            if doc.engagement_id:
+                engagement = self.world.engagement(doc.engagement_id)
+                note(engagement.lead_id, doc.modified)
+                if engagement.team_ids:
+                    note(engagement.team_ids[0], doc.modified)
+        return seen
+
+    def user_created(self, user_id: str) -> datetime:
+        user = db.users(self.ctx).get(user_id)
+        assert user is not None
+        return datetime.fromisoformat(user["created_at"])
+
     def make_user(self, person: Person | None, **overrides: Any) -> Record:
         world = self.world
         if person is not None:
             created = datetime.combine(person.hire_date or world.org.founded, time(15, 30), UTC)
+            active_since = self.active_since.get(person.id)
+            if active_since is not None and active_since < created:
+                created = datetime.combine((active_since - timedelta(days=1)).date(), time(15, 30), UTC)
             office = world.office(person.office_id) if person.office_id else None
             address = office.address.one_line() if office and not person.is_external else ""
             record: Record = {
@@ -134,6 +164,7 @@ class Seeder:
 
     def seed_users(self) -> None:
         world = self.world
+        self.active_since = self.first_seen()
         referenced: set[str] = set()
         for doc in world.documents:
             referenced.update({doc.owner_id, doc.modified_by_id})
@@ -149,7 +180,7 @@ class Seeder:
         for person in world.external_people:
             if person.id in referenced:
                 self.uid[person.id] = self.make_user(person)["id"]
-        created = datetime.combine(world.org.founded, time(12, 0), UTC)
+        created = datetime.combine((self.anchor - timedelta(days=905)).date(), time(12, 0), UTC)
         self.service = self.make_user(
             None,
             id=self.number("user", "service-account", 30_000_000_000, 39_999_999_999),
@@ -199,6 +230,10 @@ class Seeder:
                 if member not in self.uid:
                     continue
                 mid = self.number("membership", f"{group.id}/{member}", 100_000_000, 999_999_999)
+                joined = max(
+                    self.stamp(created + timedelta(days=1)),
+                    self.stamp(self.user_created(self.uid[member]) + timedelta(days=1)),
+                )
                 db.memberships(self.ctx).put(
                     {
                         "type": "group_membership",
@@ -206,8 +241,8 @@ class Seeder:
                         "user_id": self.uid[member],
                         "group_id": gid,
                         "role": "admin" if member in group.owner_ids else "member",
-                        "created_at": self.stamp(created + timedelta(days=1)),
-                        "modified_at": self.stamp(created + timedelta(days=1)),
+                        "created_at": joined,
+                        "modified_at": joined,
                     }
                 )
 
@@ -257,13 +292,16 @@ class Seeder:
             parent = self.ensure_folder(owner, parent, part, path, creator, created)
         return parent
 
-    def touch_span(self, folder_id: str, created: str, modified: str) -> None:
+    def touch_span(self, folder_id: str, created: str, modified: str, creator: str, modifier: str) -> None:
+        """Track the oldest and newest file under a folder, and who wrote them."""
         span = self.span.get(folder_id)
         if span is None:
-            self.span[folder_id] = [created, modified]
-        else:
-            span[0] = min(span[0], created)
-            span[1] = max(span[1], modified)
+            self.span[folder_id] = [created, modified, creator, modifier]
+            return
+        if created < span[0]:
+            span[0], span[2] = created, creator
+        if modified > span[1]:
+            span[1], span[3] = modified, modifier
 
     def unique_name(self, parent_id: str, name: str) -> str:
         taken = self.file_names.setdefault(parent_id, set())
@@ -324,7 +362,7 @@ class Seeder:
         # Roll file times up through ancestors so folders look as old/new as their contents.
         cursor = db.folders(ctx).get(parent)
         while cursor is not None and not db.is_root(cursor):
-            self.touch_span(cursor["id"], created, modified)
+            self.touch_span(cursor["id"], created, modified, creator, self.uid[doc.modified_by_id])
             cursor = db.folders(ctx).get(cursor["_parent"]) if cursor.get("_parent") else None
         data = content.render_document(ctx, doc.id)
         blob = ctx.store.blobs.put(data)
@@ -411,18 +449,24 @@ class Seeder:
                 "download_count": 0,
                 "preview_count": 0,
                 "vanity_name": None,
-                "created_at": self.stamp(share.created or doc.created),
+                "created_at": self.stamp(max(share.created or doc.created, doc.created)),
                 "created_by": self.uid[doc.owner_id],
             }
         return None
 
     def finish_folder_times(self) -> None:
-        for fid, (created, modified) in self.span.items():
+        """A folder is never younger than its oldest file nor older than its newest one."""
+        for fid, (created, modified, creator, modifier) in self.span.items():
             folder = db.folders(self.ctx).get(fid)
             if folder is None:
                 continue
-            folder["created_at"] = folder["content_created_at"] = created
+            if created < folder["created_at"]:
+                folder["created_at"] = folder["content_created_at"] = created
+                if self.user_created(folder["created_by"]) > datetime.fromisoformat(created):
+                    folder["created_by"] = creator
+            modified = max(modified, folder["created_at"])
             folder["modified_at"] = folder["content_modified_at"] = modified
+            folder["modified_by"] = modifier if modified != folder["created_at"] else folder["created_by"]
 
     # -- collaborations ----------------------------------------------------------------
     def collab(
@@ -441,6 +485,12 @@ class Seeder:
         invite_email: str | None = None,
     ) -> Record:
         cid = self.number("collab", key, 10_000_000_000, 99_999_999_999)
+        floor = (
+            db.groups(self.ctx).get(target_id)["created_at"]  # type: ignore[index]
+            if target_type == "group"
+            else self.stamp(self.user_created(target_id) + timedelta(days=1))
+        )
+        created = max(created, floor)
         record = {
             "type": "collaboration",
             "id": cid,
@@ -514,6 +564,7 @@ class Seeder:
                 )
 
     def seed_shares(self) -> None:
+        spaces = {s.id: s for s in self.world.spaces}
         for doc in self.world.documents:
             file_id = self.file_of_doc[doc.id]
             inviter = self.uid[doc.owner_id]
@@ -521,11 +572,41 @@ class Seeder:
                 if share.link != "none" or not share.principal_id or share.principal_id not in self.uid:
                     continue
                 self.seed_share(doc, file_id, inviter, share)
+            self.seed_owner_access(doc, spaces[doc.space_id], file_id)
+
+    def is_space_member(self, space: Space, person_id: str) -> bool:
+        """Whether the team folder is shared with ``person_id`` the way :meth:`seed_space_collaborations` does."""
+        groups = {g.id: g for g in self.world.groups}
+        for principal, _role in space.members:
+            if principal == person_id and principal in self.uid:
+                return True
+            group = groups.get(principal)
+            if principal in self.gid and group is not None and person_id in group.member_ids:
+                return True
+        return person_id == space.owner_id and person_id in self.uid
+
+    def seed_owner_access(self, doc: Document, space: Space, file_id: str) -> None:
+        """A document keeps its owner's access even when the owner is not in the space.
+
+        Box files in a team folder belong to the folder's owner, so someone who authored a document in
+        a space they are not a member of (the world allows it) would lose sight of their own file; give
+        them an ``editor`` collaboration on just that file.
+        """
+        if doc.restricted or space.kind == "personal" or self.uid[doc.owner_id] == self.admin_uid:
+            return
+        if self.is_space_member(space, doc.owner_id):
+            return
+        if any(s.principal_id == doc.owner_id and s.link == "none" for s in doc.shares):
+            return
+        self.collab(
+            f"owner/{doc.id}", "file", file_id, "user", self.uid[doc.owner_id], "editor", self.admin_uid,
+            self.stamp(doc.created),
+        )  # fmt: skip
 
     def seed_share(self, doc: Document, file_id: str, inviter: str, share: Share) -> None:
         assert share.principal_id
         person = self.world.person(share.principal_id)
-        created = self.stamp(share.created or doc.created)
+        created = self.stamp(max(share.created or doc.created, doc.created))  # never before the file
         pending = (
             person.is_external
             and doc.modified_by_id != person.id

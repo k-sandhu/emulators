@@ -29,6 +29,15 @@ def resolve_user(ctx: ProviderContext, identifier: Any) -> Record:
     return user
 
 
+def whole_number(payload: dict[str, Any], name: str, default: int) -> int:
+    value = payload.get(name)
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise fail(400, f"{name} must be an integer")
+    return value
+
+
 def principal_for(ctx: ProviderContext, identifier: Any) -> Principal:
     user = resolve_user(ctx, identifier)
     return Principal(ctx, user, user)
@@ -41,12 +50,15 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
     def mint_token(ctx: ProviderContext, payload: dict[str, Any]) -> dict[str, Any]:
         """Mint a Box access token: ``{"user": "<box id|p-id|email>|enterprise", "expires_in": 3600, "refresh": false}``."""
         user = resolve_user(ctx, payload.get("user"))
+        client_id = payload.get("client_id") or "emulator-client"
+        if not isinstance(client_id, str):
+            raise fail(400, "client_id must be a string")
         body = oauth.issue_tokens(
             ctx,
             user,
-            payload.get("client_id", "emulator-client"),
+            client_id,
             refresh=bool(payload.get("refresh", False)),
-            ttl_seconds=int(payload.get("expires_in", oauth.ACCESS_TTL)),
+            ttl_seconds=whole_number(payload, "expires_in", oauth.ACCESS_TTL),
         )
         body["user_id"] = user["id"]
         return body
@@ -57,6 +69,8 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         keys = events.webhook_keys(ctx)
         for name in ("primary", "secondary"):
             if name in payload:
+                if payload[name] is not None and not isinstance(payload[name], str):
+                    raise fail(400, f"{name} must be a string")
                 keys[name] = payload[name] or ""
         return dict(keys)
 
@@ -65,7 +79,7 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         """Change the chunked-upload ``part_size`` (bytes) so tests can exercise multi-part uploads cheaply."""
         settings = ctx.store.meta.setdefault("settings", {})
         if "part_size" in payload:
-            size = int(payload["part_size"])
+            size = whole_number(payload, "part_size", 0)
             if size < 1:
                 raise fail(400, "part_size must be positive")
             settings["upload_part_size"] = size
@@ -81,7 +95,10 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         parent = p.get_item("folder", str(payload.get("parent_id", "0")), access.UPLOAD)
         name = validate_name(payload.get("name"))
         if "content_base64" in payload:
-            data = base64.b64decode(payload["content_base64"])
+            try:
+                data = base64.b64decode(str(payload["content_base64"]), validate=True)
+            except ValueError:
+                raise fail(400, "content_base64 is not valid base64") from None
         else:
             data = str(payload.get("content", "")).encode()
         existing = p.tree.find_by_name(parent["id"], name)
@@ -118,7 +135,9 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         from emulators.providers.box.shapes import Shaper
 
         source = Shaper(p).collaboration(collab)
-        await events.emit(p, "COLLAB_ACCEPT", None, source=source, kind="collaboration", webhook_item=item)
+        await events.emit(
+            p, "COLLABORATION_ACCEPT", None, source=source, kind="collaboration", webhook_item=item
+        )
         return {"status": collab["status"], "id": collab["id"]}
 
     @provider.action("expire_token")

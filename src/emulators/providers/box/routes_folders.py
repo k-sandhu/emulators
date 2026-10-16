@@ -2,28 +2,37 @@
 
 from __future__ import annotations
 
+import copy
 from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi.responses import Response
 
+from emulators.core.errors import EmulatorError
 from emulators.core.provider import ProviderContext
 from emulators.providers.box import access, db, errors, events, ops, shapes, sharing
 from emulators.providers.box.routing import Api, created, no_content
 from emulators.providers.box.shapes import FOLDER_ITEM_ORDER, Shaper
 from emulators.providers.box.util import (
+    MAX_OFFSET,
     json_body,
     now_iso,
+    opt_bool,
+    opt_str,
     page_window,
     paginate,
     parse_fields,
+    query_int,
     ref_id,
     require_str,
+    sanitize_name,
+    str_list,
     validate_name,
 )
 
 Record = dict[str, Any]
 SORTS = ("id", "name", "date", "size")
+SYNC_STATES = ("synced", "not_synced", "partially_synced")
 
 
 def register(app: FastAPI, ctx: ProviderContext) -> None:
@@ -44,6 +53,16 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         body = paginate(records, offset, limit, use_marker, order=order)
         body["entries"] = [shaper.item(r, fields, listing=True) for r in body["entries"]]
         return body
+
+    def collection_window(request: Request) -> tuple[int, int, str | None, str]:
+        """``offset``/``limit``/``sort``/``direction`` of ``GET /folders/{id}`` page its ``item_collection``."""
+        sort, direction = sort_params(request)
+        return (
+            query_int(request, "offset", 0, maximum=MAX_OFFSET),
+            query_int(request, "limit", 100, minimum=0, maximum=1000),
+            sort,
+            direction,
+        )
 
     def sort_params(request: Request) -> tuple[str | None, str]:
         sort = request.query_params.get("sort")
@@ -82,7 +101,9 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         inm = request.headers.get("if-none-match")
         if inm and not db.is_root(record) and inm.strip('"') == str(record["_seq"]):
             return Response(status_code=304)
-        return api.shaper(p, request).folder(record, parse_fields(request))
+        shaper = api.shaper(p, request)
+        shaper.item_window = collection_window(request)
+        return shaper.folder(record, parse_fields(request))
 
     @api.get("/folders/{folder_id}/items")
     async def folder_items(request: Request, folder_id: str) -> Any:
@@ -119,48 +140,81 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
             raise errors.forbidden()
         ops.check_if_match(request.headers, record)
         now = now_iso(ctx)
-        emitted: list[tuple[str, Record | None]] = []
-        if "name" in body and body["name"] != record["name"]:
-            p.require(record, access.RENAME)
-            name = validate_name(body["name"])
-            ops.ensure_name_free(p, record["_parent"], name, ignore=record["id"])
-            record["name"] = name
-            emitted.append(("ITEM_RENAME", None))
+        # See update_file: refusable work first, the record restored on a rejection, the move last.
+        new_parent = None
         if isinstance(body.get("parent"), dict) and "id" in body["parent"]:
             new_parent = p.get_item("folder", str(body["parent"]["id"]), access.UPLOAD)
-            if new_parent["id"] != record["_parent"]:
+        if "collections" in body:
+            ops.check_collections(p, body["collections"])
+        hides_collaborators = "can_non_owners_view_collaborators" in body and not opt_bool(
+            body, "can_non_owners_view_collaborators", True
+        )
+        # Box: hiding collaborators from non-owners requires that they cannot invite either.
+        if hides_collaborators and opt_bool(
+            body, "can_non_owners_invite", record.get("can_non_owners_invite", True)
+        ):
+            raise errors.invalid_parameter(
+                "can_non_owners_view_collaborators",
+                "Set can_non_owners_invite to false as well before hiding collaborators",
+            )
+        backup = copy.deepcopy(record)
+        renamed = moved = False
+        link_event: str | None = None
+        touched = False
+        try:
+            for key in (
+                "description",
+                "can_non_owners_invite",
+                "can_non_owners_view_collaborators",
+                "is_collaboration_restricted_to_enterprise",
+                "sync_state",
+            ):
+                if key in body:
+                    p.require(record, access.RENAME)
+                    if key == "description":
+                        record[key] = opt_str(body, key)
+                        touched = True
+                    elif key == "sync_state":
+                        if body[key] not in SYNC_STATES:
+                            raise errors.invalid_parameter(
+                                key, f"'{key}' must be one of {', '.join(SYNC_STATES)}"
+                            )
+                        record[key] = body[key]
+                    else:
+                        record[key] = opt_bool(body, key, key != "is_collaboration_restricted_to_enterprise")
+            if "tags" in body:
+                p.require(record, access.RENAME)
+                record["tags"] = str_list(body["tags"], "tags")
+                touched = True
+            if "folder_upload_email" in body:
+                p.require(record, access.RENAME)
+                record["folder_upload_email"] = upload_email(record, body["folder_upload_email"])
+                touched = True
+            if "shared_link" in body:
+                link_event = sharing.apply_shared_link(p, record, body["shared_link"], now)
+            if "name" in body and body["name"] != record["name"]:
+                p.require(record, access.RENAME)
+                name = validate_name(body["name"])
+                ops.ensure_name_free(p, record["_parent"], name, ignore=record["id"])
+                record["name"] = name
+                renamed = True
+            if new_parent is not None and new_parent["id"] != record["_parent"]:
                 p.require(record, access.RENAME)
                 ops.move(p, record, new_parent, now)
-                emitted.append(("ITEM_MOVE", None))
-        for key in (
-            "description",
-            "can_non_owners_invite",
-            "can_non_owners_view_collaborators",
-            "is_collaboration_restricted_to_enterprise",
-            "sync_state",
-        ):
-            if key in body:
-                p.require(record, access.RENAME)
-                if key == "description" and not isinstance(body[key], str):
-                    raise errors.invalid_parameter("description")
-                record[key] = body[key]
-        if "tags" in body:
-            p.require(record, access.RENAME)
-            record["tags"] = [str(t) for t in (body["tags"] or [])]
-        if "folder_upload_email" in body:
-            p.require(record, access.RENAME)
-            record["folder_upload_email"] = upload_email(record, body["folder_upload_email"])
+                moved = True
+        except EmulatorError:
+            record.clear()
+            record.update(backup)
+            p.invalidate()
+            raise
         if "collections" in body:
             ops.set_collections(p, record, body["collections"])
-        if "shared_link" in body:
-            event_type = sharing.apply_shared_link(p, record, body["shared_link"], now)
-            if event_type:
-                emitted.append((event_type, None))
-        if emitted or any(k in body for k in ("description", "tags", "folder_upload_email")):
+        if renamed or moved or link_event or touched:
             ops.touch(record, p, now)
             p.invalidate()
-        for event_type, _ in emitted:
-            await events.emit(p, event_type, record)
+        for event_type in ("ITEM_RENAME" if renamed else None, "ITEM_MOVE" if moved else None, link_event):
+            if event_type:
+                await events.emit(p, event_type, record)
         return api.shaper(p, request).folder(record, parse_fields(request))
 
     # -- delete --------------------------------------------------------------------------
@@ -187,7 +241,7 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         if db.is_root(source):
             raise errors.forbidden()
         parent = p.get_item("folder", ref_id(body, "parent"), access.UPLOAD)
-        name = validate_name(body["name"]) if body.get("name") is not None else None
+        name = sanitize_name(body["name"]) if body.get("name") is not None else None
         record = ops.copy_folder(p, source, parent, name, now_iso(ctx))
         await events.emit(p, "ITEM_COPY", record)
         return created(api.shaper(p, request).folder(record, parse_fields(request)))

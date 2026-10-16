@@ -191,7 +191,9 @@ async def test_update_rename_description_move_and_conflicts(box):
     assert r.json()["name"] == "a-renamed.txt" and r.json()["description"] == "Hello"
     assert r.json()["etag"] == "1"
     assert (await box.put(f"/files/{first}", json={"name": "b.txt"})).status_code == 409
-    assert (await box.put(f"/files/{first}", json={"description": "x" * 257})).status_code == 400
+    # Box keeps the first 255 characters of a longer description instead of refusing it
+    long = await box.put(f"/files/{first}", json={"description": "x" * 400}, params={"fields": "description"})
+    assert long.status_code == 200 and long.json()["description"] == "x" * 255
     assert (await box.put(f"/files/{first}", json={"name": "bad/name"})).status_code == 400
     moved = await box.put(f"/files/{first}", json={"parent": {"id": other}})
     assert moved.json()["parent"]["id"] == other

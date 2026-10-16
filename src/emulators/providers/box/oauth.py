@@ -96,7 +96,7 @@ def resolve_subject(ctx: ProviderContext, subject_type: str | None, subject_id: 
         return service_account(ctx)
     if subject_type == "user":
         user = db.users(ctx).get(subject_id or "") if subject_id else None
-        if user is None or user.get("_kind") in ("external", "service") or user.get("status") != "active":
+        if user is None or user.get("_kind") in ("external", "service") or not db.is_active(user):
             raise OAuthError("invalid_grant", "Grant credentials are invalid")
         return user
     raise OAuthError("invalid_request", "Invalid box_subject_type.")
@@ -119,6 +119,9 @@ def exchange_token(ctx: ProviderContext, form: dict[str, str]) -> dict[str, Any]
     user = db.users(ctx).get(grant.user_id or "")
     if user is None:
         raise OAuthError("invalid_grant", "The subject token is invalid or has expired")
+    if grant.extra.get("restricted_to"):
+        # Re-exchanging a downscoped token could widen it again, so only full tokens can be exchanged.
+        raise OAuthError("invalid_grant", "The subject token is already downscoped")
     scopes = [s for s in (form.get("scope") or "").split() if s]
     if not scopes:
         raise OAuthError("invalid_request", "The scope parameter is required")
@@ -230,7 +233,7 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         hint = q.get("login_hint")
         if hint:
             user = access.lookup_user(ctx, hint)
-            if user is None or user.get("status") != "active" or user.get("_kind") == "service":
+            if user is None or not db.is_active(user) or user.get("_kind") == "service":
                 return fail("access_denied", "The user could not be authenticated")
             code = ctx.tokens.issue_code(
                 client_id=client_id,
@@ -246,7 +249,7 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         accounts = [
             {"display_name": u["name"], "email": u["login"], "login_hint": u["login"]}
             for u in db.users(ctx)
-            if u.get("status") == "active" and u.get("_kind") in ("managed", "external")
+            if db.is_active(u) and u.get("_kind") in ("managed", "external")
         ]
         client = ctx.tokens.client(client_id) or {}
         return HTMLResponse(
@@ -281,9 +284,6 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
             sibling = grant.extra.get("access") or grant.extra.get("refresh")
             if sibling:
                 ctx.tokens.revoke(sibling)
-            owner = db.users(ctx).get(grant.user_id or "")
-            if owner is not None and grant.kind == "access":
-                audit(ctx, "OAUTH2_ACCESS_TOKEN_REVOKE", owner)
         return Response(status_code=200)
 
 
@@ -317,6 +317,7 @@ def handle_grant(ctx: ProviderContext, grant_type: str | None, form: dict[str, s
         if user is None:
             raise OAuthError("invalid_grant", "Auth code doesn't exist or is invalid for the client")
         audit(ctx, "LOGIN", user)
+        audit(ctx, "USER_AUTHENTICATE_OAUTH2_ACCESS_TOKEN_CREATE", user)
         return issue_tokens(ctx, user, client["id"], refresh=True, scopes=redeemed.scopes)
     if grant_type == "refresh_token":
         client = ctx.tokens.authenticate_client(client_id, form.get("client_secret"))
@@ -324,13 +325,13 @@ def handle_grant(ctx: ProviderContext, grant_type: str | None, form: dict[str, s
         if refresh is None:
             raise OAuthError("invalid_grant", "Refresh token has expired")
         user = db.users(ctx).get(refresh.user_id or "")
-        if user is None or user.get("status") != "active":
+        if user is None or not db.is_active(user):
             raise OAuthError("invalid_grant", "Refresh token has expired")
         ctx.tokens.revoke(refresh.token)  # refresh tokens are single use and rotate
         old_access = refresh.extra.get("access")
         if old_access:
             ctx.tokens.revoke(old_access)
-        audit(ctx, "USER_AUTHENTICATE_OAUTH2_TOKEN_REFRESH", user)
+        audit(ctx, "USER_AUTHENTICATE_OAUTH2_ACCESS_TOKEN_CREATE", user)
         return issue_tokens(ctx, user, client["id"], refresh=True, scopes=refresh.scopes)
     if grant_type == "client_credentials":
         client = ctx.tokens.authenticate_client(client_id, form.get("client_secret"))

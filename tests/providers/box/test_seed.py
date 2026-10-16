@@ -139,7 +139,7 @@ async def test_shared_links_and_link_shares_from_the_world(box):
 
 
 async def test_external_client_contacts(box):
-    externals = (await box.get("/users", params={"user_type": "external", "limit": 1000})).json()["entries"]
+    externals = await box.externals()
     assert len(externals) == 22
     ingram = next(e for e in externals if e["login"] == "christopher.ingram@northwindlogistics.example")
     full = (await box.get(f"/users/{ingram['id']}")).json()

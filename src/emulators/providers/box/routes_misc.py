@@ -20,6 +20,7 @@ from emulators.providers.box.util import (
     decode_marker,
     encode_marker,
     json_body,
+    opt_str,
     page_window,
     paginate,
     parse_fields,
@@ -145,26 +146,43 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
             raise errors.invalid_parameter("items", f"At most {MAX_ZIP_ITEMS} items may be requested")
         entries: list[tuple[str, Record]] = []
         for ref in items:
-            record = p.get_item(ref.get("type", ""), str(ref.get("id", "")), access.DOWNLOAD)
-            collect(p, record, "", entries)
-        names: dict[str, int] = {}
-        files: list[dict[str, str]] = []
-        conflicts: list[list[dict[str, str]]] = []
-        for path, record in entries:
-            seen = names.get(path.lower(), 0)
-            names[path.lower()] = seen + 1
-            download = path if seen == 0 else _dedupe(path, seen)
-            files.append({"path": download, "file_id": record["id"]})
-            if seen:
-                conflicts.append(
-                    [{"id": record["id"], "type": "file", "original_name": path, "download_name": download}]
+            if not isinstance(ref, dict) or ref.get("type") not in ("file", "folder") or not ref.get("id"):
+                raise errors.invalid_parameter(
+                    "items", "Each item needs a 'type' (file or folder) and an 'id'"
                 )
+            record = p.get_item(ref["type"], str(ref["id"]), access.DOWNLOAD)
+            collect(p, record, "", entries)
+        # Items that share a path are *all* renamed (``name (1).ext``, ``name (2).ext``...) and reported
+        # together, so a conflict always lists at least two items.
+        groups: dict[str, list[tuple[str, Record]]] = {}
+        for path, record in entries:
+            groups.setdefault(path.lower(), []).append((path, record))
+        downloads: dict[str, str] = {}
+        conflicts: list[list[dict[str, str]]] = []
+        for members in groups.values():
+            if len(members) < 2:
+                continue
+            conflict = []
+            for number, (path, record) in enumerate(members, start=1):
+                downloads[record["id"]] = _dedupe(path, number)
+                conflict.append(
+                    {
+                        "id": record["id"],
+                        "type": "file",
+                        "original_name": path.rsplit("/", 1)[-1],
+                        "download_name": downloads[record["id"]].rsplit("/", 1)[-1],
+                    }
+                )
+            conflicts.append(conflict)
+        files = [
+            {"path": downloads.get(record["id"], path), "file_id": record["id"]} for path, record in entries
+        ]
         zid = random_alnum(24)
         ctx.store.collection(db.ZIPS).put(
             {
                 "id": zid,
                 "files": files,
-                "name": body.get("download_file_name") or "Download",
+                "name": opt_str(body, "download_file_name", "") or "Download",
                 "expires_at": to_iso(ctx.clock.now() + ZIP_TTL),
                 "created_by": p.uid,
             }

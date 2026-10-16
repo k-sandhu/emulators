@@ -412,17 +412,25 @@ def user_collections(ctx: ProviderContext, user_id: str) -> list[Record]:
     return [c for c in ctx.store.collection(db.COLLECTIONS) if c["user_id"] == user_id]
 
 
-def set_collections(p: Principal, record: Record, value: Any) -> None:
-    """``collections: [{"id": ...}]`` on an item update: adds to listed, removes from unlisted."""
+def check_collections(p: Principal, value: Any) -> set[str]:
+    """The collection ids a ``collections`` update names; 400/404 like Box when it is malformed or unknown."""
     if value is None:
         value = []
     if not isinstance(value, list):
         raise errors.invalid_parameter("collections", "'collections' must be an array")
-    wanted = {str(c.get("id")) for c in value if isinstance(c, dict)}
-    mine = user_collections(p.ctx, p.uid)
-    unknown = wanted - {c["id"] for c in mine}
+    if not all(isinstance(c, dict) for c in value):
+        raise errors.invalid_parameter("collections", "'collections' must be an array of {id} objects")
+    wanted = {str(c.get("id")) for c in value}
+    unknown = wanted - {c["id"] for c in user_collections(p.ctx, p.uid)}
     if unknown:
         raise errors.not_found("Collection not found")
+    return wanted
+
+
+def set_collections(p: Principal, record: Record, value: Any) -> None:
+    """``collections: [{"id": ...}]`` on an item update: adds to listed, removes from unlisted."""
+    wanted = check_collections(p, value)
+    mine = user_collections(p.ctx, p.uid)
     for coll in mine:
         items = coll["items"].setdefault(record["type"], [])
         if coll["id"] in wanted and record["id"] not in items:

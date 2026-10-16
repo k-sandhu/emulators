@@ -211,8 +211,43 @@ class Principal:
         self._caps[key] = result
         return result
 
+    def invites_blocked(self, record: Record) -> bool:
+        """``can_non_owners_invite: false`` on the item's folder (or an ancestor) leaves invitations
+        to the owner and co-owners."""
+        chain = [record, *tree.ancestors(self.ctx, record)]
+        if not any(f["type"] == "folder" and f.get("can_non_owners_invite") is False for f in chain):
+            return False
+        return self.role(record) not in ("owner", "co-owner")
+
+    def can_view_path(self, record: Record) -> bool:
+        """A collaboration with ``can_view_path`` on the item or an ancestor reveals the full parent path."""
+        for item in [record, *tree.ancestors(self.ctx, record)]:
+            if any(c.get("can_view_path") for c in self._collab_index().get((item["type"], item["id"]), [])):
+                return True
+        return False
+
+    def collaborators_hidden(self, record: Record) -> bool:
+        """``can_non_owners_view_collaborators: false`` hides the collaborator list from non-owners."""
+        chain = [record, *tree.ancestors(self.ctx, record)]
+        if not any(
+            f["type"] == "folder" and f.get("can_non_owners_view_collaborators") is False for f in chain
+        ):
+            return False
+        return self.role(record) not in ("owner", "co-owner")
+
     def caps(self, record: Record) -> frozenset[str]:
         caps = self.raw_caps(record)
+        if INVITE in caps and self.invites_blocked(record):
+            caps = caps - {INVITE}
+        if (
+            DOWNLOAD in caps
+            and record.get("download_scope") == "company"
+            and self.user.get("_kind") == "external"
+        ):
+            caps = caps - {DOWNLOAD}  # permissions.can_download = company: no downloads for outsiders
+        barred = db.RESTRICTED_STATUSES.get(str(self.user.get("status")))
+        if barred:
+            caps = caps - set(barred)
         if not self.restricted_to or not caps:
             return caps
         allowed: set[str] = set()
@@ -305,6 +340,34 @@ class Principal:
         if not self.is_privileged:
             raise errors.forbidden()
 
+    def is_group_admin(self, group_id: str) -> bool:
+        return any(
+            m["group_id"] == group_id and m["user_id"] == self.uid and m["role"] == "admin"
+            for m in db.memberships(self.ctx)
+        )
+
+    def _group_audience(self, group_id: str, level: str) -> bool:
+        """Box's three audience levels: admins (enterprise and group), plus members, plus all managed users."""
+        if self.is_privileged or self.is_group_admin(group_id):
+            return True
+        if level == "admins_and_members":
+            return group_id in self.groups
+        return level == "all_managed_users" and self.user.get("_kind") == "managed"
+
+    def can_invite_group(self, group: Record) -> bool:
+        return self._group_audience(group["id"], group.get("invitability_level", "admins_and_members"))
+
+    def can_view_members(self, group: Record) -> bool:
+        return self._group_audience(group["id"], group.get("member_viewability_level", "admins_and_members"))
+
+    def can_manage_user(self, target: Record) -> bool:
+        """Admins and the service account manage anyone; co-admins manage ordinary users (and themselves)."""
+        if self.is_admin or self.user.get("_kind") == "service":
+            return True
+        if not self.is_privileged:
+            return False
+        return target["id"] == self.uid or target.get("role", "user") == "user"
+
     def can_see_user(self, other: Record) -> bool:
         """Managed users see each other; outsiders only through a collaboration; admins see everyone."""
         if self.is_privileged or other["id"] == self.uid:
@@ -341,8 +404,11 @@ def parse_boxapi(request: Request) -> tuple[str, str | None] | None:
 
 def find_shared_link(ctx: ProviderContext, url: str) -> Record | None:
     """The file/folder whose shared link matches ``url`` (``/s/<hash>`` or a vanity ``/v/<name>``)."""
-    path = urlsplit(url).path.rstrip("/")
-    token = path.rsplit("/", 1)[-1]
+    segments = [part for part in urlsplit(url).path.split("/") if part]
+    # ``/s/<hash>`` or ``/v/<vanity>``, possibly followed by ``/file/<id>`` or ``/folder/<id>`` (as in the web app)
+    anchor = next((i for i, part in enumerate(segments) if part in ("s", "v")), None)
+    token = segments[anchor + 1] if anchor is not None and anchor + 1 < len(segments) else None
+    token = token or (segments[-1] if segments else None)
     if not token:
         return None
     for collection in (db.files(ctx), db.folders(ctx)):
@@ -395,7 +461,7 @@ def authenticate(request: Request, ctx: ProviderContext, *, allow_anonymous: boo
             raise errors.unauthorized_missing()
         return Principal(ctx, dict(ANONYMOUS), dict(ANONYMOUS), links=[link])
     actor = db.users(ctx).get(grant.user_id) if grant.user_id else None
-    if actor is None or actor.get("status") != "active":
+    if actor is None or not db.is_active(actor):
         raise errors.unauthorized()
     user = actor
     target_id = request.headers.get("as-user")
@@ -405,7 +471,7 @@ def authenticate(request: Request, ctx: ProviderContext, *, allow_anonymous: boo
         target = db.users(ctx).get(target_id.strip())
         if target is None or target.get("_kind") == "external":
             raise errors.not_found()
-        if target.get("status") != "active":
+        if not db.is_active(target):
             raise errors.forbidden()
         user = target
     principal = Principal(

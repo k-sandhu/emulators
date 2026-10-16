@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from fastapi import FastAPI, Request
 
 from emulators.core.clock import utc
 from emulators.core.provider import ProviderContext
-from emulators.providers.box import access, db, errors, events, ops
+from emulators.providers.box import access, db, errors, events, ops, tree
 from emulators.providers.box.access import Principal
 from emulators.providers.box.routing import Api, created, no_content
 from emulators.providers.box.util import (
@@ -17,6 +18,7 @@ from emulators.providers.box.util import (
     json_body,
     next_id,
     now_iso,
+    opt_bool,
     page_window,
     paginate,
     parse_fields,
@@ -25,6 +27,7 @@ from emulators.providers.box.util import (
 )
 
 Record = dict[str, Any]
+EMAIL = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
 FILE_ROLES = ("editor", "viewer", "previewer", "co-owner")
 FOLDER_ROLES = access.ROLES
 
@@ -51,10 +54,17 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         return collab, item
 
     async def emit_collab(
-        request: Request, p: Principal, event_type: str, collab: Record, item: Record
+        request: Request,
+        p: Principal,
+        event_type: str,
+        collab: Record,
+        item: Record,
+        trigger: str | None = None,
     ) -> None:
         source = api.shaper(p, request).collaboration(collab)
-        await events.emit(p, event_type, None, source=source, kind="collaboration", webhook_item=item)
+        await events.emit(
+            p, event_type, None, source=source, kind="collaboration", webhook_item=item, trigger=trigger
+        )
 
     # -- create --------------------------------------------------------------------------
     @api.post("/collaborations")
@@ -74,7 +84,14 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         role = body.get("role")
         if not role:
             raise errors.missing_parameter("role")
+        if not isinstance(role, str):
+            raise errors.invalid_parameter("role", "'role' must be a string")
         record = p.get_item(target["type"], str(target["id"]), access.INVITE)
+        view_path = opt_bool(body, "can_view_path")
+        if view_path and record["type"] != "folder":
+            raise errors.invalid_parameter("can_view_path", "'can_view_path' can only be used on folders")
+        if view_path and p.role(record) not in ("owner", "co-owner"):
+            raise errors.forbidden("Only an owner or co-owner can invite with can_view_path")
         if db.is_root(record):
             raise errors.bad_request(
                 "Cannot add collaborators to the root folder", reason="invalid_parameter", name="item"
@@ -91,12 +108,13 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
                 raise errors.invalid_parameter("expires_at", "'expires_at' must be in the future")
         now = now_iso(ctx)
         invite_email: str | None = None
+        by_login = False
         status = "accepted"
         if by["type"] == "group":
             group = db.groups(ctx).get(str(by.get("id", "")))
             if group is None:
                 raise errors.not_found("Group not found")
-            if not p.is_privileged and group["invitability_level"] == "admins_only":
+            if not p.can_invite_group(group):
                 raise errors.forbidden()
             accessible_id = group["id"]
         else:
@@ -106,13 +124,20 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
                 if user is None:
                     raise errors.not_found("User not found")
             elif by.get("login"):
-                user = db.user_by_login(ctx, by["login"])
+                login = by["login"]
+                if not isinstance(login, str) or not EMAIL.fullmatch(login.strip()):
+                    raise errors.invalid_parameter(
+                        "accessible_by.login", "'login' must be the e-mail address of a Box user"
+                    )
+                login = login.strip()
+                user = db.user_by_login(ctx, login)
                 if user is None:
-                    user = ops.create_external_user(ctx, by["login"], now)
-                    status, invite_email = "pending", by["login"]
+                    user = ops.create_external_user(ctx, login, now)
+                    status, invite_email = "pending", login
+                    by_login = True
             else:
                 raise errors.missing_parameter("accessible_by.id")
-            if user.get("status") != "active":
+            if not db.is_active(user):
                 raise errors.bad_request(
                     "The user is not active", reason="invalid_parameter", name="accessible_by"
                 )
@@ -126,8 +151,14 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
                 owner = db.users(ctx).get(record["_owner"]) or {}
                 if p.user.get("is_external_collab_restricted") or owner.get("is_external_collab_restricted"):
                     raise errors.forbidden("External collaboration is restricted")
+                if any(
+                    f.get("is_collaboration_restricted_to_enterprise")
+                    for f in [record, *tree.ancestors(ctx, record)]
+                ):
+                    raise errors.forbidden("Collaboration is restricted to the enterprise on this folder")
                 if status != "pending":
                     status, invite_email = "pending", user["login"]
+                    by_login = bool(by.get("login"))
             accessible_id = user["id"]
         if any(
             c["item_type"] == record["type"] and c["item_id"] == record["id"]
@@ -144,7 +175,8 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
             "accessible_type": by["type"], "accessible_id": accessible_id, "role": role, "status": status,
             "created_by": p.uid, "created_at": now, "modified_at": now, "expires_at": expires,
             "invite_email": invite_email, "acknowledged_at": now if status == "accepted" else None,
-            "is_access_only": bool(body.get("is_access_only", False)),
+            "is_access_only": opt_bool(body, "is_access_only"), "can_view_path": view_path,
+            "_by_login": by_login,
         }  # fmt: skip
         db.collabs(ctx).put(collab)
         p.invalidate()
@@ -182,12 +214,14 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
             if body["status"] == "rejected":
                 db.collabs(ctx).delete(collab["id"])
                 p.invalidate()
-                await emit_collab(request, p, "COLLAB_REJECT", collab, item)
+                await emit_collab(
+                    request, p, "COLLAB_REMOVE_COLLABORATOR", collab, item, trigger="COLLABORATION.REJECTED"
+                )
                 return no_content()
             if collab["status"] == "pending" and body["status"] == "accepted":
                 collab["status"] = "accepted"
                 collab["acknowledged_at"] = now_iso(ctx)
-                event_type = "COLLAB_ACCEPT"
+                event_type = "COLLABORATION_ACCEPT"
         if "role" in body:
             if not manager:
                 raise errors.forbidden()
@@ -208,7 +242,12 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
                 raise errors.forbidden()
             collab["expires_at"] = input_ts(body["expires_at"], "expires_at") if body["expires_at"] else None
         if "can_view_path" in body:
-            collab["can_view_path"] = bool(body["can_view_path"])
+            view_path = opt_bool(body, "can_view_path")
+            if view_path and item["type"] != "folder":
+                raise errors.invalid_parameter("can_view_path", "'can_view_path' can only be used on folders")
+            if view_path and p.role(item) not in ("owner", "co-owner"):
+                raise errors.forbidden("Only an owner or co-owner can invite with can_view_path")
+            collab["can_view_path"] = view_path
         collab["modified_at"] = now_iso(ctx)
         p.invalidate()
         await emit_collab(request, p, event_type, collab, item)
@@ -239,7 +278,7 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
             for c in db.collabs(ctx)
             if c["status"] == "pending" and c["accessible_type"] == "user" and c["accessible_id"] == p.uid
         ]
-        offset = query_int(request, "offset", 0)
+        offset = query_int(request, "offset", 0, maximum=10_000)
         limit = query_int(request, "limit", 100, maximum=1000)
         shaper = api.shaper(p, request)
         fields = parse_fields(request)
@@ -267,7 +306,7 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
     async def folder_collaborations(request: Request, folder_id: str) -> Any:
         p = api.principal(request)
         item = p.get_item("folder", folder_id)
-        if access.PREVIEW not in p.caps(item):
+        if access.PREVIEW not in p.caps(item) or p.collaborators_hidden(item):
             raise errors.forbidden()
         return listing(p, request, item)
 
@@ -275,7 +314,7 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
     async def file_collaborations(request: Request, file_id: str) -> Any:
         p = api.principal(request)
         item = p.get_item("file", file_id)
-        if access.PREVIEW not in p.caps(item):
+        if access.PREVIEW not in p.caps(item) or p.collaborators_hidden(item):
             raise errors.forbidden()
         return listing(p, request, item)
 

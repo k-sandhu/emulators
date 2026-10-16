@@ -55,7 +55,13 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
                 raise errors.invalid_parameter("triggers", f"Invalid trigger '{unknown[0]}'")
 
     def visible(p: Principal, webhook: Record) -> bool:
-        return webhook["created_by"] == p.uid or p.is_privileged
+        """Box lists the webhooks on items the caller can reach (an admin does not see a service
+        account's webhooks unless the admin has access to those folders)."""
+        if webhook["created_by"] == p.uid:
+            return True
+        target = webhook["target"]
+        record = None if target["id"] == db.ROOT_WIRE_ID else db.item(ctx, target["type"], target["id"])
+        return record is not None and p.visible(record)
 
     def webhook_or_404(p: Principal, webhook_id: str) -> Record:
         webhook = webhooks.get(webhook_id)

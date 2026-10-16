@@ -311,20 +311,20 @@ async def test_zip_download_of_files_and_folders(box):
     body = r.json()
     assert body["download_url"].startswith("https://dl.boxcloud.com/2.0/zip_downloads/")
     assert body["status_url"].startswith("https://api.box.com/2.0/zip_downloads/") and body["expires_at"]
-    conflict = body["name_conflicts"][0][0]
-    assert (
-        conflict["original_name"] == "a.txt"
-        and conflict["download_name"] == "a (1).txt"
-        and conflict["id"] == twin
-    )
+    # Box renames *both* items that share a name and reports them together (a multiple of two entries).
+    (conflict,) = body["name_conflicts"]
+    assert [(c["id"], c["original_name"], c["download_name"]) for c in conflict] == [
+        (loose, "a.txt", "a (1).txt"),
+        (twin, "a.txt", "a (2).txt"),
+    ]
     status = (await box.client.get(body["status_url"], headers=box.auth())).json()
     assert status["state"] == "succeeded" and status["total_file_count"] == 4
     archive = await box.client.get(body["download_url"])
     assert archive.status_code == 200 and archive.headers["content-type"] == "application/zip"
     with zipfile.ZipFile(io.BytesIO(archive.content)) as z:
-        assert sorted(z.namelist()) == ["Bundle/Inner/b.txt", "Bundle/a.txt", "a (1).txt", "a.txt"]
-        assert z.read("Bundle/a.txt") == b"alpha" and z.read("a.txt") == b"loose alpha"
-        assert z.read("a (1).txt") == b"twin alpha"
+        assert sorted(z.namelist()) == ["Bundle/Inner/b.txt", "Bundle/a.txt", "a (1).txt", "a (2).txt"]
+        assert z.read("Bundle/a.txt") == b"alpha" and z.read("a (1).txt") == b"loose alpha"
+        assert z.read("a (2).txt") == b"twin alpha"
     assert (await box.post("/zip_downloads", json={"items": []})).status_code == 400
     denied = await box.post("/zip_downloads", "p044", json={"items": [{"type": "file", "id": loose}]})
     assert denied.status_code == 404

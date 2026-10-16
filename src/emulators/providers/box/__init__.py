@@ -13,8 +13,10 @@ from typing import Any
 
 from fastapi import FastAPI
 
+from emulators.core.middleware import FaultRule
 from emulators.core.provider import Provider, ProviderContext
 from emulators.providers.box import errors
+from emulators.providers.box.middleware import BoxResponseMiddleware
 
 MODULES = (
     "oauth",  # account.box.com authorize, api.box.com /oauth2/token + revoke
@@ -91,12 +93,27 @@ class BoxProvider(Provider):
             return {"WWW-Authenticate": errors.WWW_AUTHENTICATE}
         return {}
 
+    def fault_response(
+        self, rule: FaultRule, scope: dict[str, Any] | None = None
+    ) -> tuple[int, dict[str, str], bytes]:
+        """Injected faults answer outside the app, so they stamp ``Box-Request-Id`` themselves."""
+        rid = errors.new_request_id()
+        token = errors.CURRENT_REQUEST_ID.set(rid)
+        try:
+            status, headers, body = super().fault_response(rule, scope)
+        finally:
+            errors.CURRENT_REQUEST_ID.reset(token)
+        if not any(name.lower() == "box-request-id" for name in headers):
+            headers["Box-Request-Id"] = rid
+        return status, headers, body
+
     def seed(self, ctx: ProviderContext) -> None:
         from emulators.providers.box import seed
 
         seed.seed(ctx)
 
     def build(self, app: FastAPI, ctx: ProviderContext) -> None:
+        app.add_middleware(BoxResponseMiddleware)
         for module in _modules():
             if hasattr(module, "register"):
                 module.register(app, ctx)

@@ -143,10 +143,7 @@ async def test_restricted_documents_live_in_a_private_folder_of_their_owner(box)
 
 
 async def test_clients_see_only_files_shared_with_them(box):
-    clients = [
-        u
-        for u in (await box.get("/users", params={"user_type": "external", "limit": 1000})).json()["entries"]
-    ]
+    clients = await box.externals()
     ingram = next(u for u in clients if u["login"] == "christopher.ingram@northwindlogistics.example")
     token = (await box.action("mint_token", {"user": ingram["id"]}))["access_token"]
     root = await box.items("0", token)
@@ -167,7 +164,7 @@ async def test_clients_see_only_files_shared_with_them(box):
 
 
 async def test_pending_invitations_grant_nothing_until_accepted_and_expiry_revokes_access(box):
-    clients = (await box.get("/users", params={"user_type": "external", "limit": 1000})).json()["entries"]
+    clients = await box.externals()
     pending = None
     for user in clients:
         token = (await box.action("mint_token", {"user": user["id"]}))["access_token"]

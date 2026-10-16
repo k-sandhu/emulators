@@ -78,8 +78,10 @@ async def test_event_types_for_common_operations(box):
         e["event_type"] for e in (await events_since(box, start, stream_type="changes", limit=500))["entries"]
     ]
     assert "ITEM_DOWNLOAD" not in changes and "ITEM_MOVE" in changes
-    filtered = await events_since(box, start, event_type="ITEM_RENAME,ITEM_MOVE")
-    assert [e["event_type"] for e in filtered["entries"]] == ["ITEM_RENAME", "ITEM_MOVE"]
+    ignored = await events_since(box, start, event_type="ITEM_RENAME,ITEM_MOVE")
+    assert [e["event_type"] for e in ignored["entries"]] == got  # the user streams ignore ``event_type``
+    filtered = await events_since(box, start, stream_type="admin_logs", event_type="RENAME,MOVE")
+    assert [e["event_type"] for e in filtered["entries"]] == ["RENAME", "MOVE"]
     limited = await events_since(box, start, limit=2)
     assert limited["chunk_size"] == 2
     rest = await events_since(box, limited["next_stream_position"], limit=500)
@@ -122,9 +124,8 @@ async def test_admin_logs_are_enterprise_wide_and_privileged(box):
     folder = await box.find("Notes", "p018")
     await box.upload(folder, "private.txt", b"x", "p018")
     logs = await events_since(box, start, stream_type="admin_logs")
-    assert [e["event_type"] for e in logs["entries"]] == [
-        "ITEM_UPLOAD"
-    ]  # personal folders are visible in the audit log
+    # personal folders are visible in the audit log, which names file activity the enterprise way
+    assert [e["event_type"] for e in logs["entries"]] == ["UPLOAD"]
     assert (
         await box.get("/events", "p036", params={"stream_type": "admin_logs", "stream_position": start})
     ).status_code == 200
@@ -132,11 +133,18 @@ async def test_admin_logs_are_enterprise_wide_and_privileged(box):
         box,
         "0",
         stream_type="admin_logs",
-        event_type="ITEM_UPLOAD",
+        event_type="UPLOAD",
         created_after=marker,
         created_before="2999-01-01T00:00:00Z",
     )
     assert [e["source"]["name"] for e in window["entries"]] == ["private.txt"]
+    legacy = await events_since(
+        box, "0", stream_type="admin_logs", event_type="ITEM_UPLOAD", created_after=marker
+    )
+    assert [e["event_type"] for e in legacy["entries"]] == ["UPLOAD"]  # the per-user name filters too
+    # Box ignores ``event_type`` on the per-user streams: only admin_logs can be filtered by it
+    user_stream = await events_since(box, "0", "p018", event_type="UPLOAD", limit=500)
+    assert {"ITEM_UPLOAD", "ITEM_CREATE"} <= {e["event_type"] for e in user_stream["entries"]}
     assert (await events_since(box, "0", stream_type="admin_logs", created_before="2000-01-01T00:00:00Z"))[
         "entries"
     ] == []

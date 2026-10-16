@@ -142,6 +142,8 @@ def query_list(request: Request, name: str) -> list[str]:
     return values
 
 
+#: Box rejects offsets beyond this with a 400 (clients must switch to marker pagination).
+MAX_OFFSET = 10_000
 MARKER_PREFIX = "box-marker:"
 
 
@@ -167,7 +169,7 @@ def page_window(request: Request, *, default_limit: int, max_limit: int) -> tupl
     use_marker = query_bool(request, "usemarker")
     if use_marker:
         return decode_marker(request.query_params.get("marker")), limit, True
-    return query_int(request, "offset", 0), limit, False
+    return query_int(request, "offset", 0, maximum=MAX_OFFSET), limit, False
 
 
 def paginate(
@@ -209,7 +211,7 @@ async def json_body(request: Request, *, required: bool = True) -> dict[str, Any
         return {}
     try:
         data = json.loads(raw)
-    except ValueError:
+    except (ValueError, RecursionError):
         raise errors.bad_request("Invalid JSON in request body", reason="invalid_request_body") from None
     if not isinstance(data, dict):
         raise errors.bad_request("Request body must be a JSON object", reason="invalid_request_body")
@@ -225,6 +227,69 @@ def require_str(body: dict[str, Any], name: str) -> str:
     return value
 
 
+def opt_str(body: dict[str, Any], name: str, default: str = "", *, max_len: int | None = None) -> str:
+    """A string field (``null`` or absent -> ``default``); Box answers 400 for any other JSON type."""
+    value = body.get(name)
+    if value is None:
+        return default
+    if not isinstance(value, str):
+        raise errors.invalid_parameter(name, f"'{name}' must be a string")
+    if max_len is not None and len(value) > max_len:
+        raise errors.invalid_parameter(name, f"'{name}' must be at most {max_len} characters long")
+    return value
+
+
+def opt_bool(body: dict[str, Any], name: str, default: bool = False) -> bool:
+    value = body.get(name)
+    if value is None:
+        return default
+    if not isinstance(value, bool):
+        raise errors.invalid_parameter(name, f"'{name}' must be true or false")
+    return value
+
+
+def opt_int(body: dict[str, Any], name: str, default: int, *, minimum: int | None = None) -> int:
+    value = body.get(name)
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise errors.invalid_parameter(name, f"'{name}' must be an integer")
+    if minimum is not None and value < minimum:
+        raise errors.invalid_parameter(name, f"'{name}' must be at least {minimum}")
+    return value
+
+
+def str_list(value: Any, name: str, *, max_items: int = 100, max_len: int = 255) -> list[str]:
+    """``null`` -> ``[]``; otherwise a list of strings (Box tags, trigger lists...)."""
+    if value is None:
+        return []
+    if not isinstance(value, list) or any(not isinstance(v, str) for v in value):
+        raise errors.invalid_parameter(name, f"'{name}' must be an array of strings")
+    if len(value) > max_items or any(len(v) > max_len for v in value):
+        raise errors.invalid_parameter(name, f"'{name}' has too many or too long entries")
+    return list(value)
+
+
+def object_or_empty(value: Any, name: str) -> dict[str, Any]:
+    """An optional JSON object (``null`` -> ``{}``); anything else is a 400."""
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise errors.invalid_parameter(name, f"'{name}' must be an object")
+    return value
+
+
+async def json_any(request: Request) -> Any:
+    """The JSON body whatever its shape (RFC 6902 patches are arrays); 400 when empty or malformed."""
+    raw = await request.body()
+    if not raw.strip():
+        raise errors.bad_request("Bad Request", reason="invalid_request_body", name="body")
+    try:
+        return json.loads(raw)
+    except (ValueError, RecursionError):
+        raise errors.bad_request("Invalid JSON in request body", reason="invalid_request_body") from None
+
+
 def ref_id(body: dict[str, Any], name: str) -> str:
     """``{"parent": {"id": "123"}}`` -> ``"123"`` with Box's validation errors."""
     value = body.get(name)
@@ -235,6 +300,7 @@ def ref_id(body: dict[str, Any], name: str) -> str:
 
 # -- names -----------------------------------------------------------------------------
 _RESERVED = re.compile(r"[\\/]")
+_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 
 
 def validate_name(name: Any, field: str = "name") -> str:
@@ -244,12 +310,27 @@ def validate_name(name: Any, field: str = "name") -> str:
         raise errors.invalid_parameter(field, f"'{field}' must be a string")
     if len(name) > 255:
         raise errors.invalid_parameter(field, "Item name is too long (maximum 255 characters)")
-    if name != name.strip() or name in (".", "..") or _RESERVED.search(name) or not name.strip():
+    if (
+        name != name.strip()
+        or name in (".", "..")
+        or _RESERVED.search(name)
+        or _CONTROL.search(name)
+        or not name.strip()
+    ):
         raise errors.invalid_parameter(
             field,
-            f"Invalid value '{name}'. Item names must not contain / or \\, or start or end with whitespace.",
+            "Invalid value. Item names must not contain / or \\, control characters, "
+            "or start or end with whitespace.",
         )
     return name
+
+
+def sanitize_name(name: Any, field: str = "name") -> str:
+    """A copy's ``name`` is sanitized, not rejected: Box strips the characters items may not contain."""
+    if not isinstance(name, str):
+        raise errors.invalid_parameter(field, f"'{field}' must be a string")
+    cleaned = _CONTROL.sub("", _RESERVED.sub("", name)).rstrip()
+    return validate_name(cleaned, field)
 
 
 def extension_of(name: str) -> str:

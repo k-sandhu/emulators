@@ -319,11 +319,12 @@ async def test_sign_in_activity_is_only_visible_in_admin_logs(box):
         )
     ).json()
     kinds = [e["event_type"] for e in logs["entries"]]
-    assert kinds == ["LOGIN", "USER_AUTHENTICATE_OAUTH2_TOKEN_REFRESH", "OAUTH2_ACCESS_TOKEN_REVOKE"]
+    token_created = "USER_AUTHENTICATE_OAUTH2_ACCESS_TOKEN_CREATE"  # Box's name for a (re)issued token
+    assert kinds == ["LOGIN", token_created, token_created]  # revoking a token is not an audited event
     assert logs["entries"][0]["created_by"]["login"] == "maya.chen@halcyonadvisory.example"
     assert logs["entries"][0]["source"]["type"] == "user"
     mine = (await box.get("/events", "p018", params={"stream_position": "0", "limit": 500})).json()
-    assert not {"LOGIN", "OAUTH2_ACCESS_TOKEN_REVOKE"} & {e["event_type"] for e in mine["entries"]}
+    assert not {"LOGIN", token_created} & {e["event_type"] for e in mine["entries"]}
 
 
 async def test_enterprise_token_sees_the_team_folders_it_co_owns(box):

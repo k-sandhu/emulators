@@ -8,7 +8,7 @@ from typing import Any
 
 from emulators.providers.box import access, errors
 from emulators.providers.box.access import Principal
-from emulators.providers.box.util import input_ts
+from emulators.providers.box.util import input_ts, to_iso
 
 Record = dict[str, Any]
 
@@ -17,6 +17,15 @@ ACCESS_LEVELS = ("open", "company", "collaborators")
 
 def new_hash(seed: str) -> str:
     return hashlib.sha256(f"{seed}/{secrets.token_hex(8)}".encode()).hexdigest()[:32]
+
+
+def strong_enough(password: str) -> bool:
+    """Box: at least eight characters with a number, an upper-case letter or a non-alphanumeric character."""
+    return len(password) >= 8 and any(c.isdigit() or c.isupper() or not c.isalnum() for c in password)
+
+
+def now_iso_of(p: Principal) -> str:
+    return to_iso(p.ctx.clock.now())
 
 
 def apply_shared_link(p: Principal, record: Record, value: Any, now: str) -> str | None:
@@ -58,9 +67,11 @@ def apply_shared_link(p: Principal, record: Record, value: Any, now: str) -> str
     if "password" in value:
         password = value["password"]
         if password is not None:
-            if not isinstance(password, str) or len(password) < 6:
+            if not isinstance(password, str) or not strong_enough(password):
                 raise errors.invalid_parameter(
-                    "shared_link.password", "Password must be at least 6 characters"
+                    "shared_link.password",
+                    "Passwords must be at least eight characters long and include a number, "
+                    "an upper case letter or a symbol",
                 )
             if link["access"] != "open":
                 raise errors.invalid_parameter(
@@ -68,9 +79,12 @@ def apply_shared_link(p: Principal, record: Record, value: Any, now: str) -> str
                 )
         link["password"] = password
     if "unshared_at" in value:
-        link["unshared_at"] = (
-            input_ts(value["unshared_at"], "shared_link.unshared_at") if value["unshared_at"] else None
-        )
+        expires = input_ts(value["unshared_at"], "shared_link.unshared_at") if value["unshared_at"] else None
+        if expires and expires <= now_iso_of(p):
+            raise errors.invalid_parameter(
+                "shared_link.unshared_at", "'unshared_at' must be later than the current time"
+            )
+        link["unshared_at"] = expires
     if "vanity_name" in value:
         name = value["vanity_name"]
         if name is not None and (not isinstance(name, str) or len(name) < 12):
@@ -82,9 +96,22 @@ def apply_shared_link(p: Principal, record: Record, value: Any, now: str) -> str
     if isinstance(perms, dict):
         for key in ("can_download", "can_edit"):
             if key in perms:
-                link["permissions"][key] = bool(perms[key])
+                if not isinstance(perms[key], bool):
+                    raise errors.invalid_parameter(
+                        f"shared_link.permissions.{key}", f"'{key}' must be true or false"
+                    )
+                link["permissions"][key] = perms[key]
         if record["type"] == "folder" and link["permissions"].get("can_edit"):
             raise errors.invalid_parameter("shared_link.permissions", "Folders do not support 'can_edit'")
+        if link["permissions"].get("can_edit") and not link["permissions"].get("can_download"):
+            raise errors.invalid_parameter(
+                "shared_link.permissions", "'can_edit' needs 'can_download' to be true as well"
+            )
+        if perms.get("can_download") and link["access"] == "collaborators":
+            raise errors.invalid_parameter(
+                "shared_link.permissions.can_download",
+                "'can_download' can only be true for 'open' or 'company' links",
+            )
     elif perms is not None:
         raise errors.invalid_parameter("shared_link.permissions", "'permissions' must be an object")
     record["shared_link"] = link

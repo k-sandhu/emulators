@@ -12,7 +12,7 @@ from emulators.core.provider import ProviderContext
 from emulators.providers.box import access, db, errors, events, metadata
 from emulators.providers.box.access import Principal
 from emulators.providers.box.routing import Api, created, no_content
-from emulators.providers.box.util import json_body, now_iso, require_str
+from emulators.providers.box.util import json_any, json_body, now_iso, object_or_empty, require_str
 
 Record = dict[str, Any]
 
@@ -75,6 +75,11 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
             raise errors.invalid_parameter("scope", "Only 'enterprise' templates can be created")
         display = require_str(body, "displayName")
         key = body.get("templateKey") or camel_key(display)
+        if not isinstance(key, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]*", key):
+            raise errors.invalid_parameter("templateKey", "'templateKey' must be alphanumeric")
+        fields = body.get("fields") or []
+        if not isinstance(fields, list) or not all(isinstance(f, dict) for f in fields):
+            raise errors.invalid_parameter("fields", "'fields' must be an array of field definitions")
         if metadata.find_template(ctx, "enterprise", key) is not None:
             raise errors.box_error(409, "tuple_already_exists", "A template with this key already exists")
         tpl = {
@@ -85,9 +90,12 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
             "displayName": display,
             "hidden": bool(body.get("hidden", False)),
             "copyInstanceOnItemCopy": bool(body.get("copyInstanceOnItemCopy", False)),
-            "fields": [metadata.new_field(f) for f in body.get("fields", [])],
+            "fields": [metadata.new_field(f) for f in fields],
         }
         templates.put(tpl)
+        events.append_event(
+            ctx, "METADATA_TEMPLATE_CREATE", created_by=p.uid, source=metadata.render_template(tpl)
+        )
         return created(metadata.render_template(tpl))
 
     def template_or_404(scope: str, key: str) -> Record:
@@ -106,16 +114,23 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         p = api.principal(request)
         p.require_privileged()
         tpl = template_or_404(scope, key)
-        raw = await request.json()
+        raw = await json_any(request)
         if not isinstance(raw, list) or not raw:
             raise errors.bad_request(
                 "Request body must be a non-empty array of operations", reason="invalid_request_body"
             )
         for op in raw:
             apply_template_op(tpl, op)
+        events.append_event(
+            ctx, "METADATA_TEMPLATE_UPDATE", created_by=p.uid, source=metadata.render_template(tpl)
+        )
         return metadata.render_template(tpl)
 
-    def apply_template_op(tpl: Record, op: dict[str, Any]) -> None:
+    def apply_template_op(tpl: Record, op: Any) -> None:
+        if not isinstance(op, dict):
+            raise errors.bad_request(
+                "Each template operation must be an object", reason="invalid_request_body", name="op"
+            )
         kind = op.get("op")
         fields: list[Record] = tpl["fields"]
 
@@ -126,17 +141,24 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
             raise errors.not_found(f"Field '{field_key}' not found")
 
         if kind == "addField":
-            spec = op.get("data") or {}
+            spec = object_or_empty(op.get("data"), "data")
             if any(f["key"] == spec.get("key") for f in fields):
                 raise errors.box_error(409, "tuple_already_exists", "A field with this key already exists")
             fields.append(metadata.new_field(spec))
         elif kind == "editField":
             field = find(op.get("fieldKey"))
-            data = op.get("data") or {}
+            data = object_or_empty(op.get("data"), "data")
+            if "key" in data and (
+                not isinstance(data["key"], str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", data["key"])
+            ):
+                raise errors.invalid_parameter("data.key", "Field 'key' must be alphanumeric")
+            for attr in ("displayName", "description"):
+                if attr in data and not isinstance(data[attr], str):
+                    raise errors.invalid_parameter(f"data.{attr}", f"'{attr}' must be a string")
             for attr in ("displayName", "description", "hidden", "key"):
                 if attr in data:
                     old_key = field["key"]
-                    field[attr] = data[attr]
+                    field[attr] = bool(data[attr]) if attr == "hidden" else data[attr]
                     if attr == "key":
                         for inst in ctx.store.collection(db.METADATA):
                             if (
@@ -153,18 +175,26 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
                     inst["values"].pop(field["key"], None)
         elif kind == "reorderFields":
             order = op.get("fieldKeys") or []
+            if not isinstance(order, list):
+                raise errors.invalid_parameter("fieldKeys", "'fieldKeys' must be an array")
             fields.sort(key=lambda f: order.index(f["key"]) if f["key"] in order else len(order))
         elif kind == "editTemplate":
+            data = object_or_empty(op.get("data"), "data")
+            if "displayName" in data and not isinstance(data["displayName"], str):
+                raise errors.invalid_parameter("data.displayName", "'displayName' must be a string")
             for attr in ("displayName", "hidden", "copyInstanceOnItemCopy"):
-                if attr in (op.get("data") or {}):
-                    tpl[attr] = op["data"][attr]
+                if attr in data:
+                    tpl[attr] = data[attr] if attr == "displayName" else bool(data[attr])
         elif kind in ("addEnumOption", "addMultiSelectOption"):
             field = find(op.get("fieldKey"))
             if field["type"] not in ("enum", "multiSelect"):
                 raise errors.invalid_parameter("fieldKey", "Field has no options")
-            field.setdefault("options", []).append(
-                {"id": str(uuid.uuid4()), "key": (op.get("data") or {}).get("key")}
-            )
+            option_key = object_or_empty(op.get("data"), "data").get("key")
+            if not isinstance(option_key, str) or not option_key:
+                raise errors.invalid_parameter("data.key", "An option 'key' is required")
+            if any(o["key"] == option_key for o in field.get("options", [])):
+                raise errors.box_error(409, "tuple_already_exists", "An option with this key already exists")
+            field.setdefault("options", []).append({"id": str(uuid.uuid4()), "key": option_key})
         elif kind in ("removeEnumOption", "removeMultiSelectOption"):
             field = find(op.get("fieldKey"))
             field["options"] = [
@@ -189,6 +219,9 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         ]:
             metadata.delete_instance(ctx, inst)
         templates.delete(tpl["id"])
+        events.append_event(
+            ctx, "METADATA_TEMPLATE_DELETE", created_by=p.uid, source=metadata.render_template(tpl)
+        )
         return no_content()
 
     @api.get("/metadata_templates/{template_id}")
@@ -256,7 +289,7 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
             p = api.principal(request)
             item = item_for(p, item_id, access.RENAME)
             inst = instance_or_404(item, scope, template)
-            ops_body = await request.json()
+            ops_body = await json_any(request)
             inst["values"] = metadata.apply_patch(ctx, scope, template, inst["values"], ops_body)
             inst["version"] += 1
             await emit(p, "METADATA_INSTANCE_UPDATE", item, inst)

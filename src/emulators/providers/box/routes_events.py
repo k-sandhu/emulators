@@ -30,9 +30,11 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         for event in ctx.store.collection(db.EVENTS):
             if event["_pos"] <= after:
                 continue
-            if wanted_types and event["event_type"] not in wanted_types:
-                continue
             if stream.startswith("admin_logs"):
+                # ``event_type`` and the created_* bounds only apply to the enterprise stream
+                names = {event["event_type"], events.admin_name(event["event_type"])}
+                if wanted_types and not wanted_types & names:
+                    continue
                 low, high = created
                 if low and event["created_at"] < low:
                     continue
@@ -81,13 +83,21 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         return {
             "chunk_size": len(rows),
             "next_stream_position": str(next_position),
-            "entries": [events.render_event(shaper, e) for e in rows],
+            "entries": [events.render_event(shaper, e, admin=stream.startswith("admin_logs")) for e in rows],
         }
 
     @api.options("/events")
     async def long_poll_info(request: Request) -> Any:
         p = api.principal(request)
         stream = request.query_params.get("stream_type", "changes")
+        if stream not in STREAMS:
+            raise errors.invalid_parameter(
+                "stream_type", f"'stream_type' must be one of {', '.join(STREAMS)}"
+            )
+        if stream.startswith("admin_logs"):
+            raise errors.invalid_parameter(
+                "stream_type", "Long polling is only available for user event streams, not enterprise events"
+            )
         channel = secrets.token_hex(16)
         ctx.store.collection(db.CHANNELS).put(
             {"id": channel, "user_id": p.uid, "stream": stream, "since": events.current_position(ctx)}

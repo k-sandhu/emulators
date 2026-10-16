@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import copy
+import html
 import re
 from datetime import timedelta
 from typing import Any
@@ -11,6 +13,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 
 from emulators.core.clock import utc
+from emulators.core.errors import EmulatorError
 from emulators.core.provider import ProviderContext, url_for_host
 from emulators.providers.box import access, content, db, errors, events, ops, sharing, tree
 from emulators.providers.box.routing import Api, created, no_content
@@ -19,12 +22,16 @@ from emulators.providers.box.util import (
     input_ts,
     json_body,
     now_iso,
+    object_or_empty,
+    opt_str,
     page_window,
     paginate,
     parse_fields,
     query_int,
     random_alnum,
     ref_id,
+    sanitize_name,
+    str_list,
     to_iso,
     try_parse_ts,
     validate_name,
@@ -32,6 +39,10 @@ from emulators.providers.box.util import (
 from emulators.world import documents
 
 Record = dict[str, Any]
+#: Fields a lock protects: everything but ``lock`` itself, ``collections`` (the caller's own favourites).
+LOCKED_FIELDS = frozenset(
+    {"name", "parent", "description", "tags", "disposition_at", "permissions", "shared_link"}
+)
 DOWNLOAD_TTL = timedelta(minutes=15)
 PNG_SIZES = (32, 64, 128, 256)
 JPG_SIZES = (32, 94, 160, 320, 1024, 2048)
@@ -104,62 +115,87 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         record = get_file(p, file_id)
         ops.check_if_match(request.headers, record)
         now = now_iso(ctx)
-        emitted: list[str] = []
-        changed = False
-        if "name" in body and body["name"] != record["name"]:
-            p.require(record, access.RENAME)
-            ops.ensure_unlocked(ctx, record, p)
-            name = validate_name(body["name"])
-            ops.ensure_name_free(p, record["_parent"], name, ignore=record["id"], as_object=True)
-            record["name"] = name
-            emitted.append("ITEM_RENAME")
-            changed = True
+        # Everything that can be refused is checked before anything the request does is kept: the record
+        # is restored if a later field is rejected, and the move (the one change that reaches other
+        # records) goes last, after its own checks.
+        new_parent = None
         if isinstance(body.get("parent"), dict) and "id" in body["parent"]:
             new_parent = p.get_item("folder", str(body["parent"]["id"]), access.UPLOAD)
-            if new_parent["id"] != record["_parent"]:
+        if "collections" in body:
+            ops.check_collections(p, body["collections"])
+        if LOCKED_FIELDS & set(body):
+            ops.ensure_unlocked(ctx, record, p)  # a lock stops anyone but its owner changing the file
+        backup = copy.deepcopy(record)
+        renamed = moved = False
+        lock_event: str | None = None
+        link_event: str | None = None
+        changed = False
+        try:
+            if "description" in body:
+                p.require(record, access.RENAME)
+                # Box keeps the first 255 characters of a longer description instead of refusing it.
+                record["description"] = opt_str(body, "description")[:255]
+                changed = True
+            if "tags" in body:
+                p.require(record, access.RENAME)
+                record["tags"] = str_list(body["tags"], "tags")
+                changed = True
+            if "disposition_at" in body:
+                p.require(record, access.RENAME)
+                disposition = (
+                    input_ts(body["disposition_at"], "disposition_at") if body["disposition_at"] else None
+                )
+                current = record.get("disposition_at")
+                if current and (disposition is None or disposition < current):
+                    raise errors.invalid_parameter(
+                        "disposition_at", "The retention expiration date cannot be shortened once set"
+                    )
+                record["disposition_at"] = disposition
+                changed = True
+            if "permissions" in body:
+                p.require(record, access.SET_SHARE_ACCESS)
+                level = object_or_empty(body["permissions"], "permissions").get("can_download")
+                if level not in (None, "open", "company"):
+                    raise errors.invalid_parameter("permissions.can_download", "Must be 'open' or 'company'")
+                if level is not None:
+                    record["download_scope"] = level
+                    changed = True
+            if "lock" in body:
+                lock_event = apply_lock(p, record, body["lock"], now)
+                changed = True
+            if "shared_link" in body:
+                link_event = sharing.apply_shared_link(p, record, body["shared_link"], now)
+                changed = changed or link_event is not None
+            if "name" in body and body["name"] != record["name"]:
+                p.require(record, access.RENAME)
+                ops.ensure_unlocked(ctx, record, p)
+                name = validate_name(body["name"])
+                ops.ensure_name_free(p, record["_parent"], name, ignore=record["id"], as_object=True)
+                record["name"] = name
+                renamed = changed = True
+            if new_parent is not None and new_parent["id"] != record["_parent"]:
                 p.require(record, access.RENAME)
                 ops.ensure_unlocked(ctx, record, p)
                 ops.move(p, record, new_parent, now)
-                emitted.append("ITEM_MOVE")
-                changed = True
-        if "description" in body:
-            p.require(record, access.RENAME)
-            if not isinstance(body["description"], str) or len(body["description"]) > 256:
-                raise errors.invalid_parameter(
-                    "description", "'description' must be a string of at most 256 characters"
-                )
-            record["description"] = body["description"]
-            changed = True
-        if "tags" in body:
-            p.require(record, access.RENAME)
-            record["tags"] = [str(t) for t in (body["tags"] or [])]
-            changed = True
-        if "disposition_at" in body:
-            p.require(record, access.RENAME)
-            record["disposition_at"] = (
-                input_ts(body["disposition_at"], "disposition_at") if body["disposition_at"] else None
-            )
-            changed = True
-        if "lock" in body:
-            emitted.append(apply_lock(p, record, body["lock"], now))
-            changed = True
+                moved = changed = True
+        except EmulatorError:
+            record.clear()
+            record.update(backup)
+            p.invalidate()
+            raise
         if "collections" in body:
             ops.set_collections(p, record, body["collections"])
-        if "shared_link" in body:
-            event_type = sharing.apply_shared_link(p, record, body["shared_link"], now)
-            if event_type:
-                emitted.append(event_type)
-                changed = True
-        if "permissions" in body:
-            p.require(record, access.SET_SHARE_ACCESS)
-            level = (body["permissions"] or {}).get("can_download")
-            if level not in (None, "open", "company", "admins"):
-                raise errors.invalid_parameter("permissions.can_download")
         if changed:
             ops.touch(record, p, now)
             p.invalidate()
-        for event_type in emitted:
-            await events.emit(p, event_type, record)
+        for event_type in (
+            "ITEM_RENAME" if renamed else None,
+            "ITEM_MOVE" if moved else None,
+            lock_event,
+            link_event,
+        ):
+            if event_type:
+                await events.emit(p, event_type, record)
         return api.shaper(p, request).file(record, parse_fields(request))
 
     def apply_lock(p: access.Principal, record: Record, value: Any, now: str) -> str:
@@ -172,6 +208,8 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
             return "UNLOCK"
         if not isinstance(value, dict):
             raise errors.invalid_parameter("lock", "'lock' must be an object or null")
+        if value.get("access", "lock") != "lock":
+            raise errors.invalid_parameter("lock.access", "'access' must be 'lock'")
         if current and current["created_by"] != p.uid:
             raise errors.box_error(403, "access_denied_item_locked", "Access denied - item locked")
         expires = input_ts(value["expires_at"], "lock.expires_at") if value.get("expires_at") else None
@@ -227,7 +265,7 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         body = await json_body(request)
         source = get_file(p, file_id, access.DOWNLOAD)
         parent = p.get_item("folder", ref_id(body, "parent"), access.UPLOAD)
-        name = validate_name(body["name"]) if body.get("name") is not None else None
+        name = sanitize_name(body["name"]) if body.get("name") is not None else None
         version = body.get("version")
         if version is not None and db.versions(ctx).get(str(version)) is None:
             raise errors.not_found("Version not found")
@@ -287,11 +325,12 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         link = record["shared_link"]
         link["preview_count"] = int(link.get("preview_count", 0)) + 1
         locked = "This link is password protected." if link.get("password") else ""
-        html = (
-            f"<!doctype html><html><head><title>{record['name']} - Box</title></head><body>"
-            f"<h1>{record['name']}</h1><p>Shared {record['type']} (emulated Box shared link).</p><p>{locked}</p></body></html>"
+        name = html.escape(record["name"])
+        page = (
+            f"<!doctype html><html><head><title>{name} - Box</title></head><body>"
+            f"<h1>{name}</h1><p>Shared {record['type']} (emulated Box shared link).</p><p>{locked}</p></body></html>"
         )
-        return HTMLResponse(html)
+        return HTMLResponse(page)
 
     @app.get("/shared/static/{name}")
     async def shared_static(request: Request, name: str) -> Any:
@@ -409,6 +448,6 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
             raise errors.not_found()
         data = content.version_bytes(ctx, source)
         ops.add_version(p, record, data, now_iso(ctx))
-        await events.emit(p, "ITEM_UPLOAD", record)
+        await events.emit(p, "ITEM_MAKE_CURRENT_VERSION", record, trigger="FILE.UPLOADED")
         version = db.versions(ctx).get(record["_version"])
         return created(api.shaper(p, request).version(version, parse_fields(request)))  # type: ignore[arg-type]

@@ -41,8 +41,10 @@ async def test_search_boolean_operators(box):
     assert both and both <= either
     assert only_northwind.isdisjoint(both)
     assert only_northwind and all("letter" not in n.lower() for n in only_northwind)
+    # Box reads a multi-word query as OR unless AND joins the terms.
     implicit = set(await names(box, query="northwind letter", content_types="name"))
-    assert implicit == both
+    assert implicit == either and implicit > both
+    assert set(await names(box, query="northwind AND NOT letter", content_types="name")) == only_northwind
 
 
 async def test_search_in_file_content_and_content_types(box):
@@ -116,13 +118,13 @@ async def test_search_sorting_and_paging(box):
 
 async def test_search_only_returns_items_the_caller_can_see(box):
     # Growth staff cannot see client files, so they get no hits; partners do.
-    assert await names(box, "p044", query="engagement letter", type="file") == []
-    assert await names(box, "p004", query="engagement letter", type="file")
+    assert await names(box, "p044", query='"engagement letter"', type="file") == []
+    assert await names(box, "p004", query='"engagement letter"', type="file")
     # Restricted salary bands: only the owner and the two people it was shared with can find it.
-    assert await names(box, "p031", query="salary bands")
-    assert await names(box, "p001", query="salary bands")
-    assert await names(box, "p032", query="salary bands") == []
-    assert await names(box, "p035", query="salary bands") == []
+    assert await names(box, "p031", query='"salary bands"')
+    assert await names(box, "p001", query='"salary bands"')
+    assert await names(box, "p032", query='"salary bands"') == []
+    assert await names(box, "p035", query='"salary bands"') == []
     assert (
         await box.get("/search", "p018", params={"query": "x", "scope": "enterprise_content"})
     ).status_code == 403

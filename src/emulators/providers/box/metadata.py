@@ -66,17 +66,25 @@ def new_field(spec: dict[str, Any]) -> Record:
     key = spec.get("key")
     if not key or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", str(key)):
         raise errors.invalid_parameter("fields", "Field 'key' is required and must be alphanumeric")
+    display = spec.get("displayName") or key
+    if not isinstance(display, str) or isinstance(spec.get("description"), (dict, list, int)):
+        raise errors.invalid_parameter("fields", "'displayName' and 'description' must be strings")
     field: Record = {
         "id": str(uuid.uuid4()),
         "type": ftype,
         "key": key,
-        "displayName": spec.get("displayName") or key,
+        "displayName": display,
         "hidden": bool(spec.get("hidden", False)),
     }
     if spec.get("description"):
-        field["description"] = spec["description"]
+        field["description"] = str(spec["description"])
     if ftype in ("enum", "multiSelect"):
-        field["options"] = [{"id": str(uuid.uuid4()), "key": o["key"]} for o in spec.get("options", [])]
+        raw = spec.get("options") or []
+        if not isinstance(raw, list) or not all(
+            isinstance(o, dict) and isinstance(o.get("key"), str) for o in raw
+        ):
+            raise errors.invalid_parameter("fields", "'options' must be a list of {key} objects")
+        field["options"] = [{"id": str(uuid.uuid4()), "key": o["key"]} for o in raw]
     return field
 
 
@@ -128,12 +136,12 @@ def coerce_value(field: Record, value: Any) -> Any:
         return value
     options = {o["key"] for o in field.get("options", [])}
     if ftype == "enum":
-        if value not in options:
+        if not isinstance(value, str) or value not in options:
             raise errors.bad_request(
                 f"Value '{value}' is not a valid option for '{key}'", reason="invalid_parameter", name=key
             )
         return value
-    if not isinstance(value, list) or any(v not in options for v in value):
+    if not isinstance(value, list) or any(not isinstance(v, str) or v not in options for v in value):
         raise errors.bad_request(
             f"Invalid value for multiSelect '{key}'", reason="invalid_parameter", name=key
         )
@@ -178,6 +186,10 @@ def apply_patch(
         return path[1:].replace("~1", "/").replace("~0", "~")
 
     for op in ops:
+        if not isinstance(op, dict):
+            raise errors.bad_request(
+                "Each patch operation must be an object", reason="invalid_request_body", name="op"
+            )
         kind = op.get("op")
         if kind in ("add", "replace"):
             name = path_key(op.get("path"))

@@ -33,23 +33,22 @@ def parse_search(query: str) -> Callable[[Callable[[str, bool], bool]], bool]:
         return tokens[pos] if pos < len(tokens) else None
 
     def parse_or() -> Callable[[Callable[[str, bool], bool]], bool]:
+        # Box reads multi-word queries as OR unless an explicit AND joins the terms.
         nonlocal pos
         parts = [parse_and()]
-        while peek() == ("op", "OR"):
-            pos += 1
+        while peek() is not None:
+            if peek() == ("op", "OR"):
+                pos += 1
             parts.append(parse_and())
         return lambda m: any(part(m) for part in parts)
 
     def parse_and() -> Callable[[Callable[[str, bool], bool]], bool]:
         nonlocal pos
         parts = [parse_not()]
-        while True:
-            token = peek()
-            if token is None or token == ("op", "OR"):
-                break
-            if token == ("op", "AND"):
+        while peek() in (("op", "AND"), ("op", "NOT")):
+            if peek() == ("op", "AND"):
                 pos += 1
-            parts.append(parse_not())
+            parts.append(parse_not())  # ``a NOT b`` reads as ``a AND NOT b``
         return lambda m: all(part(m) for part in parts)
 
     def parse_not() -> Callable[[Callable[[str, bool], bool]], bool]:
@@ -107,6 +106,33 @@ def tokenize_md(query: str) -> list[tuple[str, str]]:
         tokens.append((kind, match.group(kind)))
         pos = match.end()
     return tokens
+
+
+def like_match(text: str, pattern: str) -> bool:
+    """SQL ``LIKE`` (``%`` any run, ``_`` one character, case-insensitive) in O(len(text) * len(pattern)).
+
+    A regular expression would backtrack catastrophically on patterns such as ``%%%%%%%%x``.
+    """
+    text, pattern = text.lower(), pattern.lower()
+    t = p = 0
+    star = -1
+    mark = 0
+    while t < len(text):
+        if p < len(pattern) and pattern[p] in ("_", text[t]) and pattern[p] != "%":
+            t += 1
+            p += 1
+        elif p < len(pattern) and pattern[p] == "%":
+            star, mark = p, t
+            p += 1
+        elif star != -1:
+            p = star + 1
+            mark += 1
+            t = mark
+        else:
+            return False
+    while p < len(pattern) and pattern[p] == "%":
+        p += 1
+    return p == len(pattern)
 
 
 def parse_metadata_query(query: str, params: dict[str, Any]) -> Predicate:
@@ -182,11 +208,7 @@ def parse_metadata_query(query: str, params: dict[str, Any]) -> Predicate:
             right = operand()
 
             def like(values: dict[str, Any]) -> bool:
-                pattern = "^" + re.escape(str(right(values))).replace("%", ".*").replace("_", ".") + "$"
-                return (
-                    left(values) is not None
-                    and re.match(pattern, str(left(values)), re.IGNORECASE) is not None
-                )
+                return left(values) is not None and like_match(str(left(values)), str(right(values)))
 
             return like
         if op_token[0] != "op":

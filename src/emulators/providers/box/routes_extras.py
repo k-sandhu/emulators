@@ -12,7 +12,16 @@ from emulators.providers.box import access, db, errors, events, ops, representat
 from emulators.providers.box.access import Principal
 from emulators.providers.box.routing import UPLOAD_API, Api, created, no_content
 from emulators.providers.box.shapes import Shaper
-from emulators.providers.box.util import box_ts, json_body, next_id, now_iso, parse_fields, ref_id
+from emulators.providers.box.util import (
+    box_ts,
+    json_body,
+    next_id,
+    now_iso,
+    object_or_empty,
+    parse_fields,
+    query_int,
+    ref_id,
+)
 
 Record = dict[str, Any]
 
@@ -32,11 +41,7 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         target = db.users(ctx).get(ref_id(body, "owned_by"))
         if source is None or target is None:
             raise errors.not_found()
-        if (
-            source["id"] == target["id"]
-            or target.get("_kind") == "external"
-            or target.get("status") != "active"
-        ):
+        if source["id"] == target["id"] or target.get("_kind") == "external" or not db.is_active(target):
             raise errors.invalid_parameter("owned_by", "The new owner must be another active managed user")
         now = now_iso(ctx)
         owner = Principal(ctx, target, target)
@@ -82,7 +87,7 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
             p = api.principal(request)
             record = p.get_item(kind, item_id, access.RENAME)
             body = await json_body(request)
-            if (body.get("watermark") or {}).get("imprint") != "default":
+            if object_or_empty(body.get("watermark"), "watermark").get("imprint") != "default":
                 raise errors.invalid_parameter("watermark.imprint", "'imprint' must be 'default'")
             now = now_iso(ctx)
             existing = record.get("watermark")
@@ -90,6 +95,8 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
                 "created_at": existing["created_at"] if existing else now,
                 "modified_at": now,
             }
+            if not existing:
+                await events.emit(p, "WATERMARK_LABEL_CREATE", record)
             return body_of(record)
 
         @api.delete(f"/{plural}/{{item_id}}/watermark")
@@ -99,10 +106,23 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
             if not record.get("watermark"):
                 raise errors.not_found("Watermark not found")
             record["watermark"] = None
+            await events.emit(p, "WATERMARK_LABEL_DELETE", record)
             return no_content()
 
     watermark_routes("file")
     watermark_routes("folder")
+
+    # -- app item associations (the emulator has no app items, so the list is always empty) ----
+    def app_item_routes(kind: str) -> None:
+        @api.get(f"/{kind}s/{{item_id}}/app_item_associations")
+        async def list_app_item_associations(request: Request, item_id: str) -> Any:
+            p = api.principal(request)
+            p.get_item(kind, item_id)
+            limit = query_int(request, "limit", 100, minimum=1, maximum=1000)
+            return {"limit": limit, "next_marker": None, "entries": []}
+
+    app_item_routes("file")
+    app_item_routes("folder")
 
     # -- folder locks ----------------------------------------------------------------------------
     def lock_body(shaper: Shaper, lock: Record) -> Record:
@@ -124,9 +144,14 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         folder = p.get_item("folder", ref_id(body, "folder"), access.INVITE)
         if db.is_root(folder) or p.role(folder) not in ("owner", "co-owner"):
             raise errors.forbidden()
-        operations = body.get("locked_operations") or {"move": True, "delete": True}
-        if not isinstance(operations, dict) or set(operations) - {"move", "delete"}:
-            raise errors.invalid_parameter("locked_operations")
+        operations = body.get("locked_operations")
+        if operations is None:
+            operations = {"move": True, "delete": True}
+        # Box: "if locked_operations is included, both move and delete must be included and both true".
+        if not isinstance(operations, dict) or operations != {"move": True, "delete": True}:
+            raise errors.invalid_parameter(
+                "locked_operations", "'locked_operations' must set both 'move' and 'delete' to true"
+            )
         if any(lock["folder_id"] == folder["id"] for lock in locks):
             raise errors.box_error(409, "conflict", "A lock already exists on this folder")
         lock = {
@@ -137,7 +162,11 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
             "locked_operations": {"move": bool(operations.get("move", False)), "delete": bool(operations.get("delete", False))},
         }  # fmt: skip
         locks.put(lock)
-        return created(lock_body(Shaper(p, request), lock))
+        shaper = Shaper(p, request)
+        await events.emit(
+            p, "LOCK_CREATE", None, source=lock_body(shaper, lock), kind="folder_lock", webhook_item=folder
+        )
+        return created(lock_body(shaper, lock))
 
     @api.get("/folder_locks")
     async def list_folder_locks(request: Request) -> Any:
@@ -161,6 +190,14 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         if p.role(folder) not in ("owner", "co-owner"):
             raise errors.forbidden()
         locks.delete(lock["id"])
+        await events.emit(
+            p,
+            "LOCK_DESTROY",
+            None,
+            source=lock_body(Shaper(p, request), lock),
+            kind="folder_lock",
+            webhook_item=folder,
+        )
         return no_content()
 
     # -- representations -----------------------------------------------------------------------------
@@ -226,9 +263,11 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         p = api.principal(request)
         p.require_privileged()
         body = await json_body(request)
-        login = (body.get("actionable_by") or {}).get("login")
+        login = object_or_empty(body.get("actionable_by"), "actionable_by").get("login")
         if not login:
             raise errors.missing_parameter("actionable_by.login")
+        if not isinstance(login, str) or "@" not in login:
+            raise errors.invalid_parameter("actionable_by.login", "'login' must be an e-mail address")
         if str(ref_id(body, "enterprise")) != ctx.world.org.box_enterprise_id:
             raise errors.not_found("Enterprise not found")
         user = db.user_by_login(ctx, login)
