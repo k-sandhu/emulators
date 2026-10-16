@@ -50,6 +50,12 @@ class GoogleProvider(Provider):
         "calendar-json.googleapis.com",
         "meet.googleapis.com",
         "content.googleapis.com",
+        "docs.googleapis.com",
+        "sheets.googleapis.com",
+        "pubsub.googleapis.com",
+        "drive.google.com",
+        "docs.google.com",
+        "meet.google.com",
     )
     default_port = 44102
     description = "OAuth/OIDC, Admin Directory, Drive v3, Gmail v1, Calendar v3 and Meet REST v2."

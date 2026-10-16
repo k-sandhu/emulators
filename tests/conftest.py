@@ -14,6 +14,7 @@ real HTTP semantics, only the transport swapped::
 
 from __future__ import annotations
 
+import os
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from functools import lru_cache
@@ -25,6 +26,8 @@ import pytest
 from emulators.core.hub import EmulatorHub
 
 ANCHOR = "2026-10-16"
+# Pin the world for the plugin's session hub (emulator_server / emulator_intercept) too.
+os.environ.setdefault("EMULATORS_ANCHOR", ANCHOR)
 
 
 @lru_cache(maxsize=32)
