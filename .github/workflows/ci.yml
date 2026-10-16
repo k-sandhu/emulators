@@ -4,6 +4,8 @@ on:
   push:
     branches: [main]
   pull_request:
+  # release.yml runs the whole suite on the tagged commit before publishing anything.
+  workflow_call:
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -20,6 +22,8 @@ jobs:
       - run: uv sync --frozen
       - run: uv run ruff check .
       - run: uv run ruff format --check .
+      - name: docker-compose files match the providers and the project version
+        run: uv run python scripts/gen_compose.py --check
 
   test:
     runs-on: ubuntu-latest
