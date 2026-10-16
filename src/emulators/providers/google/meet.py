@@ -226,7 +226,7 @@ def _page(
         token = request.query_params.get("pageToken")
         binding = stable_hash(request.url.path, request.query_params.get("filter", ""))
         decoded = b64url_decode(token).decode().split(":") if token else [binding, "0"]
-        if decoded[0] != binding:
+        if len(decoded) != 2 or decoded[0] != binding:
             raise ValueError
         offset = int(decoded[1])
         if offset < 0:
@@ -262,7 +262,7 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
 
     @app.exception_handler(HTTPException)
     async def meet_http_error(request: Request, exc: HTTPException) -> Any:
-        if request.url.path.startswith("/v2/"):
+        if request.url.path.removeprefix(request.scope.get("root_path", "")).startswith("/v2/"):
             from emulators.providers.google.common import error_body
 
             return JSONResponse(
@@ -272,7 +272,7 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
 
     @app.exception_handler(RequestValidationError)
     async def meet_validation_error(request: Request, exc: RequestValidationError) -> Any:
-        if request.url.path.startswith("/v2/"):
+        if request.url.path.removeprefix(request.scope.get("root_path", "")).startswith("/v2/"):
             from emulators.providers.google.common import error_body
 
             return JSONResponse(error_body(400, "Invalid request", legacy=False), status_code=400)

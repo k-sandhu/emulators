@@ -210,9 +210,10 @@ expiration are enforced. Push simulation has no Google OIDC signature.
 
 Calendar sends empty-body notifications with `X-Goog-Channel-ID`,
 `X-Goog-Channel-Token` when configured, `X-Goog-Resource-ID`,
-`X-Goog-Resource-URI`, `X-Goog-Resource-State` (`sync`/`exists`) and increasing
+`X-Goog-Resource-URI`, `X-Goog-Resource-State` (`sync`/`exists`/`not_exists`) and increasing
 `X-Goog-Message-Number`. Google Calendar does not attach an HMAC signature.
 Stopping a channel or an expired channel suppresses later delivery.
+Deleting a watched secondary calendar sends `not_exists` and removes its channels.
 
 ## Known gaps
 

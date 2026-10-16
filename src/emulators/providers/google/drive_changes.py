@@ -114,6 +114,8 @@ async def watch(
         get_file(ctx, actor, fid)
     else:
         parse_change_token(ctx, request.query_params.get("pageToken"))
+        if request.query_params.get("driveId"):
+            get_file(ctx, actor, request.query_params["driveId"])
     maximum = ctx.clock.timestamp() * 1000 + (86400000 if fid else 604800000)
     try:
         expiration = min(int(data.get("expiration", maximum)), maximum)

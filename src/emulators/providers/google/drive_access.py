@@ -46,7 +46,11 @@ def principal(request: Request, ctx: ProviderContext, *, legacy: bool = True) ->
     allowed = {"drive", "drive.file", "drive.appdata"}
     if not write:
         allowed |= {"drive.readonly", "drive.metadata", "drive.metadata.readonly"}
-    elif request.url.path.startswith("/drive/v3/files") and request.method == "PATCH":
+    elif (
+        request.url.path.startswith("/drive/v3/files")
+        and request.method == "PATCH"
+        and "/permissions" not in request.url.path
+    ):
         allowed.add("drive.metadata")
     if request.url.path.startswith("/v1/documents"):
         allowed.add("documents")
@@ -366,7 +370,27 @@ def query_shape(ctx: ProviderContext, row: dict[str, Any], actor: Principal) -> 
         ("readers", set(RANK)),
     ):
         emails = [p["emailAddress"] for p in perms if p.get("emailAddress") and p["role"] in roles]
-        if email in emails:
+        for perm in perms:
+            if perm["role"] not in roles:
+                continue
+            if perm["type"] == "group":
+                group = next(
+                    (
+                        g
+                        for g in ctx.store.collection("directory_groups")
+                        if g["email"] == perm.get("emailAddress")
+                    ),
+                    None,
+                )
+                if group:
+                    emails.extend(
+                        m["email"] for m in expanded_members(ctx, group["id"], derived=True) if m.get("email")
+                    )
+            elif perm["type"] == "domain":
+                emails.extend(
+                    p.email for p in ctx.world.people if p.email.endswith("@" + perm.get("domain", ""))
+                )
+        if email in emails or any(p["role"] in roles and applies(ctx, p, actor) for p in perms):
             emails.append("me")
         result["_" + key] = emails
     result["visibility"] = (

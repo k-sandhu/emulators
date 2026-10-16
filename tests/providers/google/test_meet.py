@@ -210,6 +210,8 @@ async def test_google_prefix_links_use_local_gateway(make_hub: Any) -> None:
         token = await mint(client, "/google", user="p001")
         response = await client.post("/google/v2/spaces", headers=bearer(token), json={})
         assert response.json()["meetingUri"].startswith("http://localhost:44080/google/")
+        missing = await client.get("/google/v2/missing/resource", headers=bearer(token))
+        assert missing.status_code == 404 and "errors" not in missing.json()["error"]
 
 
 async def test_meet_explicit_scopes_and_framework_errors(meet_client: httpx.AsyncClient) -> None:

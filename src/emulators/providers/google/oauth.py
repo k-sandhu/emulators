@@ -201,7 +201,10 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
                 {"error": "invalid_request", "error_description": "Missing required parameter"},
                 status_code=400,
             )
-        client = ctx.tokens.authenticate_client(client_id, None, require_secret=False)
+        try:
+            client = ctx.tokens.authenticate_client(client_id, None, require_secret=False)
+        except OAuthError as exc:
+            return JSONResponse({"error": exc.error, "error_description": exc.description}, status_code=400)
         if client.get("redirect_uris") and redirect not in client["redirect_uris"]:
             return JSONResponse({"error": "redirect_uri_mismatch"}, status_code=400)
         error = None

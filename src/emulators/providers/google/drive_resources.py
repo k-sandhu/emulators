@@ -24,7 +24,7 @@ from emulators.providers.google.drive_access import (
 from emulators.providers.google.drive_changes import record_change, visibility
 from emulators.providers.google.drive_fields import select
 from emulators.providers.google.drive_query import compile_query
-from emulators.providers.google.drive_seed import FOLDER, new_file, permission
+from emulators.providers.google.drive_seed import FOLDER, new_file, permission, root_id
 
 
 def admin_access(ctx: ProviderContext, request: Request, actor: Principal) -> bool:
@@ -134,6 +134,8 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         kind, role = data.get("type"), data.get("role")
         if kind not in ("user", "group", "domain", "anyone") or role not in RANK:
             raise google_error(400, "Invalid permission type or role", reason="invalid")
+        if not row.get("driveId") and role in ("organizer", "fileOrganizer"):
+            raise google_error(400, "Invalid role for a My Drive file", reason="invalid")
         if (kind in ("user", "group") and not data.get("emailAddress")) or (
             kind == "domain" and not data.get("domain")
         ):
@@ -167,6 +169,8 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
                     previous["role"] = "writer"
             owner = ctx.world.person_by_email(data["emailAddress"])
             row["_owner"] = owner.id if owner else None
+            if owner and request.query_params.get("moveToNewOwnersRoot") == "true":
+                row["parents"] = [root_id(ctx, owner.id)]
         row["_permissions"] = [p for p in row["_permissions"] if p["id"] != perm["id"]]
         row["_permissions"].append(perm)
         await record_change(ctx, row, before=before, changed="permissions")
@@ -189,6 +193,12 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         data = await json_object(request)
         if "role" in data and data["role"] not in RANK:
             raise google_error(400, "Invalid role", reason="invalid")
+        if perm["role"] == "owner" and data.get("role", "owner") != "owner":
+            raise google_error(
+                403,
+                "Cannot modify the owner's role without transferring ownership.",
+                reason="cannotModifyOwnerPermission",
+            )
         if data.get("role") == "owner" and (
             request.query_params.get("transferOwnership") != "true"
             or row.get("driveId")
@@ -206,6 +216,8 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
                     previous["role"] = "writer"
             owner = ctx.world.person_by_email(perm.get("emailAddress", ""))
             row["_owner"] = owner.id if owner else None
+            if owner and request.query_params.get("moveToNewOwnersRoot") == "true":
+                row["parents"] = [root_id(ctx, owner.id)]
         perm.update(
             {
                 k: data[k]

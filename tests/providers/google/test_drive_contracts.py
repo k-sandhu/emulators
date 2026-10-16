@@ -139,7 +139,7 @@ async def test_link_sharing_known_id_domain_sharing_and_ownership_transfer(make_
             await client.post(
                 BASE + "/files/" + fid + "/permissions",
                 headers=owner,
-                params={"transferOwnership": "true"},
+                params={"transferOwnership": "true", "moveToNewOwnersRoot": "true"},
                 json=transfer,
             )
         ).status_code == 200

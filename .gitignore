@@ -17,3 +17,5 @@ htmlcov/
 node_modules/
 .tmp*/
 **/.tmp-*/
+.pytest-*/
+**/.pytest-*/

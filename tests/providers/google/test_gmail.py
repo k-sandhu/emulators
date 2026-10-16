@@ -116,6 +116,7 @@ async def test_paging_formats_and_labels(gmail: httpx.AsyncClient) -> None:
     label = (await gmail.get(ROOT + "/labels/INBOX")).json()
     assert label["type"] == "system" and label["messagesTotal"] > 0
     assert (await gmail.get(ROOT + "/messages", params={"pageToken": "bad"})).status_code == 400
+    assert (await gmail.get(ROOT + "/messages", params={"pageToken": "e30"})).status_code == 400
 
 
 @pytest.mark.parametrize(

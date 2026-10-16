@@ -383,7 +383,13 @@ def page(
         )
         token = request.query_params.get("pageToken")
         decoded = json.loads(b64url_decode(token)) if token else [binding, 0]
-        if decoded[0] != binding or not isinstance(decoded[1], int) or decoded[1] < 0:
+        if (
+            not isinstance(decoded, list)
+            or len(decoded) != 2
+            or decoded[0] != binding
+            or not isinstance(decoded[1], int)
+            or decoded[1] < 0
+        ):
             raise ValueError
         offset = decoded[1]
     except (ValueError, TypeError, UnicodeError, IndexError) as exc:

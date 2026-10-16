@@ -94,6 +94,7 @@ async def test_seed_projection_meet_cross_ids_and_paging(calendar_client: httpx.
     assert any(a.get("self") and a["email"] == CEO for a in event["attendees"])
     assert (await client.get(EVENTS, params={"orderBy": "startTime"})).status_code == 400
     assert (await client.get(EVENTS, params={"pageToken": "bad"})).status_code == 400
+    assert (await client.get(EVENTS, params={"pageToken": "e30"})).status_code == 400
 
 
 async def test_event_crud_etag_sync_cancel_and_private_visibility(calendar_client: httpx.AsyncClient) -> None:

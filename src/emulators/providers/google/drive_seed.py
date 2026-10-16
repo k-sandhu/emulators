@@ -195,6 +195,8 @@ def seed(ctx: ProviderContext) -> None:
             _restricted=doc.restricted,
             _modified_by=doc.modified_by_id,
         )
+        if doc.kind == "png":
+            row["imageMediaMetadata"] = {"width": 64, "height": 64, "rotation": 0}
         if doc.restricted:
             row["_permissions"] = [permission(ctx, doc.owner_id, "writer" if drive else "owner")]
         for share in doc.shares:
