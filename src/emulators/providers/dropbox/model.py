@@ -25,12 +25,9 @@ from typing import TYPE_CHECKING, Any
 from emulators.core.auth import Grant
 from emulators.core.provider import ProviderContext
 from emulators.providers.dropbox.common import (
-    BadInput,
     Args,
-    api_error,
     b64url,
     digest,
-    file_id_for,
     path_error,
     revision_for,
     ts,
@@ -146,7 +143,9 @@ class Tree:
         if siblings is not None and rec in siblings:
             siblings[:] = [r for r in siblings if r is not rec]
         if rec.get("mount_ns"):
-            self.mounts_to[rec["mount_ns"]] = [r for r in self.mounts_to.get(rec["mount_ns"], []) if r is not rec]
+            self.mounts_to[rec["mount_ns"]] = [
+                r for r in self.mounts_to.get(rec["mount_ns"], []) if r is not rec
+            ]
         if dead:
             self.dead[key].append(rec)
 
@@ -228,6 +227,7 @@ class Call:
     actor: Actor
     request_id: str
     touched: set[str] = field(default_factory=set)
+    prop_filter: list[str] | None = None  # template ids for ``include_property_groups``
     _tree: Tree | None = None
     _prefix: dict[str, tuple[str, str] | None] = field(default_factory=dict)
 
@@ -275,9 +275,9 @@ def ns_role(actor: Actor, ns: dict[str, Any] | None) -> str | None:
         return None
     role: str | None = None
     for member in ns.get("members", ()):
-        if member["kind"] == "user" and member["account_id"] == acct["id"]:
-            role = best(role, member["access_type"])
-        elif member["kind"] == "group" and member["group_id"] in acct.get("groups", ()):
+        if (member["kind"] == "user" and member["account_id"] == acct["id"]) or (
+            member["kind"] == "group" and member["group_id"] in acct.get("groups", ())
+        ):
             role = best(role, member["access_type"])
     if actor.admin and ns.get("team_id"):
         role = best(role, "editor")
@@ -405,7 +405,9 @@ def loc_for_entry(c: Call, rec: dict[str, Any]) -> Loc:
     if rec.get("mount_ns"):
         parent = locate_ns(c, rec["ns"])
         pl, pd = parent if parent else ("", "")
-        return Loc(rec["mount_ns"], "", "", rec, pl + rec["path"], pd + rec["dpath"], reachable=parent is not None)
+        return Loc(
+            rec["mount_ns"], "", "", rec, pl + rec["path"], pd + rec["dpath"], reachable=parent is not None
+        )
     prefix = locate_ns(c, rec["ns"])
     pl, pd = prefix if prefix else ("", "")
     return Loc(rec["ns"], rec["path"], rec["dpath"], rec, pl, pd, reachable=prefix is not None)
@@ -450,10 +452,11 @@ def resolve(c: Call, path: str, *, allow_root: bool = True, wrapper: str = "path
         ns = c.tree.namespace(ns_id)
         if ns is None or ns_role(actor, ns) is None:
             return None
-        w = walk(c, ns_id, split_path(rest))
-        if not w.found:
-            return None
-        return w.loc
+        segments = split_path(rest)
+        if not segments:  # the namespace root, addressed as ``ns:123``
+            return Loc(ns_id, "", "", None, "", "", is_view_root=True) if allow_root else None
+        w = walk(c, ns_id, segments)
+        return w.loc if w.found else None
     segments = split_path(path)
     if not segments:
         return view_root(c) if allow_root else None
@@ -470,18 +473,12 @@ def resolve_for_write(c: Call, path: str) -> Walk:
         if ns is None or ns_role(actor, ns) is None:
             raise path_error("not_found", "path")
         return walk(c, ns_id, split_path(rest))
-    if path.startswith(("id:", "rev:")):
-        raise BadInput(f"path: '{path}' did not match pattern '(/(.|[\\r\\n])*)|(ns:[0-9]+(/.*)?)'")
     return walk(c, actor.root_ns, split_path(path))
 
 
 # ---------------------------------------------------------------------------------------
 # Metadata rendering
 # ---------------------------------------------------------------------------------------
-def sharing_role_for(c: Call, rec: dict[str, Any]) -> str | None:
-    return entry_role(c, rec)
-
-
 def _prefix_fields(loc: Loc | None, d: dict[str, Any]) -> None:
     if loc is not None and loc.reachable:
         d["path_lower"] = loc.path_lower
@@ -525,6 +522,14 @@ def file_metadata(
         d["export_info"] = dict(rec["export"])
     if explicit_members:
         d["has_explicit_shared_members"] = bool(rec.get("members"))
+    if c.prop_filter and rec.get("props"):
+        groups = [
+            {"template_id": tid, "fields": [{"name": k, "value": v} for k, v in values.items()]}
+            for tid, values in rec["props"].items()
+            if tid in c.prop_filter
+        ]
+        if groups:
+            d["property_groups"] = groups
     lock = rec.get("lock")
     if lock:
         info: dict[str, Any] = {
@@ -593,9 +598,10 @@ def metadata(
     return file_metadata(c, rec, explicit_members=explicit_members, loc=loc, revision=revision)
 
 
-def view_path_lower(c: Call, rec: dict[str, Any]) -> str | None:
-    loc = loc_for_entry(c, rec)
-    return loc.path_lower if loc.reachable else None
+def leaf(meta: dict[str, Any]) -> dict[str, Any]:
+    """Drop ``.tag`` for fields whose Stone type is the leaf struct (``FileMetadata`` /
+    ``FolderMetadata``) rather than the polymorphic ``Metadata`` -- Dropbox only tags the latter."""
+    return {k: v for k, v in meta.items() if k != ".tag"}
 
 
 # ---------------------------------------------------------------------------------------
@@ -652,7 +658,3 @@ def user_info(c: Call, acct: dict[str, Any]) -> dict[str, Any]:
     if d["same_team"] and acct.get("team_member_id"):
         d["team_member_id"] = acct["team_member_id"]
     return d
-
-
-def api_not_found_ns() -> Exception:
-    return api_error({".tag": "invalid_id"})

@@ -144,7 +144,13 @@ class Ops:
         return self._insert(rec)
 
     def ensure_folders(
-        self, ns_id: str, parent_rel: str, names: list[str], *, when: datetime | None = None, owner: str | None = None
+        self,
+        ns_id: str,
+        parent_rel: str,
+        names: list[str],
+        *,
+        when: datetime | None = None,
+        owner: str | None = None,
     ) -> str:
         """Create any missing folders along ``names`` under ``parent_rel``; return the final rel path."""
         rel = parent_rel
@@ -307,6 +313,51 @@ class Ops:
                 parent_in = parent_of(rel_in)
                 clone(item, root["path"] + parent_in, item["name"])
         return root
+
+    # -- shared folders -----------------------------------------------------------------
+    def convert_to_shared(self, rec: dict[str, Any], new_ns: str) -> None:
+        """Turn folder ``rec`` into a mount point and move its subtree into namespace ``new_ns``."""
+        base_path, base_dpath = rec["path"], rec["dpath"]
+        subtree = self.subtree_of(rec)
+        for item in subtree:
+            self._log(item, "delete")
+            self.tree.drop(item)
+        for item in subtree:
+            item["ns"] = new_ns
+            item["path"] = item["path"][len(base_path) :]
+            item["dpath"] = item["dpath"][len(base_dpath) :]
+            self.tree.add(item)
+            self._log(item, "upsert")
+        self.tree.drop(rec)
+        rec["mount_ns"] = new_ns
+        self.tree.add(rec)
+        self._log(rec, "upsert")
+        self.touched.add(new_ns)
+
+    def convert_from_shared(self, mount: dict[str, Any]) -> None:
+        """Dissolve a shared namespace: its content comes back under ``mount`` in the owner's tree."""
+        shared_ns = mount["mount_ns"]
+        base_path, base_dpath, dest_ns = mount["path"], mount["dpath"], mount["ns"]
+        content = [
+            r
+            for r in self.ctx.store.collection(ENTRIES).values()
+            if r["ns"] == shared_ns and not r.get("deleted")
+        ]
+        content.sort(key=lambda r: r["path"].count("/"))
+        for item in content:
+            self._log(item, "delete")
+            self.tree.drop(item)
+        self.tree.drop(mount)
+        mount.pop("mount_ns", None)
+        self.tree.add(mount)
+        for item in content:
+            item["ns"] = dest_ns
+            item["path"] = base_path + item["path"]
+            item["dpath"] = base_dpath + item["dpath"]
+            self.tree.add(item)
+            self._log(item, "upsert")
+        self._log(mount, "upsert")
+        self.touched.add(dest_ns)
 
 
 def _parse(value: str) -> datetime:

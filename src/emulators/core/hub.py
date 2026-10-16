@@ -88,6 +88,7 @@ class EmulatorHub:
         self.webhook_transport = webhook_transport
         self.snapshots: dict[str, dict[str, Any]] = {}
         self._seeded: dict[str, dict[str, Any]] = {}
+        self._settings: dict[str, dict[str, str]] = {}
         self._lock = threading.RLock()
 
         wanted = list(providers) if providers is not None else _env_list("EMULATORS_PROVIDERS")
@@ -132,6 +133,7 @@ class EmulatorHub:
                 settings=merged,
             )
             self.contexts[name] = ctx
+            self._settings[name] = dict(merged)
             self._seed(name)
             self.apps[name] = build_provider_app(ctx)
         self._gateway: Starlette | None = None
@@ -152,6 +154,8 @@ class EmulatorHub:
             for provider_name in [name] if name else list(self.contexts):
                 ctx = self.contexts[provider_name]
                 ctx.store.restore(self._seeded[provider_name])
+                ctx.settings.clear()
+                ctx.settings.update(self._settings[provider_name])
                 ctx.journal.clear()
                 ctx.faults.clear()
 

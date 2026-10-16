@@ -24,10 +24,13 @@ DBX_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 BLOCK = 4 * 1024 * 1024
 MISSING: Any = object()
 
-PATH_R_OR_ID = r"(/(.|[\r\n])*)?|id:.*|(ns:[0-9]+(/.*)?)"
-PATH_R = r"(/(.|[\r\n])*)?|(ns:[0-9]+(/.*)?)"
-READ_PATH = r"(/(.|[\r\n])*|id:.*)|(rev:[0-9a-f]{9,})|(ns:[0-9]+(/.*)?)"
-WRITE_PATH = r"(/(.|[\r\n])*)|(ns:[0-9]+(/.*)?)"
+_P = r"(/(.|[\r\n])*)"
+_NS = r"(ns:[0-9]+(/(.|[\r\n])*)?)"
+PATH_R_OR_ID = rf"{_P}?|id:.*|{_NS}"  # list_folder / search path ("" = root)
+READ_PATH = rf"(/(.|[\r\n])*|id:.*)|(rev:[0-9a-f]{{9,}})|{_NS}"  # get_metadata / download / export / ...
+WRITE_PATH = rf"{_P}|{_NS}"  # create_folder / restore
+WRITE_OR_ID = rf"{_P}|{_NS}|(id:.*)"  # delete / move / copy / upload / commit / lock
+REVISIONS_PATH = rf"/(.|[\r\n])*|id:.*|{_NS}"
 PATH_ONLY = r"/(.|[\r\n])*"
 
 
@@ -88,7 +91,7 @@ def api_error(
     return EmulatorError(status, body, headers=headers)
 
 
-def tag(name: str, **fields: Any) -> dict[str, Any]:
+def tag(name: str, /, **fields: Any) -> dict[str, Any]:
     return {".tag": name, **fields}
 
 
@@ -112,14 +115,6 @@ def auth_error(kind: str, **fields: Any) -> EmulatorError:
 
 def missing_scope(scope: str) -> EmulatorError:
     return api_error({".tag": "missing_scope", "required_scope": scope}, 401)
-
-
-def rate_limit(retry_after: int = 1, reason: str = "too_many_requests") -> EmulatorError:
-    body = {
-        "error_summary": f"{reason}/...",
-        "error": {"reason": {".tag": reason}, "retry_after": retry_after},
-    }
-    return EmulatorError(429, body, headers={"Retry-After": str(retry_after)})
 
 
 # ---------------------------------------------------------------------------------------
@@ -146,7 +141,9 @@ class Args:
     def _fail(self, key: str, message: str) -> BadInput:
         return BadInput(f"{self.where}: {key}: {message}")
 
-    def str(self, key: str, default: Any = MISSING, *, pattern: str | None = None, nonempty: bool = False) -> Any:
+    def str(
+        self, key: str, default: Any = MISSING, *, pattern: str | None = None, nonempty: bool = False
+    ) -> Any:
         value = self.data.get(key)
         if value is None:
             if default is MISSING:
@@ -168,9 +165,7 @@ class Args:
             raise self._fail(key, f"expected boolean, got {type(value).__name__}")
         return value
 
-    def int(
-        self, key: str, default: Any = MISSING, *, lo: int | None = None, hi: int | None = None
-    ) -> Any:
+    def int(self, key: str, default: Any = MISSING, *, lo: int | None = None, hi: int | None = None) -> Any:
         value = self.data.get(key)
         if value is None:
             if default is MISSING:
@@ -205,7 +200,9 @@ class Args:
             raise self._fail(key, f"expected object, got {type(value).__name__}")
         return Args(value, f"{self.where}: {key}")
 
-    def union(self, key: str, allowed: tuple[str, ...] | None = None, default: Any = MISSING) -> tuple[str, Any]:
+    def union(
+        self, key: str, allowed: tuple[str, ...] | None = None, default: Any = MISSING
+    ) -> tuple[str, Any]:
         """Decode a Stone union value ``{".tag": "x", ...}`` (or a bare string for void tags)."""
         value = self.data.get(key)
         if value is None:
@@ -258,13 +255,12 @@ def header_json(value: Any) -> str:
 def decode_header_json(raw: str) -> Any:
     """Parse a ``Dropbox-API-Arg`` header. HTTP headers are latin-1 on the wire, but clients
     may send raw UTF-8 bytes; repair that before ``json.loads`` resolves ``\\uXXXX`` escapes."""
-    try:
-        return json.loads(raw)
-    except ValueError:
-        try:
-            return json.loads(raw.encode("latin-1").decode("utf-8"))
-        except (UnicodeError, ValueError):
-            raise
+    if not raw.isascii():
+        try:  # raw UTF-8 bytes were read as latin-1 by the HTTP layer
+            raw = raw.encode("latin-1").decode("utf-8")
+        except UnicodeError:
+            pass
+    return json.loads(raw)
 
 
 # ---------------------------------------------------------------------------------------
@@ -278,22 +274,17 @@ def digest(*parts: object) -> bytes:
     return hashlib.sha256("\x1f".join(str(p) for p in parts).encode()).digest()
 
 
-def file_id_for(key: str, counter: int) -> str:
-    """``id:a4ayc_80_OEAAAAAAAAAXw``: 11 chars of key hash + 11 chars of a big-endian counter."""
-    return "id:" + b64url(digest("dbx-file", key)[:8]) + b64url(counter.to_bytes(8, "big"))
-
-
 def numeric_id(key: str, digits: int = 10) -> str:
     n = int.from_bytes(digest("dbx-num", key)[:8], "big") % (9 * 10 ** (digits - 1)) + 10 ** (digits - 1)
     return str(n)
 
 
 def account_id_for(key: str) -> str:
-    return "dbid:" + b64url(digest("dbx-acct", key))[:39]
+    return "dbid:AA" + b64url(digest("dbx-acct", key))[:33]
 
 
 def member_id_for(key: str) -> str:
-    return "dbmid:" + b64url(digest("dbx-member", key))[:39]
+    return "dbmid:AA" + b64url(digest("dbx-member", key))[:37]
 
 
 def group_id_for(key: str) -> str:

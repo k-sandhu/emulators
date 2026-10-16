@@ -119,7 +119,21 @@ def category_of(name: str, is_folder: bool) -> str:
     return EXT_CATEGORIES.get(ext, "others")
 
 
-PREVIEWABLE = {"doc", "docx", "docm", "ppt", "pps", "ppsx", "ppsm", "pptx", "pptm", "xls", "xlsm", "xlsx", "rtf"}
+PREVIEWABLE = {
+    "doc",
+    "docx",
+    "docm",
+    "ppt",
+    "pps",
+    "ppsx",
+    "ppsm",
+    "pptx",
+    "pptm",
+    "xls",
+    "xlsm",
+    "xlsx",
+    "rtf",
+}
 THUMBNAILABLE = {"jpg", "jpeg", "png", "tiff", "tif", "gif", "webp", "ppm", "bmp"}
 
 

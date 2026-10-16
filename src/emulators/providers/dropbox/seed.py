@@ -59,12 +59,19 @@ def link_slug(key: str, n: int) -> str:
     return "".join(alphabet[b % 36] for b in raw[:n])
 
 
-def make_account(w: World, p: Person, ns_id: str, root_id: str, team_id: str, anchor: datetime) -> dict[str, Any]:
+def make_account(
+    w: World, p: Person, ns_id: str, root_id: str, team_id: str, anchor: datetime
+) -> dict[str, Any]:
     is_team = not p.is_external
     key = p.id
     office = w.office(p.office_id) if p.office_id else None
-    client = w.client(p.company_id) if p.company_id else None
-    country = office.address.country_code if office else (client.address.country_code if client else "US")
+    company = None
+    if p.company_id:
+        try:
+            company = w.client(p.company_id)
+        except KeyError:
+            company = w.vendor(p.company_id)  # vendor contacts carry a "v###" company id
+    country = office.address.country_code if office else (company.address.country_code if company else "US")
     status = "active" if (p.active or not is_team) else "suspended"
     return {
         "id": account_id_for(key),
@@ -172,7 +179,9 @@ def seed(ctx: ProviderContext) -> None:
     by_person = {a["person"]: a for a in accounts}
     for g in w.groups:
         gid = group_id_for(g.id)
-        members = [by_person[m]["team_member_id"] for m in g.member_ids if m in by_person and by_person[m]["is_team"]]
+        members = [
+            by_person[m]["team_member_id"] for m in g.member_ids if m in by_person and by_person[m]["is_team"]
+        ]
         store.collection(GROUPS).put(
             {
                 "id": gid,
@@ -200,7 +209,12 @@ def seed(ctx: ProviderContext) -> None:
                 access = ROLE_MAP.get(role, "viewer")
                 if principal.startswith("g-"):
                     members.append(
-                        {"kind": "group", "group_id": group_id_for(principal), "access_type": access, "inherited": False}
+                        {
+                            "kind": "group",
+                            "group_id": group_id_for(principal),
+                            "access_type": access,
+                            "inherited": False,
+                        }
                     )
                 elif principal in by_person:
                     members.append(
@@ -280,7 +294,12 @@ def _seed_document(
     modifier = by_person.get(doc.modified_by_id, owner)
     table = [list(r) for r in doc.table] if doc.table else None
     data, _ = docs.render(
-        doc.kind, doc.title, list(doc.paragraphs), author=owner["display_name"], created=doc.created, table=table
+        doc.kind,
+        doc.title,
+        list(doc.paragraphs),
+        author=owner["display_name"],
+        created=doc.created,
+        table=table,
     )
     parent = ""
     if doc.folder:
@@ -347,7 +366,7 @@ def _seed_share(
                 "expires": ts(share.expires) if share.expires else None,
                 "created": ts(created),
                 "rlkey": link_slug("rlkey/" + doc.id, 25),
-                "legacy": False,
+                "legacy": doc.id.endswith("2"),  # one legacy /s/<id>/<name> link, one /scl/fi/ link
             }
         )
         return
@@ -381,10 +400,18 @@ def _seed_extras(
     knowledge = space_ns.get("knowledge")
     if knowledge:
         writer = by_person[w.space("knowledge").owner_id]
-        notes = ops.ensure_folders(knowledge, "", ["Paper"], when=anchor - timedelta(days=60), owner=writer["id"])
+        notes = ops.ensure_folders(
+            knowledge, "", ["Paper"], when=anchor - timedelta(days=60), owner=writer["id"]
+        )
         samples = [
-            ("Onboarding Checklist", ["Set up laptop and accounts", "Meet your manager", "Complete security training"]),
-            ("Engagement Kickoff Template", ["Goals and scope", "Team roles and rates", "Key dates and deliverables"]),
+            (
+                "Onboarding Checklist",
+                ["Set up laptop and accounts", "Meet your manager", "Complete security training"],
+            ),
+            (
+                "Engagement Kickoff Template",
+                ["Goals and scope", "Team roles and rates", "Key dates and deliverables"],
+            ),
         ]
         for i, (title, bullets) in enumerate(samples):
             md = f"# {title}\n\n" + "\n".join(f"- {b}" for b in bullets) + "\n"
@@ -407,9 +434,15 @@ def _seed_extras(
     growth = space_ns.get("growth")
     if growth:
         owner = by_person[w.space("growth").owner_id]
-        folder = ops.ensure_folders(growth, "", ["Brand Assets", "Photos"], when=anchor - timedelta(days=90), owner=owner["id"])
+        folder = ops.ensure_folders(
+            growth, "", ["Brand Assets", "Photos"], when=anchor - timedelta(days=90), owner=owner["id"]
+        )
         for i, (name, width, height) in enumerate(
-            [("Office Entrance.png", 160, 90), ("Team Offsite.png", 128, 128), ("Conference Booth.png", 96, 96)]
+            [
+                ("Office Entrance.png", 160, 90),
+                ("Team Offsite.png", 128, 128),
+                ("Conference Booth.png", 96, 96),
+            ]
         ):
             ops.create_file(
                 growth,

@@ -8,7 +8,6 @@ from typing import Any
 from emulators.core.errors import EmulatorError
 from emulators.providers.dropbox import model as m
 from emulators.providers.dropbox.common import (
-    api_error,
     autorename,
     disallowed_name,
     path_error,
@@ -21,6 +20,8 @@ def lookup(
     c: m.Call, path: str, *, wrapper: str = "path", allow_root: bool = True, deleted_ok: bool = False
 ) -> m.Loc:
     """Resolve ``path`` or raise the route's ``<wrapper>/not_found`` 409."""
+    if path == "/":  # the root is addressed as "" -- a bare slash is malformed, like on Dropbox
+        raise path_error("malformed_path", wrapper)
     loc = m.resolve(c, path, allow_root=allow_root)
     if loc is None:
         raise path_error("not_found", wrapper)
@@ -37,11 +38,6 @@ def require_file(loc: m.Loc, wrapper: str = "path") -> dict[str, Any]:
 def require_folder(loc: m.Loc, wrapper: str = "path") -> None:
     if loc.rec is not None and loc.rec["type"] != "folder":
         raise path_error("not_folder", wrapper)
-
-
-def lookup_file(c: m.Call, path: str, *, wrapper: str = "path") -> tuple[m.Loc, dict[str, Any]]:
-    loc = lookup(c, path, wrapper=wrapper, allow_root=False)
-    return loc, require_file(loc, wrapper)
 
 
 def mount_error(rec: dict[str, Any], tree: m.Tree) -> str | None:
@@ -84,6 +80,14 @@ def write_target(c: m.Call, path: str) -> Target:
     segments = m.split_path(path)
     if not segments:
         return Target(c.actor.root_ns, "", [], "", None, "", "", None, is_root=True)
+    if path.startswith("id:"):
+        loc = m.resolve(c, path, allow_root=False)
+        if loc is None or loc.rec is None:
+            raise path_error("malformed_path")
+        rec = loc.rec
+        prefix = m.locate_ns(c, rec["ns"]) or ("", "")
+        role = m.entry_role(c, rec)
+        return Target(rec["ns"], m.parent_of(rec["path"]), [], rec["name"], rec, prefix[0], prefix[1], role)
     w = m.resolve_for_write(c, path)
     if w.found:
         rec = w.loc.rec
@@ -132,9 +136,7 @@ def materialize_parents(c: m.Call, target: Target) -> str:
     if not target.missing:
         return target.parent_rel
     ops = Ops(c.ctx, c.tree, c.touched)
-    return ops.ensure_folders(
-        target.ns, target.parent_rel, target.missing, when=c.now(), owner=c.actor.id
-    )
+    return ops.ensure_folders(target.ns, target.parent_rel, target.missing, when=c.now(), owner=c.actor.id)
 
 
 def conflicted_copy_name(c: m.Call, name: str) -> str:
@@ -143,6 +145,17 @@ def conflicted_copy_name(c: m.Call, name: str) -> str:
     return f"{stem} ({c.actor.account['display_name']}'s conflicted copy {day}){ext}"
 
 
-def gate(condition: bool, error: dict[str, Any], status: int = 409) -> None:
-    if not condition:
-        raise api_error(error, status)
+def quota_exceeded(c: m.Call, ns_id: str, extra: int, *, replacing: int = 0) -> bool:
+    """Would ``extra`` more bytes overflow the owner's storage allocation (member homes only)?"""
+    ns = c.tree.namespace(ns_id)
+    if ns is None or ns["type"] not in ("team_member_folder", "personal"):
+        return False
+    owner = m.account(c.ctx, ns.get("owner"))
+    if owner is None:
+        return False
+    used = sum(
+        r["revisions"][-1]["size"]
+        for r in c.tree.entries.values()
+        if r["ns"] == ns_id and r["type"] == "file" and not r.get("deleted")
+    )
+    return used - replacing + extra > owner["space_allocated"]

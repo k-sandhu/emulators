@@ -87,9 +87,7 @@ def route(
     void_arg: bool = False,
 ) -> Callable[[Callable[[m.Call], Any]], Callable[[m.Call], Any]]:
     def decorator(fn: Callable[[m.Call], Any]) -> Callable[[m.Call], Any]:
-        ROUTES[name] = RouteDef(
-            name, fn, style, tuple(p.strip() for p in auth.split(",")), scope, void_arg
-        )
+        ROUTES[name] = RouteDef(name, fn, style, tuple(p.strip() for p in auth.split(",")), scope, void_arg)
         return fn
 
     return decorator
@@ -272,18 +270,31 @@ def parse_arg(request: Request, rd: RouteDef, body: bytes) -> tuple[Args, bytes]
 # ---------------------------------------------------------------------------------------
 # Responses
 # ---------------------------------------------------------------------------------------
+def strip_none(value: Any) -> Any:
+    """Dropbox omits absent optional fields instead of sending ``null``."""
+    if isinstance(value, dict):
+        return {k: strip_none(v) for k, v in value.items() if v is not None}
+    if isinstance(value, list):
+        return [strip_none(v) for v in value]
+    return value
+
+
 def json_response(result: Any, request_id: str, status: int = 200) -> Response:
-    payload = json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode()
+    payload = json.dumps(strip_none(result), ensure_ascii=False, separators=(",", ":")).encode()
     return Response(
-        payload, status_code=status, media_type="application/json", headers={"X-Dropbox-Request-Id": request_id}
+        payload,
+        status_code=status,
+        media_type="application/json",
+        headers={"X-Dropbox-Request-Id": request_id, **CORS_HEADERS},
     )
 
 
 def download_response(dl: Download, request_id: str) -> Response:
     headers = {
-        "Dropbox-API-Result": header_json(dl.result),
+        "Dropbox-API-Result": header_json(strip_none(dl.result)),
         "X-Dropbox-Request-Id": request_id,
         "Accept-Ranges": "bytes",
+        **CORS_HEADERS,
         **dl.headers,
     }
     return Response(dl.body, status_code=dl.status, media_type=dl.content_type, headers=headers)
@@ -306,7 +317,12 @@ def parse_range(header: str | None, total: int) -> tuple[int, int] | None:
         return None
     end = min(end, total - 1)
     if start >= total or start > end:
-        raise EmulatorError(416, "Range Not Satisfiable", headers={"Content-Range": f"bytes */{total}"}, media_type="text/plain")
+        raise EmulatorError(
+            416,
+            "Range Not Satisfiable",
+            headers={"Content-Range": f"bytes */{total}"},
+            media_type="text/plain",
+        )
     return start, end
 
 
@@ -341,7 +357,9 @@ async def handle(ctx: ProviderContext, request: Request, route_path: str) -> Res
         body = await request.body()
         args, payload = parse_arg(request, rd, body)
         actor = authenticate(ctx, request, rd)
-        c = m.Call(ctx=ctx, request=request, route=name, args=args, body=payload, actor=actor, request_id=request_id)
+        c = m.Call(
+            ctx=ctx, request=request, route=name, args=args, body=payload, actor=actor, request_id=request_id
+        )
         result = rd.fn(c)
         if inspect.isawaitable(result):
             result = await result
@@ -361,8 +379,14 @@ async def handle(ctx: ProviderContext, request: Request, route_path: str) -> Res
     return json_response(result, request_id)
 
 
+CORS_HEADERS = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Expose-Headers": "Dropbox-API-Result, X-Dropbox-Request-Id, Content-Range, Accept-Ranges",
+}
+
+
 def _stamp(exc: EmulatorError, request_id: str) -> EmulatorError:
-    exc.headers = {**exc.headers, "X-Dropbox-Request-Id": request_id}
+    exc.headers = {**exc.headers, "X-Dropbox-Request-Id": request_id, **CORS_HEADERS}
     return exc
 
 
@@ -370,6 +394,23 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
     @app.api_route("/2/{route_path:path}", methods=["POST", "GET"], include_in_schema=False)
     async def api(route_path: str, request: Request) -> Response:
         return await handle(ctx, request, route_path)
+
+    @app.options("/2/{route_path:path}", include_in_schema=False)
+    @app.options("/oauth2/token", include_in_schema=False)
+    async def preflight(request: Request) -> Response:
+        """CORS preflight for the browser SDK (``Content-Type: text/plain; charset=dropbox-cors-hack``)."""
+        return Response(
+            status_code=200,
+            headers={
+                **CORS_HEADERS,
+                "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
+                "Access-Control-Allow-Headers": request.headers.get(
+                    "access-control-request-headers",
+                    "Authorization, Content-Type, Dropbox-API-Arg, Dropbox-API-Select-User, Dropbox-API-Select-Admin, Dropbox-API-Path-Root",
+                ),
+                "Access-Control-Max-Age": "86400",
+            },
+        )
 
 
 __all__ = ["ROUTES", "Download", "Raw", "api_error", "register", "route"]

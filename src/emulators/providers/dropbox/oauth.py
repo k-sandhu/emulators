@@ -143,7 +143,11 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
             if redirect_uri:
                 url = redirect_with_params(
                     redirect_uri,
-                    {"error": "unsupported_response_type", "error_description": "Invalid response_type", "state": state},
+                    {
+                        "error": "unsupported_response_type",
+                        "error_description": "Invalid response_type",
+                        "state": state,
+                    },
                 )
                 return RedirectResponse(url, status_code=302)
             return _page("Dropbox", "<h1>Error</h1><p>Invalid response_type.</p>", 400)
@@ -184,7 +188,9 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
                 fragment["team_id"] = body["team_id"]
             if not redirect_uri:
                 return _page("Dropbox", "<h1>Access granted</h1>")
-            return RedirectResponse(redirect_with_params(redirect_uri, fragment, fragment=True), status_code=302)
+            return RedirectResponse(
+                redirect_with_params(redirect_uri, fragment, fragment=True), status_code=302
+            )
         grant = ctx.tokens.issue_code(
             client_id=client_id,
             user_id=acct["person"],

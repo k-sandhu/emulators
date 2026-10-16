@@ -20,7 +20,9 @@ def find_account(ctx: ProviderContext, who: Any) -> dict[str, Any] | None:
         or m.account_by_person(ctx, text)
         or m.account_by_email(ctx, text)
         or m.account_by_member_id(ctx, text)
-        or next((a for a in ctx.store.collection(m.ACCOUNTS) if a["display_name"].lower() == text.lower()), None)
+        or next(
+            (a for a in ctx.store.collection(m.ACCOUNTS) if a["display_name"].lower() == text.lower()), None
+        )
     )
 
 
@@ -37,7 +39,9 @@ def mint_token(ctx: ProviderContext, payload: dict[str, Any]) -> dict[str, Any]:
     if acct is None and user:
         raise EmulatorError(404, {"error": f"unknown user '{user}'"})
     if acct is None:
-        acct = next(a for a in ctx.store.collection(m.ACCOUNTS) if any(r["name"] == "Team admin" for r in a["roles"]))
+        acct = next(
+            a for a in ctx.store.collection(m.ACCOUNTS) if any(r["name"] == "Team admin" for r in a["roles"])
+        )
     if team and not acct.get("is_team"):
         raise EmulatorError(400, {"error": "team tokens need a team member"})
     scopes = payload.get("scopes") or []
@@ -55,5 +59,23 @@ def mint_token(ctx: ProviderContext, payload: dict[str, Any]) -> dict[str, Any]:
     return body
 
 
+def set_quota(ctx: ProviderContext, payload: dict[str, Any]) -> dict[str, Any]:
+    """Cap one person's storage so uploads fail with ``path/insufficient_space``:
+    ``{"user": "<email|id>", "allocated": 1048576}``."""
+    acct = find_account(ctx, payload.get("user"))
+    if acct is None:
+        raise EmulatorError(404, {"error": f"unknown user '{payload.get('user')}'"})
+    acct["space_allocated"] = int(payload["allocated"])
+    return {"account_id": acct["id"], "allocated": acct["space_allocated"]}
+
+
 def register(provider: Provider, ctx: ProviderContext) -> None:
+    from emulators.providers.dropbox import file_requests, webhooks
+
     provider.actions["mint_token"] = mint_token
+    provider.actions["set_quota"] = set_quota
+    provider.actions["simulate_file_request_upload"] = file_requests.simulate_upload
+    provider.actions["configure_webhook"] = webhooks.configure_webhook
+    provider.actions["remove_webhook"] = webhooks.remove_webhook
+    provider.actions["list_webhooks"] = webhooks.list_webhooks
+    provider.actions["trigger_webhook"] = webhooks.trigger_webhook

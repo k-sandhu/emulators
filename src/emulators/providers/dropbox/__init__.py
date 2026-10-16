@@ -2,15 +2,26 @@
 
 Modules (routes register themselves with :mod:`dispatch` on import):
 
-``seed``           project the Halcyon world into a Business team
-``model`` ``ops``  namespaces / entries / access control / mutations
-``dispatch``       RPC + content-upload + content-download plumbing, auth, path roots
-``oauth``          ``/oauth2/authorize`` and ``/oauth2/token`` on www.dropbox.com / api.dropboxapi.com
-``files_*``        the ``files/*`` namespace
-``sharing_*``      the ``sharing/*`` namespace (folders, members, links)
-``users`` ``team`` ``team_log``  account, team and audit-log routes
-``webhooks``       webhook registration, change notifications and long-polling
-``actions``        ``/_emulator/actions/*`` (tokens, webhooks, simulated edits)
+``seed``                project the Halcyon world into a Business team
+``model`` ``ops``       namespaces / entries / access control / path resolution / mutations
+``common`` ``catalog``  wire helpers (errors, args, ids, content hash) and static catalogs
+``dispatch``            RPC + content-upload + content-download plumbing, auth, path roots, CORS
+``oauth``               ``/oauth2/authorize`` and ``/oauth2/token`` (www.dropbox.com / api.dropboxapi.com)
+``files_core``          list_folder (+cursors), get_metadata, create_folder, delete, move, copy
+``files_content``       upload (+sessions), download, zip, export, temporary links, thumbnails, previews
+``files_batch``         batch variants and async-job polling
+``files_misc``          revisions, restore, tags, locks, copy references, save_url
+``files_search``        search_v2
+``file_properties``     property templates and groups
+``file_requests``       file requests (uploads are simulated)
+``fileutil``            shared path / write-target / quota helpers
+``sharing_folders``     shared folders and their members; ``sharing_files`` file members
+``sharing_links``       shared links API; ``links_web`` the public pages and temporary links
+``users`` ``team`` ``team_security`` ``team_log``  account, team, devices/apps and audit-log routes
+``webhooks``            webhook registration, change notifications and long-polling
+``legacy``              deprecated routes still called by older SDKs
+``imaging``             thumbnail encoders (PNG, baseline JPEG)
+``actions``             ``/_emulator/actions/*`` (tokens, webhooks, quota, simulated uploads)
 """
 
 from __future__ import annotations
@@ -43,33 +54,39 @@ class DropboxProvider(Provider):
     )
     credentials = {
         "app_key / app_secret": "any (lenient) -- e.g. halcyon_app_key / halcyon_app_secret",
-        "user token": "POST /_emulator/tokens {\"user\": \"maya.chen@halcyonadvisory.example\"}",
-        "team token": "POST /_emulator/tokens {\"user\": \"arjun.mehta@halcyonadvisory.example\", \"team\": true}",
+        "user token": 'POST /_emulator/tokens {"user": "maya.chen@halcyonadvisory.example"}',
+        "team token": 'POST /_emulator/tokens {"user": "arjun.mehta@halcyonadvisory.example", "team": true}',
         "oauth": "GET www.dropbox.com/oauth2/authorize?...&login_hint=<email> auto-approves",
         "team": "dbtid:AAD94f565a6beeb52a733f8bef7d77b04 (Halcyon Advisory Group)",
         "admins": "Arjun Mehta (Team admin), Sarah Johansson (User management admin)",
     }
 
     def seed(self, ctx: ProviderContext) -> None:
-        from emulators.providers.dropbox import seed
+        from emulators.providers.dropbox import seed, team_log
 
         seed.seed(ctx)
+        team_log.seed_events(ctx)
 
     def build(self, app: FastAPI, ctx: ProviderContext) -> None:
-        from emulators.providers.dropbox import (  # noqa: F401  (imports register routes)
+        from emulators.providers.dropbox import (  # noqa: F401  (importing registers the routes)
             actions,
             dispatch,
+            file_properties,
+            file_requests,
             files_batch,
             files_content,
             files_core,
+            files_misc,
             files_search,
-            files_transfer,
+            legacy,
             links_web,
             oauth,
+            sharing_files,
             sharing_folders,
             sharing_links,
             team,
             team_log,
+            team_security,
             users,
             webhooks,
         )
@@ -103,7 +120,11 @@ class DropboxProvider(Provider):
             return status, headers, json.dumps(self.error_body(status, "", "")).encode()
         if status == 409:
             err = {".tag": "too_many_write_operations"}
-            return status, headers, json.dumps({"error_summary": "too_many_write_operations/...", "error": err}).encode()
+            return (
+                status,
+                headers,
+                json.dumps({"error_summary": "too_many_write_operations/...", "error": err}).encode(),
+            )
         headers["content-type"] = "text/plain; charset=utf-8"
         text = {400: "Error in call to API function: injected bad request", 503: "Service Unavailable"}.get(
             status, "Internal Server Error"
