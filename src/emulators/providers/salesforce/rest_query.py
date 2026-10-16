@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from datetime import timedelta
 from typing import Any
 
 from emulators.core.ids import salesforce_id
@@ -33,7 +34,9 @@ def batch_size(req: ApiRequest) -> int:
     match = re.search(r"batchSize\s*=\s*(\d+)", header, re.IGNORECASE)
     if not match:
         return DEFAULT_BATCH
-    return min(max(int(match.group(1)), MIN_BATCH), DEFAULT_BATCH)
+    digits = match.group(1).lstrip("0")
+    requested = DEFAULT_BATCH if len(digits) > 4 else int(digits or "0")
+    return min(max(requested, MIN_BATCH), DEFAULT_BATCH)
 
 
 def new_cursor_id(api: Api) -> str:
@@ -65,6 +68,7 @@ def page(
                 "total": total,
                 "batch": batch,
                 "owner": req.session.user["Id"],
+                "expires_at": req.org.now() + timedelta(days=2),
             },
         )
     return {
@@ -129,14 +133,18 @@ def register(api: Api) -> None:
     def more(req: ApiRequest) -> ApiResponse:
         cursor_id, _, offset_text = req.params["locator"].rpartition("-")
         cursor = req.org.coll(CURSORS).get(cursor_id)
+        try:
+            offset = int(offset_text) if offset_text.isascii() and offset_text.isdigit() else -1
+        except ValueError:
+            offset = -1
         if (
             cursor is None
-            or not offset_text.isdigit()
+            or offset < 0
             or cursor.get("owner") != req.session.user["Id"]
-            or int(offset_text) > len(cursor["records"])
+            or req.org.now() >= cursor["expires_at"]
+            or offset > len(cursor["records"])
         ):
             raise SfError(400, "INVALID_QUERY_LOCATOR", "Invalid query locator")
-        offset = int(offset_text)
         return json_response(
             page(req, cursor["records"], cursor["total"], cursor["batch"], offset=offset, cursor_id=cursor_id)
         )

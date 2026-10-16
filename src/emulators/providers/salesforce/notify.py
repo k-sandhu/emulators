@@ -10,7 +10,7 @@ from typing import Any
 from xml.sax.saxutils import escape
 
 from emulators.core.ids import salesforce_id
-from emulators.core.provider import ProviderContext
+from emulators.core.provider import ProviderContext, ctx_url_for_host
 from emulators.providers.salesforce.common import INSTANCE_HOST
 from emulators.providers.salesforce.org import Org
 from emulators.providers.salesforce.schema import SCHEMA
@@ -44,7 +44,7 @@ def notification_xml(
             f'<sObject xsi:type="sf:{obj.name}" xmlns:sf="urn:sobject.enterprise.soap.sforce.com">{cells}</sObject>'
             "</Notification>"
         )
-    base = f"https://{INSTANCE_HOST}"
+    base = ctx_url_for_host(org.ctx, INSTANCE_HOST, "").rstrip("/")
     return (
         '<?xml version="1.0" encoding="UTF-8"?>'
         '<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" '
@@ -124,12 +124,14 @@ class Notifier:
                     batch.append((salesforce_id("04l", seq["04l"]), rec))
                 if not batch:
                     continue
-                body = notification_xml(self.org, cfg, batch).encode()
-                await self.ctx.webhooks.deliver(
-                    cfg["url"],
-                    body,
-                    content_type="text/xml; charset=UTF-8",
-                    headers={"SOAPAction": '""'},
-                    event_type=f"outbound.{cfg['object']}.{op}",
-                    metadata={"config": cfg["id"], "records": [r["Id"] for _, r in batch]},
-                )
+                for start in range(0, len(batch), 100):
+                    chunk = batch[start : start + 100]
+                    body = notification_xml(self.org, cfg, chunk).encode()
+                    await self.ctx.webhooks.deliver(
+                        cfg["url"],
+                        body,
+                        content_type="text/xml; charset=UTF-8",
+                        headers={"SOAPAction": '""'},
+                        event_type=f"outbound.{cfg['object']}.{op}",
+                        metadata={"config": cfg["id"], "records": [r["Id"] for _, r in chunk]},
+                    )

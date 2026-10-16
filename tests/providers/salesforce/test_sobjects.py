@@ -412,7 +412,13 @@ async def test_line_items_roll_up_into_the_opportunity(admin: Actor) -> None:
         "REQUIRED_FIELD_MISSING",
     )
     one = await admin.create(
-        "OpportunityLineItem", {"OpportunityId": opp, "PricebookEntryId": cheap["Id"], "Quantity": 4}
+        "OpportunityLineItem",
+        {
+            "OpportunityId": opp,
+            "PricebookEntryId": cheap["Id"],
+            "Quantity": 4,
+            "UnitPrice": cheap["UnitPrice"],
+        },
     )
     got = (await admin.get(f"/sobjects/OpportunityLineItem/{one}")).json()
     assert got["UnitPrice"] == cheap["UnitPrice"] == got["ListPrice"] and got["TotalPrice"] == round(

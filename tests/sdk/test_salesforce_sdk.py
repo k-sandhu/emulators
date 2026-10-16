@@ -429,3 +429,64 @@ def test_web_server_flow_with_a_generic_oauth2_client(emulator_intercept: object
         token["id"], headers={"Authorization": f"Bearer {refreshed['access_token']}"}, timeout=10
     )
     assert identity.json()["username"] == ADMIN
+
+
+def test_collection_retrieve_uses_salesforce_post_field_names(sf: Salesforce) -> None:
+    rid = sf.query("SELECT Id FROM Account LIMIT 1")["records"][0]["Id"]
+    result = sf.restful(
+        "composite/sobjects/Account",
+        method="POST",
+        json={
+            "recordIds": [rid] * 201,
+            "fieldNames": ["Id", "Name"],
+        },
+    )
+    assert len(result) == 201 and all(row["Id"] == rid for row in result)
+
+
+def test_composite_collection_results_can_feed_sobject_requests(sf: Salesforce) -> None:
+    result = sf.restful(
+        "composite",
+        method="POST",
+        json={
+            "allOrNone": True,
+            "compositeRequest": [
+                {
+                    "method": "POST",
+                    "url": "/services/data/v59.0/composite/sobjects",
+                    "referenceId": "accounts",
+                    "body": {
+                        "records": [{"attributes": {"type": "Account"}, "Name": "SDK array reference"}],
+                    },
+                },
+                {
+                    "method": "POST",
+                    "url": "/services/data/v59.0/sobjects/Contact",
+                    "referenceId": "contact",
+                    "body": {
+                        "LastName": "Collection SDK",
+                        "AccountId": "@{accounts[0].id}",
+                    },
+                },
+            ],
+        },
+    )["compositeResponse"]
+    assert [row["httpStatusCode"] for row in result] == [200, 201]
+    assert sf.Contact.get(result[1]["body"]["id"])["AccountId"] == result[0]["body"][0]["id"]
+
+
+def test_external_id_lookup_keeps_private_records_hidden(sf: Salesforce, emulator_intercept: object) -> None:
+    rid = sf.Opportunity.create(
+        {"Name": "SDK private alias", "StageName": "Prospecting", "CloseDate": "2026-11-01"}
+    )["id"]
+    staff = Salesforce(instance_url=INSTANCE, session_id=minted("p011"))
+    with pytest.raises(SalesforceResourceNotFound):
+        staff.Opportunity.get_by_custom_id("Id", rid)
+    assert sf.Opportunity.get_by_custom_id("Id", rid)["Id"] == rid
+
+
+def test_case_insensitive_18_character_ids_work_through_sdk(sf: Salesforce) -> None:
+    rid = sf.Lead.create({"LastName": "Case safe SDK", "Company": "SDK Company"})["id"]
+    assert sf.Lead.get(rid.lower())["Id"] == rid
+    assert sf.Lead.update(rid.upper(), {"Title": "Updated"}) == 204
+    assert sf.Lead.get(rid)["Title"] == "Updated"

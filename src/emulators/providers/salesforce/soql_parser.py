@@ -7,7 +7,9 @@ exact message layout Salesforce uses (query line, caret under the offending toke
 
 from __future__ import annotations
 
+import math
 import re
+import sys
 from dataclasses import dataclass, field
 from datetime import date
 from typing import Any
@@ -219,7 +221,16 @@ def tokenize(query: str) -> list[Token]:
                     query, Token(kind, text, text, pos, row, col), f"Invalid {kind} literal: '{text}'"
                 )
             if kind == "number":
-                value = float(text) if any(c in text for c in ".eE") else int(text)
+                try:
+                    value = float(text) if any(c in text for c in ".eE") else int(text)
+                    if isinstance(value, float) and not math.isfinite(value):
+                        raise ValueError
+                    if isinstance(value, int) and abs(value) > sys.float_info.max:
+                        raise ValueError
+                except (ValueError, OverflowError) as exc:
+                    raise query_error(
+                        query, Token(kind, None, text, pos, row, col), "Numeric literal out of range"
+                    ) from exc
             tokens.append(Token(kind, value, text, pos, row, col))
         pos = match.end()
     tokens.append(Token("eof", None, "<EOF>", n, row, n - line_start + 1))
@@ -536,6 +547,15 @@ class Parser:
         return self.parse_ref()
 
     def parse_func(self) -> Func:
+        self.depth += 1
+        try:
+            if self.depth > MAX_NESTING:
+                raise self.error(message="Query is too complex: functions are nested too deeply")
+            return self._parse_func()
+        finally:
+            self.depth -= 1
+
+    def _parse_func(self) -> Func:
         name_tok = self.advance()
         name = name_tok.upper
         self.expect_punct("(")

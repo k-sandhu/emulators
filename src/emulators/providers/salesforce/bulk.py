@@ -108,7 +108,7 @@ def register(api: Api) -> None:
         return job
 
     def _get(req: ApiRequest, kind: str) -> dict[str, Any]:
-        job = req.org.coll(JOBS).get(req.params["id"])
+        job = req.org.coll(JOBS).get(norm_id(req.params["id"]))
         if job is None or job["_kind"] != kind:
             raise not_found()
         if not req.access.is_admin and job["createdById"] != req.session.user["Id"]:
@@ -147,7 +147,7 @@ def register(api: Api) -> None:
             raise invalid_job(f"Invalid object: {body.get('object')}", "InvalidJob")
         if operation == "upsert":
             ext = body.get("externalIdFieldName")
-            f = obj.field(ext) if ext else None
+            f = obj.field(ext) if isinstance(ext, str) else None
             if f is None or not (f.name == "Id" or f.external_id or f.id_lookup or f.unique):
                 raise invalid_job("Missing or invalid externalIdFieldName for upsert")
         if operation == "hardDelete" and not req.access.is_admin:
@@ -185,7 +185,10 @@ def register(api: Api) -> None:
             raise SfError(413, "InvalidBatch", "Request entity too large")
         if job.get("_csv") is not None:
             raise invalid_job("Data has already been uploaded to this job", "InvalidBatch")
-        text = req.body.decode("utf-8-sig", errors="replace")
+        try:
+            text = req.body.decode("utf-8-sig")
+        except UnicodeDecodeError as exc:
+            raise invalid_job("CSV data must be UTF-8 encoded", "InvalidBatch") from exc
         job["_csv"] = text
         return ApiResponse(201, None, media_type="application/json")
 
@@ -319,8 +322,17 @@ def register(api: Api) -> None:
         locator = req.q("locator")
         if locator and locator != "null":
             try:
-                offset = int(base64.urlsafe_b64decode(locator.encode()).decode().split(":")[1])
-            except (ValueError, IndexError) as exc:
+                job_id, offset_text = (
+                    base64.b64decode(locator.encode("ascii"), altchars=b"-_", validate=True)
+                    .decode("ascii")
+                    .split(":")
+                )
+                if job_id != job["id"] or not offset_text.isascii() or not offset_text.isdigit():
+                    raise ValueError
+                offset = int(offset_text)
+                if offset > len(rows):
+                    raise ValueError
+            except (ValueError, UnicodeError) as exc:
                 raise invalid_job("Invalid locator") from exc
         limit = int_param(req.q("maxRecords") or DEFAULT_MAX_RECORDS, "maxRecords", minimum=1)
         chunk = rows[offset : offset + limit]
@@ -329,7 +341,7 @@ def register(api: Api) -> None:
         ending = LINE_ENDINGS[job["lineEnding"]]
         text = _csv_text([job["_header"], *chunk], delimiter, ending)
         next_locator = (
-            base64.urlsafe_b64encode(f"offset:{offset + limit}".encode()).decode() if more else "null"
+            base64.urlsafe_b64encode(f"{job['id']}:{offset + limit}".encode()).decode() if more else "null"
         )
         return ApiResponse(
             200,
@@ -437,18 +449,24 @@ def _process_ingest(req: ApiRequest, job: dict[str, Any]) -> None:
     operation = job["operation"]
     delimiter = DELIMITERS[job["columnDelimiter"]]
     ending = LINE_ENDINGS[job["lineEnding"]]
-    reader = csv.reader(io.StringIO(job["_csv"], newline=""), delimiter=delimiter)
+    reader = csv.reader(io.StringIO(job["_csv"], newline=""), delimiter=delimiter, strict=True)
     try:
         header = next(reader)
+        rows = [row for row in reader if any(cell != "" for cell in row)]
     except StopIteration:
         _fail_ingest(job, "The CSV file is empty")
+        return
+    except csv.Error as exc:
+        _fail_ingest(job, f"Invalid CSV data: {exc}")
         return
     header = [h.strip() for h in header]
     problem = _header_problem(obj, operation, header)
     if problem:
         _fail_ingest(job, problem)
         return
-    rows = [row for row in reader if any(cell != "" for cell in row)]
+    if any(len(row) != len(header) for row in rows):
+        _fail_ingest(job, "Number of CSV columns does not match the header")
+        return
     dml = Dml(req.org, req.access, req.txn)
     ok_rows: list[list[Any]] = []
     bad_rows: list[list[Any]] = []

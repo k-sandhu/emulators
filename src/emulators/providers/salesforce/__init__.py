@@ -61,7 +61,9 @@ class SalesforceProvider(Provider):
 
     def build(self, app: FastAPI, ctx: ProviderContext) -> None:
         from emulators.providers.salesforce import routes
+        from emulators.providers.salesforce.outbound import OutboundDispatcher
 
+        ctx.webhooks = OutboundDispatcher.from_dispatcher(ctx.webhooks)
         routes.register(app, ctx)
 
     def error_body(self, status: int, code: str, message: str) -> Any:

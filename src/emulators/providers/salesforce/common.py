@@ -89,7 +89,18 @@ def norm_id(text: Any) -> str | None:
         return None
     if len(text) == 15:
         return to_18(text)
-    return text if to_18(text[:15]) == text else None
+    suffix = text[15:].upper()
+    if any(ch not in _CHECKSUM for ch in suffix):
+        return None
+    body = []
+    for chunk, checksum in enumerate(suffix):
+        bits = _CHECKSUM.index(checksum)
+        for i, ch in enumerate(text[chunk * 5 : chunk * 5 + 5]):
+            upper = bool(bits & (1 << i))
+            if upper and ch.isdigit():
+                return None
+            body.append(ch.upper() if upper else ch.lower())
+    return "".join(body) + suffix
 
 
 def id_prefix(text: str) -> str:
@@ -142,7 +153,13 @@ def parse_dt(text: str) -> datetime | None:
         digits = zone[1:].replace(":", "")
         from datetime import timedelta
 
-        dt -= sign * timedelta(hours=int(digits[:2]), minutes=int(digits[2:]))
+        hours, minutes = int(digits[:2]), int(digits[2:])
+        if hours > 23 or minutes > 59:
+            return None
+        try:
+            dt -= sign * timedelta(hours=hours, minutes=minutes)
+        except OverflowError:
+            return None
     return dt
 
 

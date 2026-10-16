@@ -80,6 +80,10 @@ def authenticate(ctx: ProviderContext, org: Org, request: Request) -> Session:
     user = org.find_user(grant.user_id) if grant.user_id else integration_user(org)
     if user is None or not user.get("IsActive"):
         raise invalid_session()
+    path = request.url.path
+    connect = "/chatter/" in path and grant.has_scope("chatter_api")
+    if not grant.has_scope("api", "full") and not connect:
+        raise SfError(401, "INVALID_SESSION_ID", "This session is not valid for use with the REST API")
     return Session(token=token or "", grant=grant, user=user)
 
 

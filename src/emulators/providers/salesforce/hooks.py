@@ -179,8 +179,25 @@ def _line_item(dml: Dml, rec: Record, old: Record | None, provided: set[str]) ->
     quantity = rec.get("Quantity")
     unit = rec.get("UnitPrice")
     total = rec.get("TotalPrice")
-    if unit is None and total is None:
-        unit = entry.get("UnitPrice")
+    if "TotalPrice" in provided and total is None:
+        raise SfError(
+            400, "REQUIRED_FIELD_MISSING", "Required fields are missing: [TotalPrice]", ["TotalPrice"]
+        )
+    if "UnitPrice" in provided and unit is None and "TotalPrice" not in provided:
+        raise SfError(
+            400, "REQUIRED_FIELD_MISSING", "Required fields are missing: [UnitPrice]", ["UnitPrice"]
+        )
+    if old is None and unit is None and total is None:
+        raise SfError(
+            400, "REQUIRED_FIELD_MISSING", "Required fields are missing: [UnitPrice]", ["UnitPrice"]
+        )
+    if "UnitPrice" in provided and "TotalPrice" in provided and unit is not None and total is not None:
+        raise SfError(
+            400,
+            "FIELD_INTEGRITY_EXCEPTION",
+            "Only one of UnitPrice or TotalPrice may be specified",
+            ["UnitPrice"],
+        )
     if quantity is None:
         raise SfError(400, "REQUIRED_FIELD_MISSING", "Required fields are missing: [Quantity]", ["Quantity"])
     if quantity <= 0:
@@ -190,7 +207,11 @@ def _line_item(dml: Dml, rec: Record, old: Record | None, provided: set[str]) ->
             f"Quantity: value outside of valid range on numeric field: {quantity:g}",
             ["Quantity"],
         )
-    if "TotalPrice" in provided and "UnitPrice" not in provided and quantity:
+    if (
+        ("TotalPrice" in provided or (old is not None and "Quantity" in provided))
+        and "UnitPrice" not in provided
+        and total is not None
+    ):
         unit = round(total / quantity, 2)
     elif unit is not None:
         total = round(quantity * unit, 2)
@@ -290,7 +311,15 @@ def _event(dml: Dml, rec: Record, old: Record | None, provided: set[str]) -> Non
         duration = int((end_dt - start_dt).total_seconds() // 60)
     elif duration is not None:
         # a new duration, or a moved start with the old duration kept: the end follows
-        end_dt = start_dt + timedelta(minutes=int(duration))
+        try:
+            end_dt = start_dt + timedelta(minutes=int(duration))
+        except OverflowError as exc:
+            raise SfError(
+                400,
+                "FIELD_INTEGRITY_EXCEPTION",
+                "End Date/Time is outside the valid date range",
+                ["EndDateTime"],
+            ) from exc
     elif end:
         end_dt = parse_dt(end)
         assert end_dt is not None

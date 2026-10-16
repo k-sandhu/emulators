@@ -79,7 +79,10 @@ def coerce(f: Field, value: Any) -> Any:
         if isinstance(value, float) and value.is_integer():
             value = int(value)
         elif isinstance(value, str) and re.fullmatch(r"-?\d+", value.strip()):
-            value = int(value.strip())
+            try:
+                value = int(value.strip())
+            except ValueError as exc:
+                raise _range_error(f, "<oversized integer>") from exc
         if not isinstance(value, int):
             raise _json_error(f, value, "int")
         if abs(value) >= 10**9:
@@ -96,7 +99,7 @@ def coerce(f: Field, value: Any) -> Any:
             raise _json_error(f, value, "double")
         if f.precision:
             digits = f.precision - f.scale
-            if abs(number) >= Decimal(10) ** digits:
+            if number.copy_abs() >= Decimal(10) ** digits:
                 raise _range_error(f, value)
         quantum = Decimal(1).scaleb(-f.scale)
         result = float(number.quantize(quantum, rounding=ROUND_HALF_UP))
@@ -141,6 +144,10 @@ def coerce(f: Field, value: Any) -> Any:
     if isinstance(value, (bool, dict, list)):
         raise _json_error(f, value, "string")
     text = str(value) if not isinstance(value, str) else value
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise _json_error(f, "<invalid Unicode>", "string") from exc
     if t == "multipicklist":
         return _multipicklist(f, text)
     if t == "picklist":

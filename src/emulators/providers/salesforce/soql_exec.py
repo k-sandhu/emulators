@@ -1005,11 +1005,14 @@ class QueryEngine:
             )
         lit: Lit = cond.right
         today = soql_dates.local_today(self.now, self.tz)
-        start, end = soql_dates.date_range(lit.value, lit.n, today, self.fiscal_start)
-        if ftype == "date":
-            lo, hi = start.isoformat(), end.isoformat()
-        else:
-            lo, hi = soql_dates.datetime_bounds(start, end, self.tz)
+        try:
+            start, end = soql_dates.date_range(lit.value, lit.n, today, self.fiscal_start)
+            if ftype == "date":
+                lo, hi = start.isoformat(), end.isoformat()
+            else:
+                lo, hi = soql_dates.datetime_bounds(start, end, self.tz)
+        except (ValueError, OverflowError) as exc:
+            raise self.err(lit.tok, "Date literal is outside the supported date range") from exc
         op = cond.op
         if op == "=":
             return lambda x: (lambda v: v is not None and lo <= v < hi)(getter(x))

@@ -274,7 +274,9 @@ async def test_web_server_flow_with_pkce_refresh_revoke_and_introspect(client: h
         },
     )
     assert after.json() == {"error": "invalid_grant", "error_description": "expired access/refresh token"}
-    inactive = await client.post(f"{BASE}/services/oauth2/introspect", data={"token": new_token})
+    inactive = await client.post(
+        f"{BASE}/services/oauth2/introspect", data={"token": new_token, "client_id": "3MVG9-web"}
+    )
     assert inactive.json() == {"active": False}
 
 

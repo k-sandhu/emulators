@@ -7,7 +7,7 @@ from datetime import timedelta
 from typing import Any
 
 from emulators.core.errors import EmulatorError
-from emulators.core.provider import Provider, ProviderContext
+from emulators.core.provider import Provider, ProviderContext, ctx_url_for_host
 from emulators.providers.salesforce import auth as sfauth
 from emulators.providers.salesforce.common import INSTANCE_HOST, LOGIN_HOST, SfError, norm_id
 from emulators.providers.salesforce.dml import Dml, Txn
@@ -25,6 +25,8 @@ def _int(payload: dict[str, Any], key: str, default: int | None = None, *, minim
     if value is None:
         return None
     if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        raise _fail(400, f"'{key}' must be an integer")
+    if isinstance(value, float) and not value.is_integer():
         raise _fail(400, f"'{key}' must be an integer")
     try:
         number = int(value)
@@ -56,7 +58,15 @@ def install(provider: Provider) -> None:
         if user is None:
             raise _fail(404, f"unknown user '{ident}'")
         ttl = _int(payload, "expires_in", 7200, minimum=1) or 7200
-        scopes = payload.get("scopes") or ["api", "full"]
+        try:
+            lifetime = timedelta(seconds=ttl)
+            ctx.clock.now() + lifetime
+        except OverflowError as exc:
+            raise _fail(400, "'expires_in' is outside the supported range") from exc
+        app_only = payload.get("app_only", False)
+        if not isinstance(app_only, bool):
+            raise _fail(400, "'app_only' must be a boolean")
+        scopes = payload.get("scopes", ["api", "full"])
         if not isinstance(scopes, list) or not all(isinstance(s, str) and s for s in scopes):
             raise _fail(400, "'scopes' must be a list of scope names")
         grant = sfauth.issue_session(
@@ -65,16 +75,16 @@ def install(provider: Provider) -> None:
             user,
             client_id=_text(payload, "client_id") or "emulator-client",
             scopes=scopes,
-            ttl=timedelta(seconds=ttl),
-            app_only=bool(payload.get("app_only")),
+            ttl=lifetime,
+            app_only=app_only,
         )
         return {
             "access_token": grant.token,
             "token_type": "Bearer",
             "expires_in": ttl,
             "scope": " ".join(scopes),
-            "instance_url": f"https://{INSTANCE_HOST}",
-            "id": f"https://{LOGIN_HOST}/id/{org.org_id18}/{user['Id']}",
+            "instance_url": ctx_url_for_host(ctx, INSTANCE_HOST, "").rstrip("/"),
+            "id": ctx_url_for_host(ctx, LOGIN_HOST, f"/id/{org.org_id18}/{user['Id']}"),
             "user_id": user["Id"],
             "username": user["Username"],
         }

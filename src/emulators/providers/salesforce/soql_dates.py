@@ -71,7 +71,7 @@ def date_range(name: str, n: int | None, today: date, fiscal_start_month: int = 
     if name == "LAST_90_DAYS":
         return today - timedelta(days=90), today + timedelta(days=1)
     if name == "NEXT_90_DAYS":
-        return today, today + timedelta(days=91)
+        return today + timedelta(days=1), today + timedelta(days=91)
     if name in ("THIS_QUARTER", "THIS_FISCAL_QUARTER"):
         first = fm if name.startswith("THIS_FISCAL") else 1
         s = _quarter_start(today, 0, first)
@@ -100,7 +100,7 @@ def date_range(name: str, n: int | None, today: date, fiscal_start_month: int = 
     if name == "LAST_N_DAYS":
         return today - timedelta(days=k), today + timedelta(days=1)
     if name == "NEXT_N_DAYS":
-        return today, today + timedelta(days=k + 1)
+        return today + timedelta(days=1), today + timedelta(days=k + 1)
     if name == "N_DAYS_AGO":
         d = today - timedelta(days=k)
         return d, d + timedelta(days=1)

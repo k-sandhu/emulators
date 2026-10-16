@@ -47,7 +47,7 @@ def render(resp: ApiResponse) -> Response:
         return Response(resp.body, status_code=resp.status, headers=headers, media_type=resp.media_type)
     if isinstance(resp.body, str):
         return Response(resp.body, status_code=resp.status, headers=headers, media_type=resp.media_type)
-    payload = json.dumps(resp.body, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8")
+    payload = json.dumps(resp.body, ensure_ascii=True, separators=(",", ":"), default=str).encode("utf-8")
     return Response(payload, status_code=resp.status, headers=headers, media_type=JSON)
 
 

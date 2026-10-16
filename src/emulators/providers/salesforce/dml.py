@@ -464,7 +464,16 @@ class Dml:
         if f.name == "Id":
             rid = norm_id(value)
             rec = self.org.coll(obj.name).get(rid) if rid else None
-            return [rec] if rec and not rec.get("IsDeleted") and not rec.get("_Purged") else []
+            return (
+                [rec]
+                if (
+                    rec
+                    and not rec.get("IsDeleted")
+                    and not rec.get("_Purged")
+                    and (self.system or self.access.can_read(obj, rec))
+                )
+                else []
+            )
         if not (f.external_id or f.unique or f.id_lookup):
             raise SfError(
                 404,

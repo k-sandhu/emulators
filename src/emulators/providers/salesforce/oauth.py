@@ -5,10 +5,11 @@ from __future__ import annotations
 import base64
 import hashlib
 import html
+import math
 import re
 from datetime import timedelta
 from typing import Any
-from urllib.parse import parse_qs, urlencode
+from urllib.parse import parse_qs, urlencode, urlsplit
 from zoneinfo import ZoneInfo
 
 import jwt
@@ -247,6 +248,12 @@ def register(app: FastAPI, ctx: ProviderContext, org: Org) -> None:
             if not re.fullmatch(r"[A-Za-z0-9_-]{43,128}", challenge):
                 return _redirect_error(redirect_uri, q, "invalid_request", "invalid code_challenge")
         scopes_requested = _scope_list(q.get("scope"))
+        if any(s not in SCOPES for s in scopes_requested):
+            return _redirect_error(redirect_uri, q, "invalid_scope", "the requested scope is invalid")
+        try:
+            ctx.tokens.authenticate_client(client_id, None, require_secret=False)
+        except OAuthError:
+            return oauth_error("invalid_client_id", "client identifier invalid")
         hint = q.get("login_hint")
         if not hint:
             accounts = [
@@ -273,7 +280,6 @@ def register(app: FastAPI, ctx: ProviderContext, org: Org) -> None:
             wants_refresh = bool({"refresh_token", "offline_access"} & set(scopes_requested))
             if not wants_refresh:
                 scopes = [s for s in scopes if s != "refresh_token"]
-        ctx.tokens.authenticate_client(client_id, None, require_secret=False)
         if response_type == "code":
             code = ctx.tokens.issue(
                 "code",
@@ -359,6 +365,12 @@ def register(app: FastAPI, ctx: ProviderContext, org: Org) -> None:
     def _authorization_code(
         request: Request, form: dict[str, str], client_id: str, secret: str | None
     ) -> Response:
+        pending = ctx.tokens.resolve(form.get("code"), "code")
+        if pending is not None:
+            if pending.redirect_uri != form.get("redirect_uri"):
+                raise OAuthError("invalid_grant", "redirect_uri must match configuration")
+            if form.get("code_verifier") and not pending.code_challenge:
+                raise OAuthError("invalid_grant", "invalid code verifier")
         try:
             grant = ctx.tokens.redeem_code(
                 form.get("code"),
@@ -407,7 +419,7 @@ def register(app: FastAPI, ctx: ProviderContext, org: Org) -> None:
 
     def _refresh(request: Request, form: dict[str, str], client_id: str, secret: str | None) -> Response:
         refresh_grant = ctx.tokens.resolve(form.get("refresh_token"), "refresh")
-        if refresh_grant is None:
+        if refresh_grant is None or refresh_grant.client_id != client_id:
             raise OAuthError("invalid_grant", "expired access/refresh token")
         user = org.find_user(refresh_grant.user_id)
         if user is None or not user.get("IsActive"):
@@ -472,23 +484,56 @@ def register(app: FastAPI, ctx: ProviderContext, org: Org) -> None:
             )
         except jwt.PyJWTError as exc:
             raise OAuthError("invalid_grant", "invalid assertion") from exc
-        client_id, sub, aud = claims.get("iss"), claims.get("sub"), claims.get("aud")
-        if not client_id or not sub:
+        client_id, sub, aud = claims.get("iss"), claims.get("prn", claims.get("sub")), claims.get("aud")
+        if not isinstance(client_id, str) or not client_id or not isinstance(sub, str) or not sub:
             raise OAuthError("invalid_grant", "invalid assertion")
-        audiences = (aud,) if isinstance(aud, str) else tuple(aud or ())
-        if not any(str(a).rstrip("/").endswith(".salesforce.com") for a in audiences):
+        audiences = [aud] if isinstance(aud, str) else aud
+        if not isinstance(audiences, list) or not audiences or not all(isinstance(a, str) for a in audiences):
+            raise OAuthError("invalid_grant", "audience is invalid")
+
+        def valid_audience(value: str) -> bool:
+            try:
+                parts = urlsplit(value)
+                host = parts.hostname or ""
+                return (
+                    parts.scheme == "https"
+                    and (host in (LOGIN_HOST, "test.salesforce.com") or host.endswith(".my.salesforce.com"))
+                    and parts.port in (None, 443)
+                    and not parts.username
+                    and not parts.password
+                    and parts.path in ("", "/")
+                    and not parts.query
+                    and not parts.fragment
+                )
+            except ValueError:
+                return False
+
+        if not any(valid_audience(a) for a in audiences):
             raise OAuthError("invalid_grant", "audience is invalid")
         exp = claims.get("exp")
-        if exp is not None:
-            try:
-                if int(float(exp)) < ctx.clock.timestamp():
-                    raise OAuthError("invalid_grant", "expired authorization code")
-            except (TypeError, ValueError) as exc:
-                raise OAuthError("invalid_grant", "invalid assertion") from exc
+        try:
+            if isinstance(exp, bool) or not isinstance(exp, (int, float, str)):
+                raise ValueError
+            expiry = float(exp)
+            if not math.isfinite(expiry):
+                raise ValueError
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise OAuthError("invalid_grant", "invalid assertion") from exc
+        if expiry + 180 <= ctx.clock.timestamp():
+            raise OAuthError("invalid_grant", "expired authorization code")
         user = sfauth.user_by_login(org, str(sub))
         if user is None or not user.get("IsActive"):
             raise OAuthError("invalid_grant", "no user found")
         ctx.tokens.authenticate_client(str(client_id), None, require_secret=False)
+        jti = claims.get("jti")
+        used = org.meta.setdefault("jwt_ids", {})
+        if jti is not None:
+            if not isinstance(jti, str) or not jti:
+                raise OAuthError("invalid_grant", "invalid assertion")
+            key = f"{client_id}\0{jti}"
+            if used.get(key, 0) > ctx.clock.timestamp():
+                raise OAuthError("invalid_grant", "JWT replay detected")
+            used[key] = expiry + 180
         scopes = ["api", "web"]
         session = sfauth.issue_session(ctx, org, user, client_id=str(client_id), scopes=scopes)
         return JSONResponse(
@@ -524,12 +569,21 @@ def register(app: FastAPI, ctx: ProviderContext, org: Org) -> None:
     @app.post("/services/oauth2/introspect", include_in_schema=False)
     async def introspect(request: Request) -> Response:
         form = _form(await request.body())
+        basic = basic_credentials(request)
+        client_id = form.get("client_id") or (basic[0] if basic else None)
+        client_secret = form.get("client_secret") or (basic[1] if basic else None)
+        try:
+            client = ctx.tokens.authenticate_client(client_id, client_secret)
+        except OAuthError:
+            return oauth_error("invalid_client", "invalid client credentials", 401)
         grant = ctx.tokens.resolve(form.get("token"), "access") or ctx.tokens.resolve(
             form.get("token"), "refresh"
         )
-        if grant is None:
+        if grant is None or (grant.client_id != client_id and not client.get("introspect_all_tokens")):
             return JSONResponse({"active": False})
         user = org.find_user(grant.user_id)
+        if user is None or not user.get("IsActive"):
+            return JSONResponse({"active": False})
         body: dict[str, Any] = {
             "active": True,
             "scope": " ".join(grant.scopes),

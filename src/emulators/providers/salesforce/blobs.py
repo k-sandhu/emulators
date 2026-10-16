@@ -18,6 +18,8 @@ def parse_multipart(content_type: str, body: bytes) -> tuple[dict[str, Any], str
     The binary parts come back base64-encoded under their part name (``VersionData``, ``Body``...) so the normal
     field coercion stores them. Also returns the uploaded filename, which callers use as a default title/name.
     """
+    from emulators.providers.salesforce.rest_core import _reject_constant, require_dict
+
     raw = b"MIME-Version: 1.0\r\nContent-Type: " + content_type.encode() + b"\r\n\r\n" + body
     message = BytesParser(policy=policy.HTTP).parsebytes(raw)
     if not message.is_multipart():
@@ -29,11 +31,10 @@ def parse_multipart(content_type: str, body: bytes) -> tuple[dict[str, Any], str
         payload = part.get_payload(decode=True) or b""
         if name == "entity_content" or (name is None and part.get_content_type() == "application/json"):
             try:
-                parsed = json.loads(payload.decode("utf-8"))
-            except ValueError as exc:
+                parsed = json.loads(payload.decode("utf-8"), parse_constant=_reject_constant)
+            except (ValueError, RecursionError) as exc:
                 raise bad_request("JSON_PARSER_ERROR", "entity_content is not valid JSON") from exc
-            if isinstance(parsed, dict):
-                data.update(parsed)
+            data.update(require_dict(parsed, "entity_content"))
         elif name:
             data[str(name)] = base64.b64encode(payload).decode()
             filename = part.get_filename()

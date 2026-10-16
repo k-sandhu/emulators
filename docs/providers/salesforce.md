@@ -3,7 +3,8 @@
 The `salesforce` provider emulates one Salesforce Enterprise Edition org (`00D5g0000049673`) for Halcyon
 Advisory Group: OAuth 2.0 / OIDC, SOAP login, the REST API (sObjects, SOQL, SOSL, composite, describe),
 Bulk API 2.0, Salesforce Files and a role-hierarchy sharing model. It runs on port **44105**, through the
-gateway's `/salesforce` prefix, or through the vendor hostnames below. Nothing leaves the process.
+gateway's `/salesforce` prefix, or through the vendor hostnames below. There are no vendor network calls;
+configured outbound-message receivers can be contacted.
 
 `simple-salesforce` works unchanged (SOAP username/password/security-token login, session id + instance URL,
 OAuth password, client-credentials and JWT-bearer logins, the sObject helpers, `query_all`, `search`,
@@ -49,11 +50,17 @@ use v62.0.
   `issued_at`). Access tokens look like `00D5g0000049673!AQ0AQ…`, last two hours and are refused as
   `INVALID_SESSION_ID` after expiry, revocation or user deactivation. A refresh token is issued when
   `refresh_token`/`offline_access` is requested (or, for the code flow, no scope is). `openid` adds an RS256 `id_token`
-  (JWKS at `/id/keys` and `/services/oauth2/jwks`).
+  (JWKS at `/id/keys` and `/services/oauth2/jwks`). Authorization codes are single-use and bound to their
+  client, redirect URI (required during exchange), and PKCE challenge. Refresh tokens are bound to their
+  issuing client; refresh does not rotate them by default. JWT claims reject wrong types, malformed audiences
+  and non-finite expiration values; `prn` is supported, expiration allows Salesforce's 3-minute clock skew,
+  and a supplied `jti` cannot be replayed.
 * Errors are `{"error": "invalid_grant", "error_description": "authentication failure"}` (also
   `invalid_client_id`, `unsupported_grant_type`, `expired access/refresh token`, `audience is invalid`...).
 * `POST /services/oauth2/revoke` (revoking a refresh token also kills its access tokens),
-  `POST /services/oauth2/introspect`, `GET|POST /services/oauth2/userinfo`, `GET /id/{orgId}/{userId}`
+  `POST /services/oauth2/introspect` (client credentials in the form or Basic header; only the issuing
+  client can inspect a token, unless its registry entry has `introspect_all_tokens=True`),
+  `GET|POST /services/oauth2/userinfo`, `GET /id/{orgId}/{userId}`
   (identity document), `GET /.well-known/openid-configuration`.
 * `POST /services/Soap/u/{version}` (partner) and `/services/Soap/c/{version}` (enterprise): `login`
   (`serverUrl`, `metadataServerUrl`, `sessionId`, `userId`, `userInfo`), plus `logout` and `getUserInfo`.
@@ -61,6 +68,11 @@ use v62.0.
   `UNSUPPORTED_API_VERSION`. Other SOAP operations return a fault.
 * REST auth is `Authorization: Bearer <token>` (or `OAuth <token>`). Missing/bad tokens return `401`
   `[{"message": "Session expired or invalid", "errorCode": "INVALID_SESSION_ID"}]`.
+  Data endpoints require `api` or `full`; identity-only scopes cannot query or change records (`401
+  INVALID_SESSION_ID`, `This session is not valid for use with the REST API`). `chatter_api` also permits
+  the implemented Chatter user endpoints. Introspection reports deactivated users as inactive. See
+  [Salesforce scopes](https://help.salesforce.com/s/articleView?id=remoteaccess_oauth_tokens_scopes.htm&language=en_US&type=5)
+  and [token introspection](https://help.salesforce.com/s/articleView?id=xcloud.remoteaccess_oidc_token_introspection_endpoint.htm&language=en_US&type=5).
 * `POST /_emulator/tokens` (the `mint_token` action) takes `{user, scopes, client_id, app_only, expires_in}` where
   `user` is a world person id (`p012`), email, Username or Salesforce user Id, and returns a Salesforce-format
   token plus `instance_url`, `id`, `user_id`.
@@ -109,7 +121,7 @@ All paths are under `/services/data/vNN.N` unless noted.
 | --- | --- | --- |
 | GET | `/services/data/` | version list, no auth |
 | GET | `/` | resource map (`sobjects`, `query`, `limits`, `identity` ...) |
-| GET | `/limits`, `/limits/recordCount?sObjects=` | `DailyApiRequests` decrements per call; `Sforce-Limit-Info: api-usage=N/15000` on every response; `403 REQUEST_LIMIT_EXCEEDED` past the limit |
+| GET | `/limits`, `/limits/recordCount?sObjects=` | `DailyApiRequests` decrements per call; `Sforce-Limit-Info: api-usage=N/15000` on authenticated data responses; `403 REQUEST_LIMIT_EXCEEDED` past the limit |
 | GET | `/sobjects` | describeGlobal (28 objects incl. `Engagement__c`) |
 | GET | `/sobjects/{Type}` | object info + `recentItems` |
 | GET | `/sobjects/{Type}/describe` (+ `/layouts`, `/compactLayouts`, `/approvalLayouts`) | full field metadata; `If-Modified-Since` → 304 |
@@ -122,13 +134,14 @@ All paths are under `/services/data/vNN.N` unless noted.
 | GET | `/sobjects/{Type}/listviews` (+ `/{id}`, `/describe`, `/results`) | "All" and "My" views |
 | POST/GET/DELETE | `/sobjects/User/{id}/password` | set / status / reset |
 | GET | `/recent` | the caller's recently viewed/created records |
-| GET | `/query`, `/queryAll`, `/query/{locator}` | SOQL; `Sforce-Query-Options: batchSize=200..2000`; `explain=`; `nextRecordsUrl` cursors (only the user who ran the query can continue them, otherwise `400 INVALID_QUERY_LOCATOR`) |
+| GET | `/query`, `/queryAll`, `/query/{locator}` | SOQL; `Sforce-Query-Options: batchSize=200..2000`; `explain=`; cursors belong to the querying user, expire after two days, and can be replayed before expiry (`400 INVALID_QUERY_LOCATOR` otherwise) |
 | GET | `/search?q=FIND {...}` | SOSL |
 | GET/POST | `/parameterizedSearch` | `q`, `sobject`, `{Type}.fields`, `in`, `overallLimit` ... |
-| POST | `/composite` | ≤25 subrequests, `allOrNone`, `@{ref.id}` / `@{ref.records[0].Id}` references (an unresolvable one is `INVALID_REFERENCE: ... No value for @{ref.path}`) |
-| POST | `/composite/batch` | ≤25, `haltOnError` |
+| POST | `/composite` | ≤25 subrequests; at most 5 query/queryAll/collection operations; `allOrNone`, `@{ref.id}` / `@{ref.records[0].Id}` / `@{ref[0].id}` references; collection subrequests participate in rollback |
+| POST | `/composite/batch` | ≤25, boolean `haltOnError`; each executed subrequest counts toward API usage, while ordinary composite requests count once |
 | POST | `/composite/tree/{Type}` | nested create with `referenceId`s, all-or-nothing, ≤200 records |
-| POST/PATCH/DELETE | `/composite/sobjects` | collections ≤200, `allOrNone`; `PATCH /composite/sobjects/{Type}/{ExtIdField}` upsert; `GET|POST /composite/sobjects/{Type}` retrieve |
+| POST/PATCH/DELETE | `/composite/sobjects` | writes ≤200, boolean `allOrNone`; `PATCH /composite/sobjects/{Type}/{ExtIdField}` upserts one type with an external-ID field and required `attributes.type` |
+| GET/POST | `/composite/sobjects/{Type}` | retrieve ≤2000 records: GET `ids` + `fields`; POST `recordIds` + `fieldNames` (both required arrays); missing/invisible IDs produce null entries |
 | POST/GET/PATCH/DELETE/PUT | `/jobs/ingest[/{id}[/batches]]`, `/jobs/ingest/{id}/successfulResults|failedResults|unprocessedrecords` | Bulk API 2.0 ingest |
 | POST/GET/PATCH/DELETE | `/jobs/query[/{id}[/results]]` | Bulk API 2.0 query (`Sforce-Locator`, `Sforce-NumberOfRecords`) |
 | GET | `/chatter/users/me`, `/chatter/users/{id}` | current user |
@@ -154,7 +167,14 @@ datetimes `2026-10-15T14:22:05.000+0000`, dates `2026-10-15`, compound `BillingA
 fields nested in queries, child subqueries as `{totalSize, done, records}` or `null`, aggregates as
 `AggregateResult` rows with `expr0...`. Ids are 18-character case-safe with the real key prefixes (`001`, `003`,
 `006`, `00Q`, `500`, `005`, `00E`, `00e`, `00T`, `00U`, `701`, `00v`, `00K`, `00k`, `01s`, `01t`, `01u`, `069`,
-`068`, `06A`, `00P`, `a0X`, `750`, `01g`); 15-character ids are accepted anywhere.
+`068`, `06A`, `00P`, `a0X`, `750`, `01g`); 15-character IDs preserve case, while 18-character IDs are
+case-insensitive, including lookup values and Bulk job URLs.
+
+Collection POST retrieval uses Salesforce's
+[documented body names and 2000-record limit](https://developer.salesforce.com/docs/platform/api-rest/guide/resources-composite-sobjects-collections-retrieve-post.html).
+Composite requests support collection subrequests and the
+[outer/inner allOrNone rules](https://developer.salesforce.com/docs/platform/api-rest/guide/resources-composite-allornone.html).
+Malformed reference IDs, non-string headers and incorrectly typed flags fail before writes occur.
 
 ## SOQL and SOSL
 
@@ -258,7 +278,10 @@ column (or no `Id` for update/delete) fails the whole job (`state Failed`, `erro
 not found : Foo`). Blank cells are ignored, `#N/A` clears a field,
 `Account.QuickBooks_Customer_Id__c` style columns resolve lookups. `POST /jobs/query` (`query`/`queryAll`) → `GET
 …/results?maxRecords=&locator=` (`maxRecords` ≥ 1) returns a CSV with `Sforce-Locator` (`null` at the end) and
-`Sforce-NumberOfRecords`. Queries with subqueries or aggregates end `Failed` with an `errorMessage`. Jobs belong to
+`Sforce-NumberOfRecords`. Locators belong to one job; malformed, negative, out-of-range and cross-job locators
+return `400 InvalidJob`. Reusing a valid locator repeats that page; the final page returns `Sforce-Locator: null`.
+Malformed UTF-8 uploads are rejected; malformed CSV quoting, mismatched column counts and CSV parser failures
+fail the job without inserting partial rows. Queries with subqueries or aggregates end `Failed` with an `errorMessage`. Jobs belong to
 their creator (admins see all). Row-level sharing and object permissions apply.
 
 ## Webhooks (outbound messages) and control plane
@@ -266,9 +289,12 @@ their creator (admins see all). Row-level sharing and object permissions apply.
 Salesforce outbound messages are SOAP posts, not signed webhooks; the emulator sends the same envelope
 (`<notifications xmlns="http://soap.sforce.com/2005/09/outbound">` with `OrganizationId`, `ActionId`,
 `SessionId xsi:nil`, `EnterpriseUrl`, `PartnerUrl` and one `<Notification>` per record) through
-`ctx.webhooks.deliver`, so they appear in `GET /_emulator/webhooks`, respect the webhook mode and retry on
-non-2xx. Changes made in one request (including collections and bulk jobs) arrive as one message per operation;
-rolled-back requests send nothing.
+`ctx.webhooks.deliver`, so they appear in `GET /_emulator/webhooks` and respect the webhook mode. Delivery
+requires both a successful HTTP status and a SOAP `notificationsResponse/Ack` of `true` (or `1`); missing,
+negative or malformed acknowledgements are retried, retaining the same notification IDs. Notifications are
+split into messages of at most 100 records, and SOAP service URLs follow host/prefix/per-port routing.
+Changes in a request are grouped by operation; rolled-back requests send nothing. See
+[Salesforce outbound-message considerations](https://help.salesforce.com/articleView?id=workflow_om_considerations.htm&type=5).
 
 Actions (`POST /_emulator/actions/<name>`):
 
@@ -287,6 +313,30 @@ expected, negative `expires_in`, and so on) instead of failing.
 
 Faults (`POST /_emulator/faults`) answer with Salesforce error arrays: 401 `INVALID_SESSION_ID`, 403/429
 `REQUEST_LIMIT_EXCEEDED`, 409 `UNABLE_TO_LOCK_ROW`, 500 `UNKNOWN_EXCEPTION`, 502/503/504 `SERVER_UNAVAILABLE`.
+
+## Compatibility audit regressions
+
+Regression tests cover private-record lookups through `/sobjects/{Type}/Id/{id}` as well as direct IDs,
+queries and SDK helpers. The same record is inaccessible to unrelated staff and accessible to its owner
+or an administrator. Collection retrieval preserves null slots for invisible records.
+
+`NEXT_N_DAYS:n` and `NEXT_90_DAYS` exclude today, following the
+[SOQL date-literal reference](https://developer.salesforce.com/docs/platform/salesforce-soql-sosl/guide/sforce-api-calls-soql-select-dateformats.html).
+Numeric and relative-date overflow, deeply nested functions and invalid timezone offsets produce vendor
+errors instead of server errors. Multipart metadata uses the same JSON-object and finite-constant checks as
+ordinary JSON requests. List-view page sizes, tree attribute types and composite headers are validated.
+
+Opportunity products require an explicit `UnitPrice` or `TotalPrice`. A quantity-only update preserves
+the total and adjusts the unit price, matching the
+[documented opportunity-product behavior](https://help.salesforce.com/s/articleView?id=000381172&language=en_US&type=1).
+Conflicting prices and attempts to clear a required price return DML errors; failed saves preserve parent rollups.
+Event date arithmetic cannot overflow into a 500 response. Password reset returns a password that actually
+authenticates and replaces the previous password. Unicode download filenames use an ASCII fallback plus
+`filename*=UTF-8''...`; unsafe stored content-type headers fall back to `application/octet-stream`.
+
+Audit tests live in `test_adversarial.py`, `test_auth_audit.py`, `test_outbound_audit.py` and the
+Salesforce SDK contract tests. They use synthetic credentials; obtain current test credentials from
+`GET /_emulator/info`.
 
 ## Known gaps
 
@@ -308,7 +358,15 @@ Faults (`POST /_emulator/faults`) answer with Salesforce error arrays: 401 `INVA
   or pagination of child subqueries; `toLabel`/`FORMAT` assume en_US labels. SOSL has no snippets, highlighting,
   spell correction or `WITH DIVISION`. Describe layouts are minimal.
 * Limits: only `DailyApiRequests` is metered (no concurrency, per-app or bulk-batch limits).
-* Auth: client secrets, redirect URIs, IP ranges, MFA and JWT signatures are not verified; sandbox logins
-  (`test.salesforce.com`) reach the same org.
+* Auth: client secrets and registered callback allowlists are lenient by default (authorization-code
+  redirect binding is enforced); IP ranges, MFA and JWT signatures are not verified. Optional connected-app
+  refresh-token rotation, dynamic client registration and child-session introspection are not implemented.
+  Sandbox logins (`test.salesforce.com`) reach the same org.
+* Outbound messages use three attempts with short retry delays instead of Salesforce's 24-hour queue.
+  Queued payloads are snapshots, null fields are omitted, and session IDs are not included. No callback
+  validation handshake is required by this SOAP protocol.
+* Bulk jobs execute synchronously when closed; polling delays simulate asynchronous progress. CSV fields
+  are subject to Python's CSV parser field-size limit (normally 128 KiB). XML response negotiation and
+  OAuth `format=xml|urlencoded` are not implemented.
 * Files: no ContentNote, ContentDistribution or chunked uploads; `ContentDocument` sharing is approximated by
   the visibility of the records it is linked to.

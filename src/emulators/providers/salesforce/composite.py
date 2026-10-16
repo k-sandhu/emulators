@@ -5,21 +5,25 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from emulators.providers.salesforce.common import SfError, bad_request, norm_id
+from emulators.providers.salesforce.auth import count_call
+from emulators.providers.salesforce.common import SfError, bad_request, norm_id, parse_version
 from emulators.providers.salesforce.rest_core import (
     Api,
     ApiRequest,
     ApiResponse,
+    bool_field,
     json_error,
     json_response,
     require_dict,
     require_list,
 )
+from emulators.providers.salesforce.rest_meta import api_limit
 from emulators.providers.salesforce.rest_sobjects import parse_fields_param
 from emulators.providers.salesforce.schema import SCHEMA
 
 MAX_SUBREQUESTS = 25
 MAX_RECORDS = 200
+MAX_RETRIEVE = 2000
 HALTED = {
     "errorCode": "PROCESSING_HALTED",
     "message": "The transaction was rolled back since another operation in the same transaction failed.",
@@ -30,6 +34,7 @@ ROLLED_BACK = {
     "fields": [],
 }
 _REF = re.compile(r"@\{([^}]+)\}")
+_REF_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_]*")
 
 
 # -- references --------------------------------------------------------------------------
@@ -40,13 +45,18 @@ class RefError(Exception):
 
 
 def _lookup(path: str, results: dict[str, Any]) -> Any:
-    ref_id, _, rest = path.partition(".")
+    match = re.fullmatch(r"([A-Za-z0-9_]+)((?:\.[A-Za-z0-9_]+|\[\d+\])*)", path)
+    if match is None:
+        raise RefError(path)
+    ref_id, rest = match.groups()
     if ref_id not in results:
         raise RefError(path)
     value: Any = results[ref_id]
     for part in re.findall(r"[^.\[\]]+|\[\d+\]", rest):
         try:
             if part.startswith("["):
+                if not isinstance(value, list):
+                    raise RefError(path)
                 value = value[int(part[1:-1])]
             else:
                 if not isinstance(value, dict) or part not in value:
@@ -80,8 +90,8 @@ def _error_body(exc: SfError) -> list[dict[str, Any]]:
 
 def _record_type(record: dict[str, Any], default: str | None = None) -> str:
     require_dict(record, "records entry")
-    attrs = require_dict(record.get("attributes") or {}, "attributes")
-    name = attrs.get("type") or default
+    attrs = require_dict(record.get("attributes", {}), "attributes")
+    name = attrs.get("type", default)
     if name is not None and not isinstance(name, str):
         raise json_error("Cannot deserialize instance of string for attributes.type")
     if not name:
@@ -117,14 +127,26 @@ def register(api: Api) -> None:
     @r.route("POST", "composite")
     async def composite(req: ApiRequest) -> ApiResponse:
         body = req.obj_json()
+        all_or_none = bool_field(body, "allOrNone")
+        bool_field(body, "collateSubrequests", True)
         subs = body.get("compositeRequest")
         if not isinstance(subs, list) or not subs:
             raise bad_request("INVALID_INPUT", "compositeRequest must be a non-empty list")
         for sub in subs:
             require_dict(sub, "compositeRequest entry")
             for key in ("method", "url", "referenceId"):
-                if key in sub and not isinstance(sub[key], str):
+                if key not in sub:
+                    raise bad_request("INVALID_INPUT", f"Missing required field: {key}")
+                if not isinstance(sub[key], str):
                     raise json_error(f"Cannot deserialize instance of string for compositeRequest.{key}")
+            if "httpHeaders" in sub:
+                headers = require_dict(sub["httpHeaders"], "httpHeaders")
+                if not all(isinstance(v, str) for v in headers.values()):
+                    raise json_error("httpHeaders values must be strings")
+            if sub["method"] not in ("GET", "POST", "PATCH", "DELETE"):
+                raise bad_request("INVALID_INPUT", f"Invalid method: {sub['method']}")
+            if not re.match(r"^/services/data/v\d{2}\.0/", sub["url"]):
+                raise bad_request("INVALID_INPUT", "Subrequest URL must start with /services/data/vXX.X/")
             if sub.get("body") is not None and not isinstance(sub["body"], (dict, list)):
                 raise json_error("Cannot deserialize instance of object for compositeRequest.body")
         if len(subs) > MAX_SUBREQUESTS:
@@ -134,13 +156,26 @@ def register(api: Api) -> None:
         seen: set[str] = set()
         for sub in subs:
             ref = sub.get("referenceId")
-            if not ref or ref in seen:
+            if not ref or not _REF_ID.fullmatch(ref) or ref in seen:
                 raise bad_request("INVALID_INPUT", f"referenceId is required and must be unique: {ref}")
             seen.add(ref)
-        all_or_none = bool(body.get("allOrNone"))
+        expensive = sum(
+            bool(
+                re.match(
+                    r"^/services/data/v\d{2}\.0/(?:query(?:All)?(?:[/?]|$)|composite/sobjects(?:[/?]|$))",
+                    s["url"],
+                )
+            )
+            for s in subs
+        )
+        if expensive > 5:
+            raise bad_request(
+                "INVALID_INPUT", "At most 5 query, queryAll or sObject Collections subrequests are allowed"
+            )
         results: dict[str, Any] = {}
         out: list[dict[str, Any]] = []
         halted = False
+        failing: int | None = None
         start = req.txn.savepoint()
         for sub in subs:
             ref = sub["referenceId"]
@@ -165,13 +200,17 @@ def register(api: Api) -> None:
                 out.append(failure)
                 results[ref] = failure["body"]
                 if all_or_none:
+                    failing = len(out) - 1
                     halted = True
                 continue
             method = str(sub.get("method", "GET")).upper()
-            if method == "PUT":
-                method = "PATCH"
             child = api.sub_request(req, method, url, payload)
-            if child.path.startswith("composite"):
+            collection = child.path == "composite/sobjects" or child.path.startswith("composite/sobjects/")
+            if (
+                (child.path.startswith("composite") and not collection)
+                or child.path.split("/", 1)[0] not in ("sobjects", "query", "queryAll", "composite")
+                or parse_version("v" + child.version) is None
+            ):
                 nested = _response(
                     ref,
                     400,
@@ -181,23 +220,38 @@ def register(api: Api) -> None:
                 out.append(nested)
                 results[ref] = nested["body"]
                 if all_or_none:
+                    failing = len(out) - 1
                     halted = True
                 continue
+            child.force_all_or_none = all_or_none
             child.headers = {
                 **req.headers,
                 **{k.lower(): v for k, v in (sub.get("httpHeaders") or {}).items()},
             }
             resp = await api.dispatch(child)
+            if isinstance(resp.body, bytes):
+                resp = ApiResponse(
+                    400,
+                    [
+                        {
+                            "errorCode": "INVALID_INPUT",
+                            "message": "Blob retrieval is not supported in composite requests",
+                        }
+                    ],
+                )
             entry = _response(ref, resp.status, resp.body, resp.headers)
             out.append(entry)
             results[ref] = resp.body
-            if resp.status >= 400 and all_or_none:
+            collection_failed = (
+                collection
+                and isinstance(resp.body, list)
+                and any(isinstance(item, dict) and item.get("success") is False for item in resp.body)
+            )
+            if (resp.status >= 400 or collection_failed) and all_or_none:
+                failing = len(out) - 1
                 halted = True
         if halted:
             req.txn.rollback(start)
-            failing = next(
-                (i for i, e in enumerate(out) if e["httpStatusCode"] >= 400 and e["body"] != [HALTED]), None
-            )
             out = [
                 e if i == failing or e["body"] == [HALTED] else _response(e["referenceId"], 400, [HALTED], {})
                 for i, e in enumerate(out)
@@ -208,22 +262,29 @@ def register(api: Api) -> None:
     @r.route("POST", "composite/batch")
     async def batch(req: ApiRequest) -> ApiResponse:
         body = req.obj_json()
+        halt = bool_field(body, "haltOnError")
         items = body.get("batchRequests")
         if not isinstance(items, list) or not items:
             raise bad_request("INVALID_INPUT", "batchRequests must be a non-empty list")
         for item in items:
             require_dict(item, "batchRequests entry")
             for key in ("method", "url"):
-                if key in item and not isinstance(item[key], str):
+                if key not in item:
+                    raise bad_request("INVALID_INPUT", f"Missing required field: {key}")
+                if not isinstance(item[key], str):
                     raise json_error(f"Cannot deserialize instance of string for batchRequests.{key}")
+            if item["method"] not in ("GET", "POST", "PUT", "PATCH", "DELETE"):
+                raise bad_request("INVALID_INPUT", f"Invalid method: {item['method']}")
+            match = re.match(r"^(?:/services/data/)?(v\d{2}\.0)/", item["url"])
+            if match is None or parse_version(match.group(1)) is None:
+                raise bad_request("INVALID_INPUT", "Invalid versioned batch subrequest URL")
         if len(items) > MAX_SUBREQUESTS:
             raise bad_request(
                 "INVALID_INPUT", f"Too many subrequests: {len(items)}. The maximum is {MAX_SUBREQUESTS}."
             )
-        halt = bool(body.get("haltOnError"))
         results: list[dict[str, Any]] = []
         has_errors = False
-        for item in items:
+        for index, item in enumerate(items):
             if has_errors and halt:
                 results.append(
                     {
@@ -238,8 +299,6 @@ def register(api: Api) -> None:
                 )
                 continue
             method = str(item.get("method", "GET")).upper()
-            if method == "PUT":
-                method = "PATCH"
             child = api.sub_request(req, method, item.get("url", ""), item.get("richInput"))
             if child.path.startswith("composite"):
                 has_errors = True
@@ -252,7 +311,12 @@ def register(api: Api) -> None:
                     }
                 )
                 continue
-            resp = await api.dispatch(child)
+            try:
+                if index:
+                    count_call(api.ctx, req.org, api_limit(api))
+                resp = await api.dispatch(child)
+            except SfError as exc:
+                resp = ApiResponse(exc.status, exc.body, exc.headers)
             if resp.status >= 400:
                 has_errors = True
             results.append({"statusCode": resp.status, "result": None if resp.status == 204 else resp.body})
@@ -273,16 +337,21 @@ def register(api: Api) -> None:
             rec: dict[str, Any], type_name: str, parent: str | None, parent_field: str | None, depth: int
         ) -> None:
             require_dict(rec, "records entry")
-            attrs = require_dict(rec.get("attributes") or {}, "attributes")
+            attrs = require_dict(rec.get("attributes", {}), "attributes")
             ref = attrs.get("referenceId")
-            if not ref or ref in seen:
+            if ref is not None and not isinstance(ref, str):
+                raise json_error("attributes.referenceId must be a string")
+            if not ref or not _REF_ID.fullmatch(ref) or ref in seen:
                 raise bad_request("INVALID_INPUT", f"referenceId is required and must be unique: {ref}")
             if depth > 5:
                 raise bad_request("INVALID_INPUT", "Maximum tree depth is 5")
             seen.add(ref)
-            obj = SCHEMA.get(attrs.get("type") or type_name)
+            actual_type = _record_type(rec, type_name)
+            obj = SCHEMA.get(actual_type)
             if obj is None:
                 raise bad_request("INVALID_TYPE", f"sObject type '{attrs.get('type')}' is not supported.")
+            if obj.name != type_name:
+                raise bad_request("INVALID_INPUT", f"Expected records of type {type_name}, got {obj.name}")
             flat.append((ref, obj.name, rec, parent, parent_field))
             if len(flat) > MAX_RECORDS:
                 raise SfError(400, "EXCEEDED_ID_LIMIT", f"Maximum size of records list is {MAX_RECORDS}")
@@ -332,13 +401,17 @@ def register(api: Api) -> None:
     def create_many(req: ApiRequest) -> ApiResponse:
         body = req.obj_json()
         records = _check_size(body.get("records"))
-        return json_response(_save_many(req, records, bool(body.get("allOrNone")), "create"))
+        return json_response(
+            _save_many(req, records, bool_field(body, "allOrNone") or req.force_all_or_none, "create")
+        )
 
     @r.route("PATCH", "composite/sobjects")
     def update_many(req: ApiRequest) -> ApiResponse:
         body = req.obj_json()
         records = _check_size(body.get("records"))
-        return json_response(_save_many(req, records, bool(body.get("allOrNone")), "update"))
+        return json_response(
+            _save_many(req, records, bool_field(body, "allOrNone") or req.force_all_or_none, "update")
+        )
 
     @r.route("PATCH", "composite/sobjects/{type}/{field}")
     def upsert_many(req: ApiRequest) -> ApiResponse:
@@ -346,7 +419,12 @@ def register(api: Api) -> None:
         records = _check_size(body.get("records"))
         return json_response(
             _save_many(
-                req, records, bool(body.get("allOrNone")), "upsert", req.params["type"], req.params["field"]
+                req,
+                records,
+                bool_field(body, "allOrNone") or req.force_all_or_none,
+                "upsert",
+                req.params["type"],
+                req.params["field"],
             )
         )
 
@@ -357,7 +435,10 @@ def register(api: Api) -> None:
             raise bad_request("INVALID_INPUT", "The ids query parameter is required")
         if len(ids) > MAX_RECORDS:
             raise SfError(400, "EXCEEDED_ID_LIMIT", f"Maximum size of ids list is {MAX_RECORDS}")
-        all_or_none = (req.q("allOrNone") or "false").lower() == "true"
+        raw_all_or_none = (req.q("allOrNone") or "false").lower()
+        if raw_all_or_none not in ("true", "false"):
+            raise bad_request("INVALID_INPUT", "allOrNone must be true or false")
+        all_or_none = req.force_all_or_none or raw_all_or_none == "true"
         dml = req.dml()
         results: list[dict[str, Any]] = []
         start = req.txn.savepoint()
@@ -387,8 +468,12 @@ def register(api: Api) -> None:
         obj = SCHEMA.get(type_name)
         if obj is None:
             raise bad_request("INVALID_TYPE", f"sObject type '{type_name}' is not supported.")
-        if len(ids) > MAX_RECORDS:
-            raise SfError(400, "EXCEEDED_ID_LIMIT", f"Maximum size of ids list is {MAX_RECORDS}")
+        if not ids:
+            raise bad_request("INVALID_INPUT", "At least one record id is required")
+        if len(ids) > MAX_RETRIEVE:
+            raise SfError(400, "EXCEEDED_ID_LIMIT", f"Maximum size of ids list is {MAX_RETRIEVE}")
+        if not fields_raw or not fields_raw.strip():
+            raise bad_request("INVALID_INPUT", "The fields parameter is required")
         fields = parse_fields_param(obj, fields_raw)
         out: list[dict[str, Any] | None] = []
         for rid in ids:
@@ -410,10 +495,10 @@ def register(api: Api) -> None:
     @r.route("POST", "composite/sobjects/{type}")
     def retrieve_post(req: ApiRequest) -> ApiResponse:
         body = req.obj_json()
-        fields = require_list(body.get("fields") or [], "fields")
-        ids = require_list(body.get("ids") or [], "ids")
+        fields = require_list(body.get("fieldNames"), "fieldNames")
+        ids = require_list(body.get("recordIds"), "recordIds")
         if not all(isinstance(x, str) for x in [*fields, *ids]):
-            raise json_error("ids and fields must be arrays of strings")
+            raise json_error("recordIds and fieldNames must be arrays of strings")
         return _retrieve(req, req.params["type"], ids, ",".join(fields) if fields else None)
 
 
@@ -439,7 +524,16 @@ def _save_many(
     dml = req.dml()
     results: list[dict[str, Any]] = []
     for rec in records:  # a record without a resolvable type invalidates the whole request
-        _record_type(rec, upsert_type)
+        type_name = _record_type(rec)
+        if upsert_type is not None:
+            obj = SCHEMA.get(upsert_type)
+            if obj is None or obj.name != type_name:
+                raise bad_request(
+                    "INVALID_INPUT", "All upsert records must match the sObject type in the URI"
+                )
+            f = obj.field(ext_field or "")
+            if f is None or not f.external_id:
+                raise bad_request("INVALID_FIELD", f"Invalid external ID field: {ext_field}")
     start = req.txn.savepoint()
     failed = False
     for rec in records:
@@ -447,6 +541,13 @@ def _save_many(
         rid = norm_id(rec.get("id") or rec.get("Id")) if (rec.get("id") or rec.get("Id")) else None
         try:
             type_name = _record_type(rec, upsert_type)
+            if op in ("create", "upsert") and any(k.lower() == "id" for k in rec):
+                raise SfError(
+                    400,
+                    "INVALID_FIELD_FOR_INSERT_UPDATE",
+                    "Cannot specify Id in an insert or external ID upsert call",
+                    ["Id"],
+                )
             data = {k: v for k, v in rec.items() if k not in ("attributes", "id", "Id")}
             if op == "create":
                 saved = dml.insert(type_name, data)

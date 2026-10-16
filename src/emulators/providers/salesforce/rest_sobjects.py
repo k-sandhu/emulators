@@ -6,6 +6,7 @@ import re
 from datetime import timedelta
 from email.utils import format_datetime, parsedate_to_datetime
 from typing import Any
+from urllib.parse import quote
 
 from emulators.providers.salesforce.blobs import guess_mime, parse_multipart
 from emulators.providers.salesforce.common import (
@@ -23,8 +24,10 @@ from emulators.providers.salesforce.rest_core import (
     Api,
     ApiRequest,
     ApiResponse,
+    int_param,
     json_response,
     no_content,
+    require_str,
 )
 from emulators.providers.salesforce.schema import SCHEMA, SObject
 from emulators.providers.salesforce.soql_exec import QueryEngine
@@ -84,7 +87,7 @@ def _not_modified_since(req: ApiRequest, stamp: str) -> bool:
     except (TypeError, ValueError):
         return False
     modified = parse_dt(stamp)
-    return bool(modified and since and modified.replace(microsecond=0) <= since)
+    return bool(modified and since and since.tzinfo and modified.replace(microsecond=0) <= since)
 
 
 def mark_referenced(req: ApiRequest, obj: SObject, rec: dict[str, Any]) -> None:
@@ -368,11 +371,12 @@ def register(api: Api) -> None:
             raise SfError(
                 400, "REQUIRED_FIELD_MISSING", "Required fields are missing: [NewPassword]", ["NewPassword"]
             )
-        if len(str(new)) < 8:
+        require_str(new, "NewPassword")
+        if len(new) < 8:
             raise SfError(
                 400, "INVALID_NEW_PASSWORD", "Your password must have a length of at least 8 characters."
             )
-        req.org.meta.setdefault("passwords", {})[user["Id"]] = str(new)
+        req.org.meta.setdefault("passwords", {})[user["Id"]] = new
         user["LastPasswordChangeDate"] = req.org.now_str()
         return no_content()
 
@@ -384,8 +388,10 @@ def register(api: Api) -> None:
     @r.route("DELETE", "sobjects/User/{id}/password")
     def reset_password(req: ApiRequest) -> ApiResponse:
         user = _admin_target(req, req.params["id"])
-        req.org.meta.setdefault("passwords", {}).pop(user["Id"], None)
-        return json_response({"NewPassword": "Tmp" + user["Id"][-8:] + "!"})
+        password = "Tmp" + user["Id"][-8:] + "!"
+        req.org.meta.setdefault("passwords", {})[user["Id"]] = password
+        user["LastPasswordChangeDate"] = req.org.now_str()
+        return json_response({"NewPassword": password})
 
     # -- record by id / external id -----------------------------------------------------------
     @r.route("GET", "sobjects/{type}/{a}")
@@ -507,8 +513,16 @@ def _blob(req: ApiRequest, obj: SObject, record_id: str, field_name: str) -> Api
         raise not_found()
     name = rec.get("PathOnClient") or rec.get("Name") or rec.get("Title")
     data = req.org.store.blobs.get(str(handle).removeprefix("blob:"))
-    return ApiResponse(200, data, {"Content-Disposition": f'attachment; filename="{name}"'} if name else {},
-                       media_type=rec.get("ContentType") or guess_mime(name))  # fmt: skip
+    headers = {}
+    if name:
+        fallback = re.sub(r'[\x00-\x1f\x7f"\\\\]', "_", name).encode("ascii", "replace").decode()
+        headers["Content-Disposition"] = (
+            f"attachment; filename=\"{fallback}\"; filename*=UTF-8''{quote(name, safe='')}"
+        )
+    content_type = rec.get("ContentType") or guess_mime(name)
+    if not content_type.isascii() or any(ord(ch) < 32 or ord(ch) == 127 for ch in content_type):
+        content_type = "application/octet-stream"
+    return ApiResponse(200, data, headers, media_type=content_type)
 
 
 def _multiple(req: ApiRequest, obj: SObject, matches: list[dict[str, Any]]) -> ApiResponse:
@@ -678,7 +692,7 @@ def register_listviews(api: Api) -> None:
     @r.route("GET", "sobjects/{type}/listviews/{view}/results")
     def view_results(req: ApiRequest) -> ApiResponse:
         obj, view = _find_view(req)
-        limit = int(req.q("pageSize") or req.q("limit") or 25)
+        limit = int_param(req.q("pageSize") or req.q("limit") or 25, "pageSize", minimum=1, maximum=2000)
         engine = QueryEngine(req.org, req.access, req.version)
         result = engine.execute(_soql(obj, view).replace("{uid}", req.session.user["Id"]))
         cols = _columns(obj)

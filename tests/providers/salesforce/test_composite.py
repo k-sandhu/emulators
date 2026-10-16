@@ -99,13 +99,13 @@ async def test_without_all_or_none_each_subrequest_stands_alone(admin: Actor) ->
 
 
 async def test_composite_validation(admin: Actor) -> None:
-    too_many = {"compositeRequest": [sub("GET", "/limits", f"r{i}") for i in range(26)]}
+    too_many = {"compositeRequest": [sub("GET", "/sobjects/Account/describe", f"r{i}") for i in range(26)]}
     r = await admin.post("/composite", too_many)
     assert r.status_code == 400 and r.json()[0]["errorCode"] == "INVALID_INPUT"
     duplicate = {"compositeRequest": [sub("GET", "/limits", "same"), sub("GET", "/limits", "same")]}
     assert (await admin.post("/composite", duplicate)).status_code == 400
     assert (await admin.post("/composite", {"compositeRequest": []})).status_code == 400
-    ok25 = {"compositeRequest": [sub("GET", "/limits", f"r{i}") for i in range(25)]}
+    ok25 = {"compositeRequest": [sub("GET", "/sobjects/Account/describe", f"r{i}") for i in range(25)]}
     assert len((await admin.post("/composite", ok25)).json()["compositeResponse"]) == 25
     unknown = {"compositeRequest": [sub("GET", "/sobjects/Nope/001000000000000AAA", "x")]}
     got = (await admin.post("/composite", unknown)).json()["compositeResponse"][0]
@@ -279,7 +279,9 @@ async def test_collections_create_update_delete_retrieve(admin: Actor) -> None:
         "Rating": "Hot",
     }
     assert fetched[1] is None
-    posted = (await admin.post("/composite/sobjects/Account", {"ids": [ids[0]], "fields": ["Name"]})).json()
+    posted = (
+        await admin.post("/composite/sobjects/Account", {"recordIds": [ids[0]], "fieldNames": ["Name"]})
+    ).json()
     assert posted[0]["Name"] == "Bulk One"
     removed = (
         await admin.request(

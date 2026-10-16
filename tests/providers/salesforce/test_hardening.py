@@ -55,12 +55,12 @@ async def test_request_bodies_of_the_wrong_shape_are_rejected_not_crashed(admin:
             "INVALID_INPUT",
         )
     assert code_of(await admin.post("/composite/sobjects", {"allOrNone": False, "records": [1]}), 400)
-    assert code_of(await admin.post("/composite/sobjects/Account", {"ids": "x", "fields": ["Id"]}), 400) == (
-        "JSON_PARSER_ERROR"
-    )
-    assert code_of(await admin.post("/composite/sobjects/Account", {"ids": [1], "fields": ["Id"]}), 400) == (
-        "JSON_PARSER_ERROR"
-    )
+    assert code_of(
+        await admin.post("/composite/sobjects/Account", {"recordIds": "x", "fieldNames": ["Id"]}), 400
+    ) == ("JSON_PARSER_ERROR")
+    assert code_of(
+        await admin.post("/composite/sobjects/Account", {"recordIds": [1], "fieldNames": ["Id"]}), 400
+    ) == ("JSON_PARSER_ERROR")
 
 
 async def test_non_standard_and_pathological_json_is_a_parser_error(admin: Actor) -> None:

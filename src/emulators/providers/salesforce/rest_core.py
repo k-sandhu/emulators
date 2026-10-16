@@ -53,6 +53,13 @@ def require_str(value: Any, what: str) -> str:
     return value
 
 
+def bool_field(body: dict[str, Any], name: str, default: bool = False) -> bool:
+    value = body.get(name, default)
+    if not isinstance(value, bool):
+        raise json_error(f"Cannot deserialize instance of boolean for {name}")
+    return value
+
+
 def int_param(value: Any, name: str, *, minimum: int | None = None, maximum: int | None = None) -> int:
     """An integer query parameter / body value, or 400 INVALID_PARAMETER_VALUE."""
     try:
@@ -89,6 +96,7 @@ class ApiRequest:
     params: dict[str, str] = field(default_factory=dict)
     request: Request | None = None
     top_level: bool = True
+    force_all_or_none: bool = False
 
     @property
     def version(self) -> str:
