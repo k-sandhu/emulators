@@ -24,7 +24,20 @@ services:
       - "${EMULATORS_HTTPS_HOST_PORT:-44443}:443"
       - "44101:44101"
       - "44102:44102"
+      - "44103:44103"
+      - "44104:44104"
+      - "44105:44105"
+      - "44106:44106"
+      - "44107:44107"
+      - "44108:44108"
+      - "44109:44109"
       - "44110:44110"
+      - "44111:44111"
+      - "44112:44112"
+      - "44113:44113"
+      - "44114:44114"
+      - "44115:44115"
+      - "44116:44116"
     volumes:
       - certs:/certs
     healthcheck:
@@ -36,36 +49,102 @@ services:
     networks:
       vendors:
         aliases:
+          - account.box.com
           - accounts.google.com
+          - accounts.intuit.com
+          - accounts.platform.intuit.com
           - admin.googleapis.com
+          - api.atlassian.com
+          - api.box.com
+          - api.ciscospark.com
+          - api.dropbox.com
+          - api.dropboxapi.com
+          - api.hubapi.com
+          - api.hubspot.com
+          - api.notion.com
+          - api.slack.com
           - api.stripe.com
+          - api.twilio.com
+          - api.xero.com
+          - api.zoom.us
+          - app.box.com
+          - app.hubspot.com
+          - appcenter.intuit.com
+          - auth.atlassian.com
           - billing.stripe.com
           - calendar-json.googleapis.com
           - checkout.stripe.com
           - connect.stripe.com
+          - content.dropboxapi.com
           - content.googleapis.com
+          - conversations.twilio.com
+          - developer.api.intuit.com
+          - developer.intuit.com
+          - dl.boxcloud.com
+          - dl.dropboxusercontent.com
           - docs.google.com
           - docs.googleapis.com
           - drive.google.com
           - drive.googleapis.com
+          - facebook.com
+          - file.notion.so
+          - file.zoom.us
+          - files.slack.com
           - files.stripe.com
           - gmail.googleapis.com
+          - go.xero.com
+          - graph.facebook.com
+          - graph.instagram.com
           - graph.microsoft.com
           - graph.windows.net
           - halcyonadvisory-my.sharepoint.com
+          - halcyonadvisory.atlassian.net
+          - halcyonadvisory.lightning.force.com
+          - halcyonadvisory.my.salesforce-setup.com
+          - halcyonadvisory.my.salesforce.com
           - halcyonadvisory.sharepoint.com
+          - halcyonadvisory.slack.com
+          - hooks.slack.com
+          - identity.xero.com
           - invoice.stripe.com
           - login.microsoftonline.com
+          - login.salesforce.com
           - login.windows.net
+          - login.xero.com
+          - lookaside.fbsbx.com
+          - lookups.twilio.com
+          - marketplace.zoom.us
+          - media.twiliocdn.com
           - meet.google.com
           - meet.googleapis.com
+          - messaging.twilio.com
+          - notify.dropboxapi.com
+          - oauth.platform.intuit.com
           - oauth2.googleapis.com
           - openidconnect.googleapis.com
           - pay.stripe.com
+          - public.boxcloud.com
           - pubsub.googleapis.com
+          - quickbooks.api.intuit.com
+          - sandbox-accounts.platform.intuit.com
+          - sandbox-quickbooks.api.intuit.com
+          - scontent.whatsapp.net
+          - scontent.xx.fbcdn.net
           - sheets.googleapis.com
+          - slack.com
+          - ssrweb.zoom.us
+          - test.salesforce.com
+          - uc.dl.dropboxusercontent.com
+          - upload.box.com
           - uploads.stripe.com
+          - us06web.zoom.us
+          - verify.twilio.com
+          - webexapis.com
+          - www.dropbox.com
+          - www.facebook.com
           - www.googleapis.com
+          - www.notion.so
+          - zoom.us
 
 volumes:
   certs:

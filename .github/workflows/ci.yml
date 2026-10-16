@@ -43,11 +43,13 @@ jobs:
     needs: [test]
     steps:
       - uses: actions/checkout@v4
-      - name: Build image
-        run: docker build -t emulators:ci .
-      - name: Smoke test
+      - name: Start emulators with vendor hostnames (compose)
+        run: docker compose up -d --build --wait
+      - name: Real-hostname HTTPS check from another container
         run: |
-          docker run -d --name emu -p 44080:44080 emulators:ci serve --no-provider-ports
-          for i in $(seq 1 30); do curl -fsS http://127.0.0.1:44080/_emulator/health && break; sleep 2; done
-          curl -fsS http://127.0.0.1:44080/ | head -c 2000
-          docker logs emu
+          docker run --rm --network emulators-vendors -v emulators-certs:/certs:ro             -v "$PWD/scripts/docker_hostname_check.py:/check.py:ro" --entrypoint python emulators:local /check.py
+      - name: Gateway index
+        run: curl -fsS http://127.0.0.1:44080/_emulator | head -c 2000
+      - name: Logs
+        if: always()
+        run: docker compose logs --tail 200
