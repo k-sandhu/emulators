@@ -349,7 +349,7 @@ async def test_exhausted_retries_are_journalled_as_failed(slack: Slack, receiver
     receiver.fail_times = 10
     await action(slack, "post_as_user", user="p018", channel="general", text="never works")
     log = (await slack.client.get(f"{SLACK}/_emulator/webhooks", params={"status": "failed"})).json()
-    assert log["count"] == 1 and log["deliveries"][0]["attempts"] == 3
+    assert log["count"] == 1 and log["deliveries"][0]["attempts"] == 4
 
 
 async def test_shared_channel_events_are_flagged(slack: Slack, receiver: Receiver) -> None:
@@ -376,7 +376,8 @@ async def test_incoming_webhook_posts_are_delivered_as_bot_messages(slack: Slack
     )
     assert r.text == "ok"
     (delivery,) = receiver.events
-    assert delivery["event"]["subtype"] == "bot_message" and delivery["event"]["username"] == "ci"
+    assert delivery["event"]["subtype"] == "bot_message"
+    assert delivery["event"]["username"] == "incoming-webhook"
     assert delivery["event"]["bot_id"] == hook["bot_id"]
 
 

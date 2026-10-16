@@ -228,7 +228,7 @@ async def test_replies_returns_parent_then_replies(slack: Slack) -> None:
     via_reply = await slack.ok("conversations.replies", channel=channel, ts=reply_ts)
     assert [m["ts"] for m in via_reply["messages"]] == [m["ts"] for m in body["messages"]]
     one = await slack.ok("conversations.replies", channel=channel, ts=parent["ts"], limit=1)
-    assert len(one["messages"]) == 2 and one["has_more"] is (parent["reply_count"] > 1)
+    assert len(one["messages"]) == 1 and one["has_more"] is True
     assert await slack.err("conversations.replies", channel=channel, ts="1.000001") == "thread_not_found"
     assert await slack.err("conversations.replies", channel=channel, ts="zzz") == "invalid_ts"
 

@@ -166,7 +166,7 @@ def conversation_scope(channel: dict[str, Any], action: str) -> tuple[str, ...]:
         if family == "channels":
             return ("channels:manage", "channels:write")
         if family == "groups":
-            return ("groups:write", "channels:manage")
+            return ("groups:write",)
         return (f"{family}:write",)
     return (f"{family}:{action}",)
 
@@ -216,6 +216,7 @@ def new_ts(ctx: ProviderContext, channel: dict[str, Any] | None = None) -> str:
     """A fresh message ``ts`` from the emulator clock, unique and increasing per conversation."""
     candidate = ts_from_datetime(ctx.clock.now())
     if channel is not None:
+        channel["_generated_at"] = candidate
         last = channel.get("_last_ts") or "0.000000"
         if ts_key(candidate) <= ts_key(last):
             candidate = bump_ts(last, 100)

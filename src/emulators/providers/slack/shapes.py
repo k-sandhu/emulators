@@ -4,14 +4,16 @@ from __future__ import annotations
 
 from datetime import datetime
 from typing import Any
+from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 from fastapi import Request
 
-from emulators.core.provider import ProviderContext, url_for_host
+from emulators.core.provider import ProviderContext, ctx_url_for_host, url_for_host
 from emulators.providers.slack import access
 from emulators.providers.slack.runtime import Actor
 from emulators.providers.slack.util import (
+    WORKSPACE_DOMAIN,
     WORKSPACE_URL,
     clean,
     message_permalink,
@@ -185,14 +187,21 @@ def file_url(request: Request | None, ctx: ProviderContext, path: str) -> str:
     return url_for_host(request, ctx, "files.slack.com", path)
 
 
-def file_json(ctx: ProviderContext, request: Request | None, rec: dict[str, Any]) -> dict[str, Any]:
+def file_json(
+    ctx: ProviderContext, request: Request | None, rec: dict[str, Any], actor: Actor | None = None
+) -> dict[str, Any]:
     """A ``file`` object. Private URLs point at ``files.slack.com`` and need the Bearer token."""
     team = access.team_id(ctx)
     out = clean(rec)
-    name = rec["name"]
+    name = quote(rec["name"], safe="")
     out["url_private"] = file_url(request, ctx, f"/files-pri/{team}-{rec['id']}/{name}")
     out["url_private_download"] = file_url(request, ctx, f"/files-pri/{team}-{rec['id']}/download/{name}")
-    out["permalink"] = f"{WORKSPACE_URL}/files/{rec['user']}/{rec['id']}/{name}"
+    path = f"/files/{rec['user']}/{rec['id']}/{name}"
+    out["permalink"] = (
+        url_for_host(request, ctx, f"{WORKSPACE_DOMAIN}.slack.com", path)
+        if request
+        else ctx_url_for_host(ctx, f"{WORKSPACE_DOMAIN}.slack.com", path)
+    )
     secret = stable_id("", rec["id"], "pub", length=10).lower()
     out["permalink_public"] = f"https://slack-files.com/{team}-{rec['id']}-{secret}"
     if rec.get("public_url_shared"):
@@ -211,6 +220,11 @@ def file_json(ctx: ProviderContext, request: Request | None, rec: dict[str, Any]
         if channel is None:
             continue
         kind = access.channel_kind(channel)
+        viewer = actor.uid if actor else access.app_config(ctx)["bot_user_id"]
+        if not access.is_member(channel, viewer) and (
+            kind != "public" or access.is_guest(access.user_by_id(ctx, viewer))
+        ):
+            continue
         entry = {
             "reply_users": [],
             "reply_users_count": 0,
@@ -231,6 +245,11 @@ def file_json(ctx: ProviderContext, request: Request | None, rec: dict[str, Any]
             private.append(channel["id"])
             shares.setdefault("private", {}).setdefault(channel["id"], []).append(entry)
     out["channels"], out["groups"], out["ims"] = public, private, ims
+    out["is_public"] = bool(rec.get("public_url_shared")) or any(
+        (channel := access.channel_by_id(ctx, share["channel"])) is not None
+        and access.channel_kind(channel) == "public"
+        for share in rec.get("_shares", [])
+    )
     out["shares"] = shares
     out["comments_count"] = 0
     return out
@@ -248,7 +267,7 @@ def file_visible(ctx: ProviderContext, actor: Actor, rec: dict[str, Any]) -> boo
             continue
         if access.is_member(channel, actor.uid):
             return True
-        if access.channel_kind(channel) == "public" and not actor.is_bot:
+        if access.can_view(ctx, actor, channel) and not actor.is_bot:
             return True
     return False
 
@@ -267,7 +286,7 @@ def message_json(
     out = clean(rec, keep_id=False)
     if rec.get("_files"):
         files = [
-            file_json(ctx, request, f)
+            file_json(ctx, request, f, actor)
             for fid in rec["_files"]
             if (f := ctx.store.collection(access.FILES).get(fid)) and not f.get("_deleted")
         ]
@@ -289,9 +308,14 @@ def message_json(
     return out
 
 
-def permalink_for(rec: dict[str, Any]) -> str:
+def permalink_for(
+    rec: dict[str, Any], request: Request | None = None, ctx: ProviderContext | None = None
+) -> str:
     parent = rec.get("thread_ts")
-    return message_permalink(rec["_channel"], rec["ts"], parent if parent and parent != rec["ts"] else None)
+    link = message_permalink(rec["_channel"], rec["ts"], parent if parent and parent != rec["ts"] else None)
+    if request is not None and ctx is not None:
+        return url_for_host(request, ctx, f"{WORKSPACE_DOMAIN}.slack.com", link[len(WORKSPACE_URL) :])
+    return link
 
 
 # -- usergroups --------------------------------------------------------------------------------

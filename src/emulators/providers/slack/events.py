@@ -61,6 +61,10 @@ def _retry_reason(ctx: ProviderContext, event_id: str) -> str:
                 return "http_error"
             if "Timeout" in error:
                 return "http_timeout"
+            if "TooManyRedirects" in error:
+                return "too_many_redirects"
+            if "CERTIFICATE_VERIFY_FAILED" in error:
+                return "ssl_error"
             return "connection_failed"
     return "http_error"
 

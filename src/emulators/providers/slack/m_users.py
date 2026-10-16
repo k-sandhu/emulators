@@ -5,13 +5,14 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from emulators.core.provider import url_for_host
 from emulators.providers.slack import access, events
-from emulators.providers.slack.m_conversations import TYPE_OF_KIND, TYPE_SCOPES
+from emulators.providers.slack.m_conversations import TYPE_OF_KIND, list_types
 from emulators.providers.slack.paging import paginate
 from emulators.providers.slack.records import new_id
 from emulators.providers.slack.runtime import USER, Call, SlackError, api
 from emulators.providers.slack.shapes import channel_json, user_json, usergroup_json
-from emulators.providers.slack.util import WORKSPACE_DOMAIN, WORKSPACE_URL, slugify
+from emulators.providers.slack.util import WORKSPACE_DOMAIN, slugify
 
 PROFILE_FIELDS = {
     "first_name",
@@ -57,9 +58,8 @@ async def users_info(call: Call) -> dict[str, Any]:
 
 @api("users.lookupByEmail", scopes=("users:read.email",))
 async def users_lookup_by_email(call: Call) -> dict[str, Any]:
-    call.need_scope("users:read")
     user = access.user_by_email(call.ctx, call.params.need("email"))
-    if user is None or user.get("is_stranger"):
+    if user is None or user.get("is_stranger") or user.get("deleted"):
         raise SlackError("users_not_found")
     return {"user": user_json(call.ctx, user, call.me)}
 
@@ -83,6 +83,20 @@ def _profile_changes(call: Call) -> dict[str, Any]:
     unknown = set(raw) - PROFILE_FIELDS - {"email", "fields"}
     if unknown:
         raise SlackError("invalid_profile")
+    for key, value in raw.items():
+        if key == "status_expiration":
+            if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value < 2**63:
+                raise SlackError("invalid_profile")
+        elif key == "fields":
+            if not isinstance(value, dict) or any(
+                not isinstance(field, dict)
+                or not isinstance(field.get("value", ""), str)
+                or not isinstance(field.get("alt", ""), str)
+                for field in value.values()
+            ):
+                raise SlackError("invalid_profile")
+        elif not isinstance(value, str):
+            raise SlackError("invalid_profile")
     return raw
 
 
@@ -127,11 +141,7 @@ async def users_profile_set(call: Call) -> dict[str, Any]:
 @api("users.conversations")
 async def users_conversations(call: Call) -> dict[str, Any]:
     ctx = call.ctx
-    types = call.params.csv("types") or ["public_channel"]
-    for kind in types:
-        if kind not in TYPE_SCOPES:
-            raise SlackError("invalid_types")
-        call.need_scope(TYPE_SCOPES[kind])
+    types = list_types(call)
     uid = call.params.str("user") or call.me.uid
     subject = access.user_by_id(ctx, uid)
     if subject is None:
@@ -203,7 +213,7 @@ async def team_info(call: Call) -> dict[str, Any]:
         "team": {
             "id": access.team_id(ctx),
             "name": org.name,
-            "url": WORKSPACE_URL + "/",
+            "url": url_for_host(call.request, ctx, f"{WORKSPACE_DOMAIN}.slack.com", "/"),
             "domain": WORKSPACE_DOMAIN,
             "email_domain": org.domain,
             "icon": {**icons, "image_default": True},

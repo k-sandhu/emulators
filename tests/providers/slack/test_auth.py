@@ -188,4 +188,4 @@ async def test_prefix_routing_through_gateway(slack: Slack) -> None:
             "/slack/api/auth.test", headers={"Authorization": f"Bearer {await slack.bot()}"}
         )
         assert r.json()["ok"] is True
-        assert r.json()["url"] == "https://halcyonadvisory.slack.com/"
+        assert r.json()["url"] == "http://localhost:44080/slack/"

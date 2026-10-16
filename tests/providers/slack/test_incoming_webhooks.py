@@ -53,14 +53,12 @@ async def test_post_blocks_attachments_and_customisation(slack: Slack) -> None:
     }
     assert (await slack.client.post(f"{HOOKS}/services/{hook['id']}", json=payload)).text == "ok"
     message = (await slack.history(slack.channel_id("it-help"), limit=1))[0]
-    assert message["username"] == "Pager" and message["icons"] == {"emoji": ":rotating_light:"}
+    assert message["username"] == "incoming-webhook" and "icons" not in message
     assert message["blocks"][0]["type"] == "section" and message["blocks"][0]["block_id"]
     assert message["attachments"][0]["id"] == 1 and message["attachments"][0]["text"] == "disk full"
     icon = {"text": "x", "icon_url": "https://img.example/a.png"}
     await slack.client.post(f"{HOOKS}/services/{hook['id']}", json=icon)
-    assert (await slack.history(slack.channel_id("it-help"), limit=1))[0]["icons"] == {
-        "image_64": "https://img.example/a.png"
-    }
+    assert "icons" not in (await slack.history(slack.channel_id("it-help"), limit=1))[0]
 
 
 async def test_form_encoded_payload_and_threads(slack: Slack) -> None:

@@ -134,19 +134,22 @@ def _apply_date(ctx: ProviderContext, query: Query, key: str, value: str) -> Non
         match = re.fullmatch(r"(\d{4})(?:-(\d{2}))?", value)
         if match:
             year, month = int(match.group(1)), match.group(2)
-            start = date(year, int(month), 1) if month else date(year, 1, 1)
-            end = date(year + (int(month or 12) == 12), (int(month) % 12) + 1 if month else 1, 1)
+            try:
+                start = date(year, int(month), 1) if month else date(year, 1, 1)
+                end = date(year + (int(month or 12) == 12), (int(month) % 12) + 1 if month else 1, 1)
+            except ValueError:
+                return
             query.after, query.before = _day_start(start) - 0.000001, _day_start(end)
         return
     day = _parse_day(ctx, value)
     if day is None:
         return
     if key == "after":
-        query.after = _day_start(day + timedelta(days=1)) - 0.000001
+        query.after = _day_start(day) + 86400 - 0.000001
     elif key == "before":
         query.before = _day_start(day)
     else:
-        query.after, query.before = _day_start(day) - 0.000001, _day_start(day + timedelta(days=1))
+        query.after, query.before = _day_start(day) - 0.000001, _day_start(day) + 86400
 
 
 def searchable_text(ctx: ProviderContext, rec: dict[str, Any]) -> str:
@@ -316,7 +319,7 @@ def _search_messages(call: Call, query_text: str) -> dict[str, Any]:
             "ts": shown["ts"],
             "blocks": shown.get("blocks", []),
             "text": text,
-            "permalink": permalink_for(rec),
+            "permalink": permalink_for(rec, call.request, ctx),
         }
         if not rec.get("reactions"):
             match["no_reactions"] = True
@@ -348,9 +351,19 @@ def _search_files(call: Call, query_text: str) -> dict[str, Any]:
         for record in access.col(ctx, access.FILES):
             if not file_visible(ctx, actor, record):
                 continue
+            visible_shares = [
+                share
+                for share in record.get("_shares", [])
+                if (channel := access.channel_by_id(ctx, share["channel"])) is not None
+                and access.can_view(ctx, actor, channel)
+            ]
             if query.from_users and record["user"] not in query.from_users:
                 continue
-            if query.channels and not any(s["channel"] in query.channels for s in record.get("_shares", [])):
+            if record["user"] in query.not_from or any(
+                s["channel"] in query.not_channels for s in visible_shares
+            ):
+                continue
+            if query.channels and not any(s["channel"] in query.channels for s in visible_shares):
                 continue
             stamp = float(record["created"])
             if (query.after is not None and stamp <= query.after) or (
@@ -372,7 +385,7 @@ def _search_files(call: Call, query_text: str) -> dict[str, Any]:
     return {
         "total": total,
         **_envelope(count, page, pages, total),
-        "matches": [file_json(ctx, call.request, r) for r in window],
+        "matches": [file_json(ctx, call.request, r, actor) for r in window],
     }
 
 

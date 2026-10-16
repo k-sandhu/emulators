@@ -138,3 +138,11 @@ async def test_seeded_files_come_from_world_documents(slack: Slack) -> None:
     assert files
     assert {f["filetype"] for f in files} & {"docx", "xlsx", "pdf", "pptx"}
     assert all(f["url_private"].startswith("https://files.slack.com/files-pri/T") for f in files)
+
+
+async def test_seeded_file_references_preserve_every_share(slack: Slack) -> None:
+    for message in slack.ctx.store.collection("messages"):
+        for file_id in message.get("_files", []):
+            file = slack.ctx.store.collection("files").get(file_id)
+            assert file is not None
+            assert {"channel": message["_channel"], "ts": message["ts"]} in file["_shares"]

@@ -7,6 +7,7 @@ Events API in step, so every entry point (API call, webhook, action) behaves the
 from __future__ import annotations
 
 import copy
+from datetime import UTC, datetime
 from typing import Any
 
 from emulators.core.provider import ProviderContext
@@ -14,7 +15,7 @@ from emulators.providers.slack import access, events
 from emulators.providers.slack.records import make_channel, new_id
 from emulators.providers.slack.richtext import text_to_blocks, validate_attachments, validate_blocks
 from emulators.providers.slack.runtime import BEFORE_CALL, SlackError
-from emulators.providers.slack.util import ts_from_datetime, ts_key
+from emulators.providers.slack.util import bump_ts, ts_from_datetime, ts_key
 
 MAX_TEXT = 40_000
 
@@ -31,10 +32,10 @@ def refresh_thread(ctx: ProviderContext, channel_id: str, parent: dict[str, Any]
     """Recompute the counters Slack keeps on a thread's parent message."""
     replies = access.thread_replies(ctx, channel_id, parent["ts"])
     if not replies:
-        for key in ("reply_count", "reply_users", "reply_users_count", "latest_reply"):
+        for key in ("reply_users", "reply_users_count", "latest_reply"):
             parent.pop(key, None)
-        if parent.get("subtype") != "tombstone":
-            parent.pop("thread_ts", None)
+        if parent.get("thread_ts"):
+            parent["reply_count"] = 0
         return
     users: list[str] = []
     for reply in replies:
@@ -66,6 +67,8 @@ async def create_message(
     ts: str | None = None,
     emit: bool = True,
 ) -> dict[str, Any]:
+    if not isinstance(text, str) or (thread_ts is not None and not isinstance(thread_ts, str)):
+        raise SlackError("invalid_arguments")
     if len(text) > MAX_TEXT:
         raise SlackError("msg_too_long")
     stamp = ts or access.new_ts(ctx, channel)
@@ -137,8 +140,13 @@ async def update_message(
     text: str | None = None,
     blocks: Any = None,
     attachments: Any = None,
+    metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     previous = copy.deepcopy(rec)
+    if text is not None and not isinstance(text, str):
+        raise SlackError("invalid_arguments")
+    validated_blocks = validate_blocks(blocks, rec["ts"]) if blocks is not None else None
+    validated_attachments = validate_attachments(attachments) if attachments is not None else None
     if text is not None:
         if len(text) > MAX_TEXT:
             raise SlackError("msg_too_long")
@@ -150,9 +158,14 @@ async def update_message(
             else:
                 rec.pop("blocks", None)
     if blocks is not None:
-        rec["blocks"] = validate_blocks(blocks, rec["ts"])
+        rec["blocks"] = validated_blocks
     if attachments is not None:
-        rec["attachments"] = validate_attachments(attachments)
+        rec["attachments"] = validated_attachments
+    if metadata is not None:
+        if metadata:
+            rec["metadata"] = metadata
+        else:
+            rec.pop("metadata", None)
     rec["edited"] = {"user": editor, "ts": ts_from_datetime(ctx.clock.now())}
     touch(ctx, channel)
     await events.emit_message_changed(ctx, channel, rec, previous)
@@ -284,6 +297,9 @@ async def process_scheduled(ctx: ProviderContext) -> None:
         if channel is None or channel.get("is_archived"):
             continue
         payload = item["_payload"]
+        stamp = ts_from_datetime(datetime.fromtimestamp(item["post_at"], UTC))
+        while access.get_message(ctx, channel["id"], stamp) is not None:
+            stamp = bump_ts(stamp)
         await create_message(
             ctx,
             channel,
@@ -295,6 +311,7 @@ async def process_scheduled(ctx: ProviderContext) -> None:
             broadcast=payload.get("broadcast", False),
             bot_id=payload.get("bot_id"),
             app_id=payload.get("app_id"),
+            ts=stamp,
         )
 
 

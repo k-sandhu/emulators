@@ -9,10 +9,11 @@ from __future__ import annotations
 
 import inspect
 from typing import Any
+from uuid import uuid4
 
 from fastapi import FastAPI
 
-from emulators.core.provider import Provider, ProviderContext
+from emulators.core.provider import Provider, ProviderContext, ctx_url_for_host
 
 
 class SlackProvider(Provider):
@@ -42,6 +43,12 @@ class SlackProvider(Provider):
         from emulators.providers.slack.routes import error_body
 
         return error_body(status, code, message)
+
+    def error_headers_for(self, scope: dict[str, Any] | None, status: int) -> dict[str, str]:
+        path = (scope or {}).get("path", "")
+        if "/api/" in path:
+            return {"x-slack-req-id": uuid4().hex, "cache-control": "private, no-cache, no-store"}
+        return {}
 
     def seed(self, ctx: ProviderContext) -> None:
         from emulators.providers.slack.seed import seed
@@ -73,7 +80,8 @@ class SlackProvider(Provider):
             "verification_token": app["verification_token"],
             "tokens": seeded_tokens(ctx),
             "incoming_webhooks": [
-                f"https://hooks.slack.com/services/{hook['id']}" for hook in access.col(ctx, access.WEBHOOKS)
+                ctx_url_for_host(ctx, "hooks.slack.com", f"/services/{hook['id']}")
+                for hook in access.col(ctx, access.WEBHOOKS)
             ],
         }
         return info

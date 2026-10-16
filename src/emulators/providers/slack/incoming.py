@@ -6,7 +6,6 @@ than the Web API's ``ok:false`` JSON, so they get their own handler.
 
 from __future__ import annotations
 
-import json
 from typing import Any
 from urllib.parse import parse_qsl
 
@@ -17,7 +16,7 @@ from emulators.core.ids import stable_hash
 from emulators.core.provider import ProviderContext
 from emulators.providers.slack import access, messages
 from emulators.providers.slack.richtext import validate_attachments, validate_blocks
-from emulators.providers.slack.runtime import SlackError
+from emulators.providers.slack.runtime import SlackError, load_json
 from emulators.providers.slack.util import stable_id
 
 WEBHOOK_ICONS = {
@@ -69,8 +68,8 @@ async def _payload(request: Request) -> dict[str, Any] | None:
     if mime == "application/x-www-form-urlencoded":
         raw = dict(parse_qsl(raw, keep_blank_values=True)).get("payload", "")
     try:
-        parsed = json.loads(raw)
-    except ValueError:
+        parsed = load_json(raw)
+    except (ValueError, UnicodeError, RecursionError):
         return None
     return parsed if isinstance(parsed, dict) else None
 
@@ -100,11 +99,7 @@ async def handle_incoming(ctx: ProviderContext, request: Request, key: str) -> R
         return _text("channel_not_found", 404)
     if channel.get("is_archived"):
         return _text("channel_is_archived", 410)
-    extra: dict[str, Any] = {"username": str(payload.get("username") or "incoming-webhook")}
-    if payload.get("icon_emoji"):
-        extra["icons"] = {"emoji": payload["icon_emoji"]}
-    elif payload.get("icon_url"):
-        extra["icons"] = {"image_64": payload["icon_url"]}
+    extra: dict[str, Any] = {"username": "incoming-webhook"}
     try:
         await messages.create_message(
             ctx,

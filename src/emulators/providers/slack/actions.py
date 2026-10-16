@@ -15,7 +15,7 @@ from emulators.providers.slack.incoming import create_webhook
 from emulators.providers.slack.m_files import new_file_record
 from emulators.providers.slack.m_oauth import new_bot_token, new_user_token
 from emulators.providers.slack.records import make_channel, new_id
-from emulators.providers.slack.runtime import APP, BOT, USER
+from emulators.providers.slack.runtime import APP, BOT, USER, Params, SlackError
 from emulators.providers.slack.seed_users import (
     APP_SCOPES,
     BOT_SCOPES_FULL,
@@ -62,7 +62,11 @@ def _channel(ctx: ProviderContext, ref: Any) -> dict[str, Any]:
 def _scopes(raw: Any, default: list[str]) -> list[str]:
     if raw is None or raw in ([], ""):
         return list(default)
+    if not isinstance(raw, (str, list)):
+        raise _fail(400, "invalid_arguments")
     items = raw.replace(" ", ",").split(",") if isinstance(raw, str) else list(raw)
+    if any(not isinstance(item, str) for item in items):
+        raise _fail(400, "invalid_arguments")
     items = [i for i in items if i]
     return list(default) if "*" in items else items
 
@@ -77,7 +81,13 @@ async def mint_token(ctx: ProviderContext, payload: dict[str, Any]) -> dict[str,
     kind = payload.get("type") or (USER if payload.get("user") else BOT)
     if kind not in (BOT, USER, APP):
         raise _fail(400, "invalid_type")
-    ttl = timedelta(seconds=int(payload["expires_in"])) if payload.get("expires_in") else None
+    try:
+        seconds = Params(payload, {}, json_body=True).int("expires_in", lo=1)
+        ttl = timedelta(seconds=seconds) if seconds is not None else None
+    except (SlackError, OverflowError):
+        raise _fail(400, "invalid_arguments") from None
+    if payload.get("client_id") is not None and not isinstance(payload["client_id"], str):
+        raise _fail(400, "invalid_arguments")
     if kind == USER:
         user = _user(ctx, payload.get("user"))
         uid, scopes, token = user["id"], _scopes(payload.get("scopes"), USER_SCOPES), new_user_token(ctx)

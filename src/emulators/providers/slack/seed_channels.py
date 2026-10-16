@@ -96,6 +96,9 @@ def _reactions(msg: ChatMessage, mapping: dict[str, str]) -> list[dict[str, Any]
 
 def make_file(ctx: ProviderContext, doc: Document, uploader: str, created: int) -> dict[str, Any]:
     """A file record backed by a world document; bytes are rendered once and stored as a blob."""
+    existing = access.col(ctx, access.FILES).get(stable_id("F", doc.id))
+    if existing is not None:
+        return existing
     owner = ctx.world.person(doc.owner_id)
     table = [list(row) for row in doc.table] if doc.table else None
     data, mime = documents.render(

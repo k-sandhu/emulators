@@ -18,8 +18,9 @@ URLs a test configures.
 The same app answers every host. With the gateway it is also reachable at
 `http://localhost:44080/slack/...` (dedicated port 44107). Absolute URLs the emulator generates
 (file URLs, `upload_url`, webhook URLs) follow the routing mode, so they work for real hostnames
-and for prefix mode. Workspace URLs (`auth.test.url`, permalinks) are always
-`https://halcyonadvisory.slack.com/...`, as Slack returns them.
+and for prefix mode. Workspace URLs (`auth.test.url`, permalinks, OAuth configuration links)
+use `https://halcyonadvisory.slack.com/...` in host mode and the local base in prefix mode.
+Incoming webhook URLs returned by `/_emulator/info` follow the same routing rules.
 
 ```python
 import httpx
@@ -42,8 +43,9 @@ With `emulator_intercept` the SDK's default `https://slack.com/api/` works uncha
 Every method needs a token (`Authorization: Bearer <token>`, or a `token` form/query parameter;
 JSON bodies require the header). Missing token is `not_authed`; unknown is `invalid_auth`;
 revoked `token_revoked`; expired (rotation) `token_expired`; deactivated user `account_inactive`.
-`missing_scope` carries `needed` and `provided`, and every response has `X-OAuth-Scopes` and
-`X-Accepted-OAuth-Scopes`. Token kinds: bot (`xoxb-`), user (`xoxp-`), app-level (`xapp-`);
+`missing_scope` carries `needed` and `provided`. Authenticated responses have `X-OAuth-Scopes`;
+methods declaring static scopes have `X-Accepted-OAuth-Scopes`. Web API responses, including
+injected rate limits, carry `X-Slack-Req-Id`. Token kinds: bot, user, and app-level;
 methods a kind cannot call return `not_allowed_token_type` (e.g. `search.messages` with a bot).
 
 Seeded tokens (deterministic, also in `GET /_emulator/info` under `credentials.tokens`):
@@ -76,7 +78,11 @@ the full default set for that kind; explicit scopes are enforced exactly. Respon
 approves headlessly; without it an account picker page lists the active members. `login_hint=deny`
 redirects with `error=access_denied`. The emulator-only `channel` parameter picks the channel for
 the `incoming-webhook` scope (default `#general`). `POST /api/oauth.v2.access` takes client
-credentials via Basic or form fields, `code`, `redirect_uri`; codes are single use. Response:
+credentials via Basic or form fields, `code`, `redirect_uri`; codes are single use, client-bound,
+and require the original `redirect_uri` when one was supplied during authorization. OAuth install
+codes and OpenID Connect codes cannot be exchanged through each other's token endpoints.
+PKCE `code_challenge`/`code_challenge_method` are enforced at exchange with `code_verifier`.
+Response:
 `app_id`, `authed_user {id, scope, access_token, token_type}`, `scope`, `token_type: "bot"`,
 `access_token`, `bot_user_id`, `team {id, name}`, `enterprise: null`, `is_enterprise_install`,
 `incoming_webhook {channel, channel_id, configuration_url, url}`. Errors: `invalid_code`,
@@ -84,7 +90,8 @@ credentials via Basic or form fields, `code`, `redirect_uri`; codes are single u
 
 Token rotation: `POST /_emulator/actions/configure_app {"token_rotation": true}` (or
 `EMULATORS_SLACK_TOKEN_ROTATION=true`). Tokens become `xoxe.xoxb-1-...`/`xoxe.xoxp-1-...` with
-`refresh_token` (`xoxe-1-...`) and `expires_in: 43200`; `grant_type=refresh_token` rotates both.
+`refresh_token` and `expires_in: 43200`; `grant_type=refresh_token` rotates both. Refresh tokens
+are bound to their issuing client; a rejected cross-client exchange does not consume the token.
 Expired tokens answer `token_expired` (advance the clock with `POST /_emulator/clock`).
 
 ### Sign in with Slack (OpenID Connect)
@@ -108,6 +115,9 @@ returns `access_token` + RS256 `id_token` (verify with `/openid/connect/keys`),
   `limit` below 1: `invalid_limit`; above the maximum it is clamped.
 * `ts` values are unique per conversation, strictly increasing, derived from the emulator clock
   (seeded messages keep the world timestamps).
+* Malformed JSON, invalid multipart bodies, invalid charsets, incorrectly typed scalar fields,
+  fractional integer arguments and non-finite/oversized numeric arguments produce Slack errors.
+  Valid Unicode survives message rendering and file upload/download.
 * Visibility is enforced per caller: private channels, DMs and group DMs are `channel_not_found`
   for non-members; bots must be members to read history (`not_in_channel`), users may read public
   channels they have not joined; posting needs membership (`not_in_channel`) unless the bot has
@@ -124,22 +134,22 @@ Scopes are what the emulator enforces (any listed alternative suffices); *U* mea
 | `auth.test`, `auth.revoke` (`test=true`), `auth.teams.list` | any token |
 | `oauth.v2.access`, `openid.connect.token` | client credentials |
 | `openid.connect.userInfo` | U, `openid` (+`email`,`profile`) |
-| `conversations.list` | per type: `channels:read` `groups:read` `mpim:read` `im:read`; `types`, `exclude_archived`, `limit` (100/1000) |
+| `conversations.list` | per type: `channels:read` `groups:read` `mpim:read` `im:read`; `types` filtered by granted scopes; `exclude_archived` applied after slicing the virtual page; `limit` (100/1000) |
 | `conversations.info` | read scope of the type; `include_num_members` |
 | `conversations.history` | `*:history`; `oldest` `latest` `inclusive` `limit` (100/999); `has_more`, `pin_count`; thread replies hidden, broadcasts shown |
-| `conversations.replies` | `*:history`; `ts` of parent or reply; `thread_not_found` |
+| `conversations.replies` | `*:history`; `ts` of parent or reply; parent counts toward `limit`; ascending timestamp order; `oldest`/`latest`/`inclusive` apply to parent and replies; final cursor is empty; membership messages return `thread_not_found` |
 | `conversations.members` | read scope; deactivated users omitted |
 | `conversations.join` | `channels:join` / `channels:write`; `warning: already_in_channel` |
-| `conversations.leave` `.invite` `.kick` `.archive` `.unarchive` `.rename` `.setTopic` `.setPurpose` `.open` `.close` `.mark` | write scope of the type (`channels:manage`/`channels:write`, `groups:write`, `im:write`, `mpim:write`) |
+| `conversations.leave` `.invite` `.kick` `.archive` `.unarchive` `.rename` `.setTopic` `.setPurpose` `.open` `.close` `.mark` | write scope of the type (`channels:manage`/`channels:write`, `groups:write`, `im:write`, `mpim:write`); `.setTopic` also accepts the type's `*:write.topic` |
 | `conversations.create` | `channels:manage`/`channels:write` (`groups:write` for `is_private`); name rules (`invalid_name_*`, `name_taken`) |
 | `chat.postMessage` | `chat:write`; channel id, `#name` or user id (opens the DM); `text` `blocks` `attachments` `thread_ts` `reply_broadcast` `metadata`; `username`/`icon_*` only with `chat:write.customize` |
-| `chat.update` `.delete` `.meMessage` | `chat:write`; authors only (admins may delete); deleted thread parents become tombstones |
+| `chat.update` `.delete` `.meMessage` | `chat:write`; authors only (admins may delete); empty block/attachment arrays clear fields; metadata can be updated/removed; deleted thread parents become tombstones; deleting the last reply retains `thread_ts` and `reply_count: 0` |
 | `chat.postEphemeral` | `chat:write`; stored in `ephemeral_messages`, never in history |
 | `chat.getPermalink` | any; replies get `?thread_ts=...&cid=...` |
 | `chat.scheduleMessage` `.scheduledMessages.list` `chat.deleteScheduledMessage` | `chat:write`; posted lazily when the clock passes `post_at` (`time_in_past`, `time_too_far`) |
 | `chat.unfurl` | `links:write`; accepted, no-op |
 | `users.list` `.info` `.getPresence` | `users:read`; `profile.email` needs `users:read.email` |
-| `users.lookupByEmail` | `users:read.email` + `users:read` |
+| `users.lookupByEmail` | `users:read.email`; deactivated users return `users_not_found` |
 | `users.profile.get` / `.set` | `users.profile:read` / U `users.profile:write` (admins may edit others) |
 | `users.conversations` | type scopes; `user` defaults to the caller |
 | `users.setPresence` | U `users:write` |
@@ -152,7 +162,7 @@ Scopes are what the emulator enforces (any listed alternative suffices); *U* mea
 | `emoji.list` | `emoji:read` |
 | `dnd.info` `.teamInfo` / `.setSnooze` `.endSnooze` `.endDnd` | `dnd:read` / U `dnd:write` |
 | `bots.info` | `users:read` |
-| `files.upload` (legacy) | `files:write`; multipart `file` or `content`, `channels`, `title`, `initial_comment`. `EMULATORS_SLACK_LEGACY_FILES_UPLOAD=false` answers `method_deprecated` like real Slack today |
+| `files.upload` (legacy) | `files:write`; multipart `file` or editable snippet `content`; `channels` accepts names/IDs; title defaults to filename without extension; `initial_comment`. `EMULATORS_SLACK_LEGACY_FILES_UPLOAD=false` answers `method_deprecated` like real Slack today |
 | `files.getUploadURLExternal`, `files.completeUploadExternal` | `files:write`; upload bytes with `POST <upload_url>` (raw or multipart) -> `OK - <n>` |
 | `files.list` `.info` `.delete` | `files:read` / `files:write`; `user` `channel` `types` `ts_from` `ts_to` `count` `page` |
 | `files.sharedPublicURL` `.revokePublicURL` | U `files:write` |
@@ -163,6 +173,14 @@ Scopes are what the emulator enforces (any listed alternative suffices); *U* mea
 File URLs: `url_private` / `url_private_download` on `files.slack.com` need `Authorization: Bearer`
 with `files:read` and visibility of the file; without a token they answer a 302 to the sign-in
 page like Slack, with a token lacking the scope 403, for invisible files 404.
+Guests cannot discover or download files from public channels they have not joined. File objects,
+including those embedded in messages or search results, omit inaccessible private share locations.
+External uploads validate the declared byte length; completion validates every requested file and
+share before consuming any pending upload. Failed batches can be corrected and retried, and a
+successful completion is single use. Filenames are URL-encoded, with Unicode-safe download headers;
+control characters in uploaded filenames become underscores.
+Files shared into public channels report `is_public: true` independently of `public_url_shared`.
+User tokens may enable public links for another uploader's file when it is shared in a public channel.
 
 ## Seeded data
 
@@ -192,7 +210,8 @@ Workspace `T07CC5F644F`, domain `halcyonadvisory`, e-mail domain `halcyonadvisor
   blocks; 26 world chats become 23 DMs and 3 group DMs (`mpdm-...-1`), plus a welcome DM from
   the bot to Eleanor.
 * **Files**: documents from the world attached to announcements and engagement channels (real
-  DOCX/XLSX/PDF bytes; `files.list`, download with a token).
+  DOCX/XLSX/PDF bytes; `files.list`, download with a token). Repeated references to the same
+  world document retain every message/share reference and reuse the cached binary.
 * **User groups**: `@exec` `@audit` `@tax` `@advisory` `@finance` `@people` `@it` `@growth`
   (departments) and `@partners` `@leadership` `@managers` `@it-admins` (roles); ids `S...`.
 * **Pins** in `general`, `announcements`, `it-help`; **bookmarks** in `general`, `it-help`,
@@ -205,7 +224,8 @@ Workspace `T07CC5F644F`, domain `halcyonadvisory`, e-mail domain `halcyonadvisor
 ## Incoming webhooks
 
 `POST https://hooks.slack.com/services/T.../B.../<secret>` with JSON (or `payload=<json>` form):
-`text`, `blocks`, `attachments`, `username`, `icon_emoji`/`icon_url`, `thread_ts`. Answers plain
+`text`, `blocks`, `attachments`, `thread_ts`. App incoming webhooks ignore `channel`, `username`,
+`icon_emoji`/`icon_url` overrides. Answers plain
 text: `200 ok`; `404 no_service`; `400 invalid_payload` / `no_text` / `invalid_blocks` /
 `invalid_attachments`; `410 channel_is_archived`. Messages carry `subtype: bot_message`, the
 webhook's own `bot_id`, `username` and `bot_profile`. `oauth.v2.access` with `incoming-webhook`
@@ -227,9 +247,11 @@ Deliveries are `event_callback` envelopes (`token`, `team_id`, `api_app_id`, `ev
 `event_id` `Ev...`, `event_time`, `authorizations`, `is_ext_shared_channel`, `event_context`)
 signed `X-Slack-Signature: v0=<hmac_sha256(signing_secret, "v0:{ts}:{body}")>` with
 `X-Slack-Request-Timestamp` (verify with `slack_sdk.signature.SignatureVerifier`). Failed
-deliveries are retried (3 attempts in total) with `X-Slack-Retry-Num` and
+deliveries are retried (initial attempt plus 3 retries) with `X-Slack-Retry-Num` and
 `X-Slack-Retry-Reason` (`http_error`, `http_timeout`, `connection_failed`) and a fresh signature.
-Webhook mode (`sync`/`async`/`manual`) and the journal (`GET /_emulator/webhooks`) are the core's.
+The callback timeout is 3 seconds. `X-Slack-No-Retry: 1` in a failure response stops retries for
+that delivery; up to two redirects are followed. Webhook mode (`sync`/`async`/`manual`) and the
+journal (`GET /_emulator/webhooks`) use the shared dispatcher through a Slack-local subclass.
 
 Rules: conversation events (messages, reactions, joins, files, pins) are only delivered for
 conversations the app's bot user belongs to; workspace events (`channel_created` for public
@@ -279,9 +301,32 @@ bot). `response_url`s (`https://hooks.slack.com/commands|actions/T/<n>/<secret>`
 * No Socket Mode (`apps.connections.open`, WebSocket), RTM, `admin.*`, canvases, lists, calls,
   workflows, `conversations.inviteShared`/Connect invites, Enterprise Grid, `oauth.access` v1.
 * No built-in rate limiting (inject 429s with `/_emulator/faults`).
+* Retry delays are compressed for local tests; Slack's minute-scale retry schedule, delayed events,
+  and automatic subscription disabling are not simulated.
 * Avatar and emoji image URLs (`secure.gravatar.com`, `emoji.slack-edge.com`, `a.slack-edge.com`)
   are static strings, not served; thumbnails (`thumb_*`) serve the original bytes.
 * `unfurl_*`, `link_names`, `parse` are accepted and ignored; text is stored as sent.
 * Message search is substring-based (no stemming), UTC date filters.
+  Unparseable date modifiers (including invalid `during:` months/years) are ignored.
 * Guests are limited to their conversations but still see the full `users.list`.
 * `files.upload` is implemented because many clients still use it; real Slack has retired it.
+* Block Kit validation checks block types and basic structure, rather than every element schema.
+* Message content above 40,000 characters returns `msg_too_long`; Slack can truncate some message
+  submissions with a `message_truncated` warning instead.
+* Public file links are metadata only; anonymous `slack-files.com` hosting is not implemented.
+
+## Fidelity audit references
+
+The HTTP regressions in `tests/providers/slack/test_fidelity_audit.py` and the official SDK
+contracts cover malformed writes, thread pagination, file visibility and completion, OAuth
+binding/PKCE, webhook overrides and retry behavior. Source references:
+[thread paging](https://docs.slack.dev/reference/methods/conversations.replies/),
+[message updates](https://docs.slack.dev/reference/methods/chat.update/),
+[thread lifecycle](https://docs.slack.dev/messaging/retrieving-messages/),
+[email lookup](https://docs.slack.dev/reference/methods/users.lookupByEmail/),
+[OAuth](https://docs.slack.dev/reference/methods/oauth.v2.access/),
+[file completion](https://docs.slack.dev/reference/methods/files.completeUploadExternal/),
+[legacy upload shapes](https://docs.slack.dev/reference/methods/files.upload/),
+[incoming webhooks](https://docs.slack.dev/messaging/sending-messages-using-incoming-webhooks/),
+[Events API retries](https://docs.slack.dev/apis/events-api/), and
+[conversation scope filters](https://docs.slack.dev/apis/web-api/using-the-conversations-api/).

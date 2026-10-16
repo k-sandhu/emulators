@@ -267,7 +267,7 @@ async def test_async_web_client_with_a_prefix_base_url(
         token=credentials["tokens"]["user:p001"], base_url=emulator_server.url_for("slack") + "/api/"
     )
     me = await client.auth_test()
-    assert me["user"] == "eleanor.whitfield" and me["url"] == "https://halcyonadvisory.slack.com/"
+    assert me["user"] == "eleanor.whitfield" and me["url"] == emulator_server.url_for("slack") + "/"
     found = await client.search_messages(query="coffee machine", count=2)
     assert found["messages"]["total"] > 0
     channels = [c["name"] for page in [await client.conversations_list(limit=500)] for c in page["channels"]]
@@ -426,3 +426,47 @@ def test_events_api_delivery_is_verifiable_with_slack_sdk(
 @pytest.fixture(autouse=True)
 def _drain() -> Iterator[None]:
     yield
+
+
+def test_thread_pagination_counts_parent_and_finishes(bot: WebClient) -> None:
+    general = channel_id(bot, "general")
+    parent = bot.chat_postMessage(channel=general, text="SDK paginated parent")
+    reply = bot.chat_postMessage(channel=general, text="SDK paginated reply", thread_ts=parent["ts"])
+    pages = [dict(page.data) for page in bot.conversations_replies(channel=general, ts=parent["ts"], limit=1)]
+    assert len(pages) == 2 and all(len(page["messages"]) == 1 for page in pages)
+    assert [page["messages"][0]["ts"] for page in pages] == [parent["ts"], reply["ts"]]
+    assert pages[-1]["response_metadata"]["next_cursor"] == ""
+    bot.chat_delete(channel=general, ts=reply["ts"])
+    retained = bot.conversations_replies(channel=general, ts=parent["ts"])["messages"][0]
+    assert retained["thread_ts"] == parent["ts"] and retained["reply_count"] == 0
+
+
+def test_chat_update_clears_structured_fields(bot: WebClient) -> None:
+    general = channel_id(bot, "general")
+    posted = bot.chat_postMessage(
+        channel=general,
+        text="fallback",
+        blocks=[{"type": "divider"}],
+        attachments=[{"text": "attachment"}],
+        metadata={"event_type": "audit", "event_payload": {}},
+    )
+    updated = bot.chat_update(channel=general, ts=posted["ts"], blocks=[], attachments=[], metadata={})
+    assert updated["message"]["blocks"] == updated["message"]["attachments"] == []
+    assert "metadata" not in updated["message"] and updated["text"] == "fallback"
+
+
+def test_email_lookup_rejects_departed_users(bot: WebClient) -> None:
+    departed = next(u for page in bot.users_list() for u in page["members"] if u["deleted"])
+    with pytest.raises(SlackApiError) as error:
+        bot.users_lookupByEmail(email=departed["profile"]["email"])
+    assert error.value.response["error"] == "users_not_found"
+
+
+def test_unicode_upload_and_download(bot: WebClient) -> None:
+    uploaded = bot.files_upload_v2(content="SDK unicode content", filename="你好 #?.txt")
+    file = uploaded["files"][0]
+    response = requests.get(
+        file["url_private_download"], headers={"Authorization": f"Bearer {bot.token}"}, timeout=20
+    )
+    assert response.status_code == 200 and response.text == "SDK unicode content"
+    assert "filename*=UTF-8''" in response.headers["content-disposition"]

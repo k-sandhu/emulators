@@ -255,7 +255,7 @@ async def test_deleting_a_reply_updates_thread_counters(slack: Slack) -> None:
     reply = await slack.ok("chat.postMessage", channel=channel, text="reply", thread_ts=parent["ts"])
     await slack.ok("chat.delete", channel=channel, ts=reply["ts"])
     shown = next(m for m in await slack.history(channel, limit=999) if m["ts"] == parent["ts"])
-    assert "reply_count" not in shown and "thread_ts" not in shown
+    assert shown["reply_count"] == 0 and shown["thread_ts"] == parent["ts"]
 
 
 async def test_post_ephemeral(slack: Slack) -> None:

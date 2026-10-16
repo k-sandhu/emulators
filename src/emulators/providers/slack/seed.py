@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from emulators.core.provider import ProviderContext
+from emulators.providers.slack.delivery import SlackWebhookDispatcher
 from emulators.providers.slack.seed_channels import seed_conversations
 from emulators.providers.slack.seed_users import (
     seed_app,
@@ -14,6 +15,17 @@ from emulators.providers.slack.seed_users import (
 
 
 def seed(ctx: ProviderContext) -> None:
+    dispatcher = ctx.webhooks
+    ctx.webhooks = SlackWebhookDispatcher(
+        ctx.name,
+        ctx.store,
+        ctx.clock,
+        dispatcher.ids,
+        mode=dispatcher.mode,
+        transport_factory=dispatcher.transport_factory,
+        max_attempts=4,
+        timeout_s=3.0,
+    )
     seed_app(ctx)
     mapping = seed_users(ctx)
     names = seed_conversations(ctx, mapping)

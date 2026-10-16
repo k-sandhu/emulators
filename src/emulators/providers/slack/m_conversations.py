@@ -10,7 +10,14 @@ from emulators.providers.slack.paging import paginate
 from emulators.providers.slack.records import make_channel, new_id
 from emulators.providers.slack.runtime import Call, SlackError, api
 from emulators.providers.slack.shapes import channel_json, message_json
-from emulators.providers.slack.util import decode_cursor, encode_cursor, parse_ts, ts_key
+from emulators.providers.slack.util import (
+    bump_ts,
+    decode_cursor,
+    encode_cursor,
+    parse_ts,
+    ts_from_datetime,
+    ts_key,
+)
 
 TYPE_SCOPES = {
     "public_channel": "channels:read",
@@ -67,21 +74,26 @@ def _reject_dm(channel: dict[str, Any]) -> None:
 
 @api("conversations.list")
 async def conversations_list(call: Call) -> dict[str, Any]:
-    types = call.params.csv("types") or ["public_channel"]
-    for kind in types:
-        if kind not in TYPE_SCOPES:
-            raise SlackError("invalid_types")
-        call.need_scope(TYPE_SCOPES[kind])
+    types = list_types(call)
     exclude_archived = call.params.bool("exclude_archived")
     items = [
         c
         for c in access.col(call.ctx, access.CHANNELS)
-        if TYPE_OF_KIND[access.channel_kind(c)] in types
-        and not (exclude_archived and c.get("is_archived"))
-        and _visible_in_list(call, c)
+        if TYPE_OF_KIND[access.channel_kind(c)] in types and _visible_in_list(call, c)
     ]
     page, meta = paginate(items, call, kind="team", key=lambda c: c["id"])
+    page = [c for c in page if not (exclude_archived and c.get("is_archived"))]
     return {"channels": [_channel_out(call, c, num_members=True) for c in page], "response_metadata": meta}
+
+
+def list_types(call: Call) -> list[str]:
+    requested = call.params.csv("types") or ["public_channel"]
+    if any(kind not in TYPE_SCOPES for kind in requested):
+        raise SlackError("invalid_types")
+    allowed = [kind for kind in requested if call.me.has(TYPE_SCOPES[kind])]
+    if not allowed:
+        call.need_scope(*(TYPE_SCOPES[kind] for kind in requested))
+    return allowed
 
 
 @api("conversations.info")
@@ -99,7 +111,11 @@ def _history_window(call: Call) -> tuple[str, str, bool]:
         raise SlackError("invalid_ts_oldest")
     if latest is not None and parse_ts(latest) is None:
         raise SlackError("invalid_ts_latest")
-    return oldest, latest or "9999999999.999999", call.params.bool("inclusive")
+    current = ts_from_datetime(call.ctx.clock.now())
+    channel = access.channel_by_id(call.ctx, call.params.str("channel"))
+    if channel and channel.get("_generated_at") == current:
+        current = max(current, channel["_last_ts"], key=ts_key)
+    return oldest, latest or bump_ts(current), call.params.bool("inclusive")
 
 
 def _in_window(ts: str, oldest: str, latest: str, inclusive: bool) -> bool:
@@ -167,20 +183,19 @@ async def conversations_replies(call: Call) -> dict[str, Any]:
     if anchor.get("thread_ts") and anchor["thread_ts"] != anchor["ts"]:
         parent = access.get_message(ctx, channel["id"], anchor["thread_ts"]) or anchor
     oldest, latest, inclusive = _history_window(call)
-    replies = [
+    if parent.get("subtype") in ("channel_join", "channel_leave"):
+        raise SlackError("thread_not_found")
+    items = [
         m
-        for m in access.thread_replies(ctx, channel["id"], parent["ts"])
+        for m in [parent, *access.thread_replies(ctx, channel["id"], parent["ts"])]
         if _in_window(m["ts"], oldest, latest, inclusive)
     ]
-    cursor_param = call.params.str("cursor")
-    page, more, cursor = _page_by_ts(call, replies, newest_first=False, default_limit=1000, max_limit=1000)
-    out = page if cursor_param else [parent, *page]
+    page, more, cursor = _page_by_ts(call, items, newest_first=False, default_limit=1000, max_limit=1000)
     body: dict[str, Any] = {
-        "messages": [message_json(ctx, call.request, call.me, m) for m in out],
+        "messages": [message_json(ctx, call.request, call.me, m) for m in page],
         "has_more": more,
+        "response_metadata": {"next_cursor": cursor},
     }
-    if more:
-        body["response_metadata"] = {"next_cursor": cursor}
     return body
 
 
@@ -229,9 +244,7 @@ async def conversations_leave(call: Call) -> dict[str, Any]:
 async def conversations_create(call: Call) -> dict[str, Any]:
     ctx = call.ctx
     private = call.params.bool("is_private")
-    call.need_scope(
-        *(("groups:write", "channels:manage") if private else ("channels:manage", "channels:write"))
-    )
+    call.need_scope(*(("groups:write",) if private else ("channels:manage", "channels:write")))
     if access.is_guest(access.actor_user(ctx, call.me)):
         raise SlackError("restricted_action")
     name = validate_channel_name(call, call.params.str("name"))
@@ -375,13 +388,16 @@ async def conversations_rename(call: Call) -> dict[str, Any]:
 async def _set_meta(call: Call, field: str) -> dict[str, Any]:
     ctx = call.ctx
     channel = access.require_channel(ctx, call.me, call.params.str("channel"))
-    call.need_scope(*access.conversation_scope(channel, "write"))
+    scopes = access.conversation_scope(channel, "write")
+    if field == "topic":
+        scopes = (*scopes, *access.conversation_scope(channel, "write.topic"))
+    call.need_scope(*scopes)
     _reject_dm(channel)
     _not_archived(channel)
     _require_member(call, channel)
     if not call.params.has(field):
         raise SlackError("invalid_arguments")
-    value = str(call.params.raw(field))
+    value = call.params.str(field, "") or ""
     if len(value) > 250:
         raise SlackError("too_long")
     now = int(ctx.clock.now().timestamp())

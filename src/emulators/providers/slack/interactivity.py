@@ -24,7 +24,7 @@ from emulators.providers.slack import access, messages
 from emulators.providers.slack.events import USER_AGENT, signature
 from emulators.providers.slack.records import new_id
 from emulators.providers.slack.richtext import validate_attachments, validate_blocks
-from emulators.providers.slack.runtime import Call, SlackError, api
+from emulators.providers.slack.runtime import Call, SlackError, api, load_json
 from emulators.providers.slack.shapes import message_json
 from emulators.providers.slack.util import WORKSPACE_DOMAIN
 
@@ -236,8 +236,8 @@ async def handle_response_url(ctx: ProviderContext, request: Request, key: str) 
     if record["uses"] >= RESPONSE_URL_USES or ctx.clock.now() - created > RESPONSE_URL_TTL:
         return PlainTextResponse("used_url", status_code=400)
     try:
-        payload = json.loads((await request.body()) or b"{}")
-    except ValueError:
+        payload = load_json((await request.body()) or b"{}")
+    except (ValueError, UnicodeError, RecursionError):
         return PlainTextResponse("invalid_payload", status_code=400)
     if not isinstance(payload, dict):
         return PlainTextResponse("invalid_payload", status_code=400)
@@ -249,6 +249,10 @@ async def handle_response_url(ctx: ProviderContext, request: Request, key: str) 
     )
     app = access.app_config(ctx)
     text, blocks, attachments = payload.get("text"), payload.get("blocks"), payload.get("attachments")
+    if (text is not None and not isinstance(text, str)) or (
+        payload.get("thread_ts") is not None and not isinstance(payload["thread_ts"], str)
+    ):
+        return PlainTextResponse("invalid_payload", status_code=400)
     if not payload.get("delete_original") and not (text or blocks or attachments):
         return PlainTextResponse("no_text", status_code=400)
     try:

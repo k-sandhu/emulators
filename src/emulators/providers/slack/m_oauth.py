@@ -13,13 +13,19 @@ from urllib.parse import urlencode
 from fastapi import Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 
-from emulators.core.auth import OAuthError, basic_credentials, redirect_with_params, render_account_picker
+from emulators.core.auth import (
+    Grant,
+    OAuthError,
+    basic_credentials,
+    redirect_with_params,
+    render_account_picker,
+)
 from emulators.core.provider import ProviderContext, external_base, url_for_host
 from emulators.providers.slack import access
 from emulators.providers.slack.incoming import create_webhook
 from emulators.providers.slack.runtime import APP, BOT, USER, Call, SlackError, api
 from emulators.providers.slack.seed_users import BOT_SCOPES
-from emulators.providers.slack.util import WORKSPACE_DOMAIN, WORKSPACE_URL, digits_from
+from emulators.providers.slack.util import WORKSPACE_DOMAIN, digits_from
 
 ROTATION_TTL = timedelta(hours=12)
 OIDC_SCOPES = ("openid", "email", "profile")
@@ -47,6 +53,8 @@ def new_user_token(ctx: ProviderContext, *, rotating: bool = False) -> str:
 
 def _auth_error(error: OAuthError) -> SlackError:
     text = error.description.lower()
+    if "pkce" in text:
+        return SlackError("invalid_code_verifier")
     if "secret" in text:
         return SlackError("bad_client_secret")
     if "redirect_uri" in text:
@@ -110,6 +118,26 @@ def _team_stub(ctx: ProviderContext) -> dict[str, str]:
     return {"id": access.team_id(ctx), "name": ctx.world.org.name}
 
 
+def _redeem_code(call: Call, client_id: str, *, openid: bool = False) -> Grant:
+    code = call.params.str("code")
+    pending = call.ctx.tokens.resolve(code, "code")
+    if pending is None or bool(pending.extra.get("openid")) != openid:
+        raise SlackError("invalid_code")
+    if pending.client_id != client_id:
+        raise SlackError("invalid_client_id")
+    if pending.redirect_uri and call.params.str("redirect_uri") != pending.redirect_uri:
+        raise SlackError("bad_redirect_uri")
+    try:
+        return call.ctx.tokens.redeem_code(
+            code,
+            client_id=client_id,
+            redirect_uri=call.params.str("redirect_uri"),
+            code_verifier=call.params.str("code_verifier"),
+        )
+    except OAuthError as exc:
+        raise _auth_error(exc) from None
+
+
 @api("oauth.v2.access", auth=False)
 async def oauth_v2_access(call: Call) -> dict[str, Any]:
     ctx, p = call.ctx, call.params
@@ -119,18 +147,7 @@ async def oauth_v2_access(call: Call) -> dict[str, Any]:
         return _refresh(call, client_id, config)
     if grant_type != "authorization_code":
         raise SlackError("invalid_grant_type")
-    code = p.str("code")
-    if not code:
-        raise SlackError("invalid_code")
-    try:
-        grant = ctx.tokens.redeem_code(
-            code,
-            client_id=client_id,
-            redirect_uri=p.str("redirect_uri"),
-            code_verifier=p.str("code_verifier"),
-        )
-    except OAuthError as exc:
-        raise _auth_error(exc) from None
+    grant = _redeem_code(call, client_id)
     uid = grant.extra["slack_user"]
     bot_scopes = list(grant.scopes)
     user_scopes = list(grant.extra.get("user_scopes", []))
@@ -160,7 +177,9 @@ async def oauth_v2_access(call: Call) -> dict[str, Any]:
             body["incoming_webhook"] = {
                 "channel": "#" + channel["name"],
                 "channel_id": channel["id"],
-                "configuration_url": f"{WORKSPACE_URL}/services/{hook['bot_id']}",
+                "configuration_url": url_for_host(
+                    call.request, ctx, f"{WORKSPACE_DOMAIN}.slack.com", f"/services/{hook['bot_id']}"
+                ),
                 "url": url_for_host(call.request, ctx, "hooks.slack.com", f"/services/{hook['id']}"),
             }
     return body
@@ -173,6 +192,8 @@ def _refresh(call: Call, client_id: str, config: dict[str, Any]) -> dict[str, An
     refresh = ctx.tokens.resolve(call.params.str("refresh_token"), "refresh")
     if refresh is None:
         raise SlackError("invalid_refresh_token")
+    if refresh.client_id != client_id:
+        raise SlackError("invalid_client_id")
     ctx.tokens.revoke(refresh.token)
     extra = refresh.extra
     kind = extra.get("kind", BOT)
@@ -279,6 +300,8 @@ def authorize(ctx: ProviderContext, request: Request, *, openid: bool) -> Respon
         scopes=scopes,
         redirect_uri=redirect_uri,
         nonce=q.get("nonce"),
+        code_challenge=q.get("code_challenge"),
+        code_challenge_method=q.get("code_challenge_method"),
         extra={
             "slack_user": user["id"],
             "user_scopes": user_scopes,
@@ -337,18 +360,7 @@ async def openid_token(call: Call) -> dict[str, Any]:
     client_id, config = authenticate_app(call)
     if p.str("grant_type", "authorization_code") != "authorization_code":
         raise SlackError("invalid_grant_type")
-    code = p.str("code")
-    if not code:
-        raise SlackError("invalid_code")
-    try:
-        grant = ctx.tokens.redeem_code(
-            code,
-            client_id=client_id,
-            redirect_uri=p.str("redirect_uri"),
-            code_verifier=p.str("code_verifier"),
-        )
-    except OAuthError as exc:
-        raise _auth_error(exc) from None
+    grant = _redeem_code(call, client_id, openid=True)
     uid = grant.extra["slack_user"]
     user = access.user_by_id(ctx, uid)
     assert user is not None
@@ -435,7 +447,7 @@ async def auth_test(call: Call) -> dict[str, Any]:
     ctx = call.ctx
     user = access.actor_user(ctx, call.me)
     body: dict[str, Any] = {
-        "url": WORKSPACE_URL + "/",
+        "url": url_for_host(call.request, ctx, f"{WORKSPACE_DOMAIN}.slack.com", "/"),
         "team": ctx.world.org.name,
         "user": user["name"],
         "team_id": access.team_id(ctx),

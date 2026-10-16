@@ -9,13 +9,16 @@ does (only rate limiting uses a non-200 status).
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from email.message import Message
 from typing import Any
 from urllib.parse import parse_qsl
 
 from fastapi import Request
 from fastapi.responses import JSONResponse, Response
+from starlette.exceptions import HTTPException
 
 from emulators.core.auth import Grant, bearer_token
 from emulators.core.clock import utc
@@ -74,11 +77,9 @@ class Params:
         value = self.data.get(name)
         if value is None or value == "":
             return default
-        if isinstance(value, bool):
-            return "true" if value else "false"
-        if isinstance(value, (list, dict)):
-            return json.dumps(value)
-        return str(value)
+        if not isinstance(value, str):
+            raise SlackError("invalid_arguments")
+        return value
 
     def need(self, name: str) -> str:
         value = self.str(name)
@@ -97,8 +98,13 @@ class Params:
         if value is None or value == "":
             return default
         try:
-            number = int(float(value)) if not isinstance(value, bool) else int(value)
-        except (TypeError, ValueError):
+            if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+                raise ValueError
+            numeric = float(value)
+            if not math.isfinite(numeric) or not numeric.is_integer() or abs(numeric) > 2**63 - 1:
+                raise ValueError
+            number = int(value) if isinstance(value, (str, int)) else int(numeric)
+        except (TypeError, ValueError, OverflowError):
             raise SlackError("invalid_arguments") from None
         if lo is not None and number < lo:
             raise SlackError("invalid_limit" if name == "limit" else "invalid_arguments")
@@ -112,15 +118,21 @@ class Params:
             return default
         if isinstance(value, bool):
             return value
-        return str(value).strip().lower() in ("1", "true", "yes", "on")
+        if str(value).strip().lower() not in ("0", "1", "true", "false"):
+            raise SlackError("invalid_arguments")
+        return str(value).strip().lower() in ("1", "true")
 
     def csv(self, name: str) -> list[str]:
         value = self.data.get(name)
         if value is None or value == "":
             return []
         if isinstance(value, list):
-            return [str(v).strip() for v in value if str(v).strip()]
-        return [part.strip() for part in str(value).split(",") if part.strip()]
+            if any(not isinstance(v, str) for v in value):
+                raise SlackError("invalid_arguments")
+            return [v.strip() for v in value if v.strip()]
+        if not isinstance(value, str):
+            raise SlackError("invalid_arguments")
+        return [part.strip() for part in value.split(",") if part.strip()]
 
     def obj(self, name: str, error: str) -> Any:
         """A structured parameter (``blocks``, ``attachments``, ``metadata``...) in either encoding."""
@@ -130,8 +142,8 @@ class Params:
         if isinstance(value, (list, dict)):
             return value
         try:
-            return json.loads(str(value))
-        except ValueError:
+            return load_json(str(value))
+        except (ValueError, RecursionError, UnicodeError):
             raise SlackError(error) from None
 
 
@@ -209,6 +221,17 @@ def api(
 # -- request parsing ---------------------------------------------------------------------------
 
 
+def load_json(raw: str | bytes) -> Any:
+    """Reject non-JSON numbers and unpaired surrogates before they reach the store or response encoder."""
+
+    def invalid_constant(value: str) -> Any:
+        raise ValueError(value)
+
+    parsed = json.loads(raw, parse_constant=invalid_constant)
+    json.dumps(parsed, ensure_ascii=False, allow_nan=False).encode("utf-8")
+    return parsed
+
+
 async def read_params(request: Request) -> Params:
     data: dict[str, Any] = {k: v for k, v in request.query_params.items()}
     files: dict[str, UploadedFile] = {}
@@ -217,23 +240,31 @@ async def read_params(request: Request) -> Params:
     if request.method in ("POST", "PUT", "PATCH"):
         content_type = request.headers.get("content-type", "")
         mime = content_type.split(";")[0].strip().lower()
+        header = Message()
+        header["content-type"] = content_type
+        charset = header.get_content_charset() or "utf-8"
+        if charset not in ("utf-8", "iso-8859-1"):
+            raise SlackError("invalid_charset")
         if mime == "application/x-www-form-urlencoded":
-            body = (await request.body()).decode("utf-8", errors="replace")
-            data.update(dict(parse_qsl(body, keep_blank_values=True)))
+            body = (await request.body()).decode(charset, errors="replace")
+            data.update(dict(parse_qsl(body, keep_blank_values=True, encoding=charset)))
         elif mime == "application/json":
             json_body = True
             raw = await request.body()
             if raw.strip():
                 try:
-                    parsed = json.loads(raw)
-                except ValueError:
+                    parsed = load_json(raw.decode(charset))
+                except (ValueError, RecursionError, UnicodeError):
                     raise SlackError("invalid_json") from None
                 if not isinstance(parsed, dict):
                     raise SlackError("invalid_json")
                 data.update(parsed)
             missing_charset = "charset" not in content_type.lower()
         elif mime.startswith("multipart/"):
-            form = await request.form()
+            try:
+                form = await request.form()
+            except (HTTPException, ValueError):
+                raise SlackError("invalid_form_data") from None
             for key, value in form.multi_items():
                 if hasattr(value, "read"):
                     payload = await value.read()

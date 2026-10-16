@@ -85,13 +85,17 @@ def content(call: Call, *, required: bool = True) -> dict[str, Any]:
         validate_blocks(blocks, "check")
     if attachments is not None:
         validate_attachments(attachments)
+    if text is not None and len(text) > messages.MAX_TEXT:
+        raise SlackError("msg_too_long")
     return {"text": text, "blocks": blocks, "attachments": attachments}
 
 
-def metadata_arg(call: Call) -> dict[str, Any] | None:
+def metadata_arg(call: Call, *, allow_empty: bool = False) -> dict[str, Any] | None:
     raw = call.params.obj("metadata", "invalid_metadata_format")
     if raw is None:
         return None
+    if allow_empty and raw == {}:
+        return {}
     if (
         not isinstance(raw, dict)
         or not isinstance(raw.get("event_type"), str)
@@ -144,7 +148,12 @@ async def update(call: Call) -> dict[str, Any]:
     rec = access.get_message(ctx, channel["id"], ts)
     if rec is None:
         raise SlackError("message_not_found")
-    body = content(call)
+    body = content(call, required=False)
+    metadata = metadata_arg(call, allow_empty=True)
+    if not any(p.has(key) for key in ("text", "blocks", "attachments", "metadata")):
+        raise SlackError("no_text")
+    if p.raw("text") == "":
+        body["text"] = ""
     if rec.get("user") != call.me.uid or rec.get("subtype") == "tombstone":
         raise SlackError("cant_update_message")
     await messages.update_message(
@@ -155,6 +164,7 @@ async def update(call: Call) -> dict[str, Any]:
         text=body["text"],
         blocks=body["blocks"],
         attachments=body["attachments"],
+        metadata=metadata,
     )
     return {
         "channel": channel["id"],
@@ -213,7 +223,7 @@ async def get_permalink(call: Call) -> dict[str, Any]:
     rec = access.get_message(ctx, channel["id"], ts) if parse_ts(ts) else None
     if rec is None:
         raise SlackError("message_not_found")
-    return {"channel": channel["id"], "permalink": permalink_for(rec)}
+    return {"channel": channel["id"], "permalink": permalink_for(rec, call.request, ctx)}
 
 
 @api("chat.meMessage", scopes=("chat:write", "chat:write:user", "chat:write:bot"))

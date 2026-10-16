@@ -269,10 +269,9 @@ async def test_public_urls_and_file_reactions(slack: Slack) -> None:
     assert (await slack.ok("files.revokePublicURL", eleanor, file=file_id))["file"][
         "public_url_shared"
     ] is False
-    assert (
-        await slack.err("files.sharedPublicURL", await slack.user_token("p018"), file=file_id)
-        == "not_allowed"
-    )
+    assert (await slack.ok("files.sharedPublicURL", await slack.user_token("p018"), file=file_id))["file"][
+        "public_url_shared"
+    ] is True
     await slack.ok("reactions.add", eleanor, file=file_id, name="tada")
     got = (await slack.ok("reactions.get", eleanor, file=file_id))["file"]
     assert got["reactions"][0]["name"] == "tada"

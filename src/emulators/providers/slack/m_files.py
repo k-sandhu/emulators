@@ -3,16 +3,20 @@
 from __future__ import annotations
 
 import os
+import re
 from typing import Any
+from urllib.parse import quote
 
 from fastapi import Request
 from fastapi.responses import RedirectResponse, Response
+from starlette.exceptions import HTTPException
 
 from emulators.core.auth import bearer_token
 from emulators.core.provider import ProviderContext, url_for_host
 from emulators.providers.slack import access, events, messages
 from emulators.providers.slack.records import new_id
-from emulators.providers.slack.runtime import Call, SlackError, api
+from emulators.providers.slack.richtext import validate_blocks
+from emulators.providers.slack.runtime import Call, Params, SlackError, api, authenticate
 from emulators.providers.slack.shapes import FILETYPES, IMAGE_TYPES, file_json, file_visible
 from emulators.providers.slack.util import WORKSPACE_URL
 from emulators.world.documents import EXTENSION_TO_MIME
@@ -44,6 +48,7 @@ def new_file_record(
     filetype: str | None = None,
     file_id: str | None = None,
 ) -> dict[str, Any]:
+    name = re.sub(r"[\x00-\x1f\x7f]", "_", name)
     ext = _extension(name)
     kind, pretty = FILETYPES.get(
         filetype or ext, (filetype or ext or "binary", (filetype or ext or "Binary").upper())
@@ -80,6 +85,9 @@ def new_file_record(
 def _target_channels(call: Call, refs: list[str]) -> list[dict[str, Any]]:
     result = []
     for ref in refs:
+        named = access.channel_by_name(call.ctx, ref)
+        if named is not None:
+            ref = named["id"]
         channel = access.require_channel(call.ctx, call.me, ref)
         if channel.get("is_archived"):
             raise SlackError("is_archived")
@@ -120,7 +128,20 @@ async def share_files(
 
 
 def _public(call: Call, record: dict[str, Any]) -> dict[str, Any]:
-    return file_json(call.ctx, call.request, record)
+    return file_json(call.ctx, call.request, record, call.me)
+
+
+def _validate_share(call: Call, channels: list[dict[str, Any]]) -> None:
+    """Validate the whole share before consuming an upload or creating any files."""
+    comment = call.params.str("initial_comment")
+    if comment and len(comment) > messages.MAX_TEXT:
+        raise SlackError("msg_too_long")
+    thread = call.params.str("thread_ts")
+    if thread and any(access.get_message(call.ctx, c["id"], thread) is None for c in channels):
+        raise SlackError("thread_not_found")
+    blocks = call.params.obj("blocks", "invalid_blocks_format")
+    if blocks is not None:
+        validate_blocks(blocks, "upload")
 
 
 @api("files.upload", scopes=("files:write", "files:write:user"))
@@ -133,21 +154,27 @@ async def files_upload(call: Call) -> dict[str, Any]:
     if upload is None and content is None:
         raise SlackError("no_file_data")
     channels = _target_channels(call, p.csv("channels"))
+    _validate_share(call, channels)
     if upload is not None:
         data, name, mimetype = upload.data, p.str("filename") or upload.name, upload.content_type
     else:
         data, name, mimetype = (content or "").encode(), p.str("filename") or "untitled", None
         if not _extension(name) and not p.str("filetype"):
             mimetype = "text/plain"
+    filetype = p.str("filetype")
+    if filetype in (None, "auto"):
+        filetype = "txt" if upload is None and not _extension(name) else None
     record = new_file_record(
         call.ctx,
         name=name,
-        title=p.str("title") or name,
+        title=p.str("title") or os.path.splitext(name)[0] or name,
         data=data,
         uploader=call.me.uid,
         mimetype=None if mimetype in (None, "application/octet-stream") else mimetype,
-        filetype=p.str("filetype") if p.str("filetype") not in (None, "auto") else None,
+        filetype=filetype,
     )
+    if upload is None:
+        record.update(editable=True, mode="snippet")
     await share_files(
         call, [record], channels, comment=p.str("initial_comment"), thread_ts=p.str("thread_ts")
     )
@@ -190,7 +217,10 @@ async def receive_upload(ctx: ProviderContext, token: str, request: Request) -> 
         return Response("Not found", status_code=404, media_type="text/plain")
     content_type = request.headers.get("content-type", "application/octet-stream")
     if content_type.lower().startswith("multipart/"):
-        form = await request.form()
+        try:
+            form = await request.form()
+        except (HTTPException, ValueError):
+            return Response("Bad request", status_code=400, media_type="text/plain")
         parts = [v for _, v in form.multi_items() if hasattr(v, "read")]
         if not parts:
             return Response("Bad request", status_code=400, media_type="text/plain")
@@ -198,6 +228,8 @@ async def receive_upload(ctx: ProviderContext, token: str, request: Request) -> 
         content_type = parts[0].content_type or "application/octet-stream"
     else:
         data = await request.body()
+    if len(data) != pending["length"]:
+        return Response("Bad request", status_code=400, media_type="text/plain")
     pending["_blob"] = ctx.store.blobs.put(data)
     pending["_content_type"] = content_type
     pending["received"] = True
@@ -213,18 +245,30 @@ async def complete_upload(call: Call) -> dict[str, Any]:
         raise SlackError("invalid_arguments")
     refs = p.csv("channels") or ([p.str("channel_id")] if p.str("channel_id") else [])
     channels = _target_channels(call, refs)
+    _validate_share(call, channels)
+    uploads: list[tuple[dict[str, Any], str]] = []
+    seen: set[str] = set()
     records: list[dict[str, Any]] = []
     for item in requested:
-        if not isinstance(item, dict) or not item.get("id"):
+        if (
+            not isinstance(item, dict)
+            or not isinstance(item.get("id"), str)
+            or not item["id"]
+            or item["id"] in seen
+            or (item.get("title") is not None and not isinstance(item["title"], str))
+        ):
             raise SlackError("invalid_arguments")
+        seen.add(item["id"])
         pending = next((u for u in access.col(ctx, access.UPLOADS) if u["file_id"] == item["id"]), None)
         if pending is None or pending["user"] != call.me.uid or not pending["received"]:
             raise SlackError("file_not_found")
+        uploads.append((pending, item.get("title") or pending["filename"]))
+    for pending, title in uploads:
         data = ctx.store.blobs.get(pending["_blob"])
         record = new_file_record(
             ctx,
             name=pending["filename"],
-            title=str(item.get("title") or pending["filename"]),
+            title=title,
             data=data,
             uploader=call.me.uid,
             mimetype=pending["_content_type"]
@@ -267,6 +311,8 @@ async def files_info(call: Call) -> dict[str, Any]:
 async def files_list(call: Call) -> dict[str, Any]:
     ctx, p = call.ctx, call.params
     channel_id = p.str("channel")
+    if channel_id:
+        access.require_channel(ctx, call.me, channel_id)
     user = p.str("user")
     ts_from, ts_to = p.int("ts_from", 0), p.int("ts_to")
     types = p.csv("types") or ["all"]
@@ -312,7 +358,7 @@ async def files_delete(call: Call) -> dict[str, Any]:
 @api("files.sharedPublicURL", scopes=("files:write",), kinds=("user",))
 async def files_shared_public_url(call: Call) -> dict[str, Any]:
     record = _visible_file(call, call.params.str("file"))
-    if record["user"] != call.me.uid:
+    if record["user"] != call.me.uid and not _public(call, record)["is_public"]:
         raise SlackError("not_allowed")
     record["public_url_shared"] = True
     record["is_public"] = True
@@ -347,20 +393,18 @@ def serve_file(ctx: ProviderContext, request: Request, team_file: str, download:
         return Response("File not found", status_code=404, media_type="text/plain")
     if "files:read" not in grant.scopes and "files:read:user" not in grant.scopes:
         return Response("missing_scope", status_code=403, media_type="text/plain")
-    from emulators.providers.slack.runtime import Actor
-
-    extra = grant.extra or {}
-    actor = Actor(
-        token=token or "",
-        kind=extra.get("kind", "user"),
-        uid=extra.get("slack_user", ""),
-        scopes=tuple(grant.scopes),
-        grant=grant,
-    )
+    try:
+        actor = authenticate(ctx, request, Params({}, {}, json_body=False))
+    except SlackError:
+        return Response("File not found", status_code=404, media_type="text/plain")
     if not file_visible(ctx, actor, record):
         return Response("File not found", status_code=404, media_type="text/plain")
     data = ctx.store.blobs.get(record["_blob"])
     headers = {"content-length": str(len(data))}
     if download:
-        headers["content-disposition"] = f'attachment; filename="{record["name"]}"'
+        fallback = record["name"].encode("ascii", errors="replace").decode()
+        fallback = fallback.replace('"', "_").replace("\\", "_").replace("\r", "_").replace("\n", "_")
+        headers["content-disposition"] = (
+            f"attachment; filename=\"{fallback}\"; filename*=UTF-8''{quote(record['name'], safe='')}"
+        )
     return Response(data, media_type=record["mimetype"], headers=headers)

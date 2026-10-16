@@ -108,7 +108,7 @@ async def reactions_remove(call: Call) -> dict[str, Any]:
 async def reactions_get(call: Call) -> dict[str, Any]:
     target_file = _file_target(call)
     if target_file is not None:
-        return {"type": "file", "file": file_json(call.ctx, call.request, target_file)}
+        return {"type": "file", "file": file_json(call.ctx, call.request, target_file, call.me)}
     channel, rec = _message_target(call, write=False)
     return {
         "type": "message",

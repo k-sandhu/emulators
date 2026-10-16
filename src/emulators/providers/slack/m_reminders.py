@@ -22,6 +22,8 @@ def parse_when(ctx: ProviderContext, raw: str) -> int:
     """Slack's reminder ``time``: unix timestamp, seconds from now, or simple natural language."""
     now = ctx.clock.now()
     text = raw.strip().lower()
+    if len(text) > 256:
+        raise SlackError("cannot_parse")
     if text.isdigit():
         value = int(text)
         if value <= 86400 * 365:

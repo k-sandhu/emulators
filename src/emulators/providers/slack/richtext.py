@@ -51,28 +51,39 @@ MAX_BLOCKS = 50
 
 def _styled(text: str, style: dict[str, bool] | None = None) -> list[dict[str, Any]]:
     """Split plain text into ``text`` elements, applying mrkdwn styles (nested ones merge)."""
-    if not text:
-        return []
-    best: tuple[str, re.Match[str]] | None = None
-    for name, pattern in _STYLES:
-        match = pattern.search(text)
-        if match and (
-            best is None or (match.start(), -len(match.group(0))) < (best[1].start(), -len(best[1].group(0)))
-        ):
-            best = (name, match)
-    if best is None:
-        element: dict[str, Any] = {"type": "text", "text": unescape_text(text)}
-        if style:
-            element["style"] = dict(style)
-        return [element]
-    name, match = best
-    merged = {**(style or {}), name: True}
-    inner = (
-        _styled(match.group(1), merged)
-        if name != "code"
-        else [{"type": "text", "text": unescape_text(match.group(1)), "style": merged}]
-    )
-    return _styled(text[: match.start()], style) + inner + _styled(text[match.end() :], style)
+    pending: list[tuple[str, dict[str, bool] | None] | dict[str, Any]] = [(text, style)]
+    result: list[dict[str, Any]] = []
+    while pending:
+        task = pending.pop()
+        if isinstance(task, dict):
+            result.append(task)
+            continue
+        part, current_style = task
+        if not part:
+            continue
+        best: tuple[str, re.Match[str]] | None = None
+        for name, pattern in _STYLES:
+            match = pattern.search(part)
+            if match and (
+                best is None
+                or (match.start(), -len(match.group(0))) < (best[1].start(), -len(best[1].group(0)))
+            ):
+                best = (name, match)
+        if best is None:
+            element: dict[str, Any] = {"type": "text", "text": unescape_text(part)}
+            if current_style:
+                element["style"] = dict(current_style)
+            result.append(element)
+            continue
+        name, match = best
+        merged = {**(current_style or {}), name: True}
+        pending.append((part[match.end() :], current_style))
+        if name == "code":
+            pending.append({"type": "text", "text": unescape_text(match.group(1)), "style": merged})
+        else:
+            pending.append((match.group(1), merged))
+        pending.append((part[: match.start()], current_style))
+    return result
 
 
 def inline_elements(text: str) -> list[dict[str, Any]]:
