@@ -308,7 +308,12 @@ class PaymentsAPI(BaseAPI):
             + (".amount_capturable_updated" if intent["status"] == "requires_capture" else ".succeeded"),
             intent,
         )
+        if not setup and intent["status"] == "succeeded":
+            await self.payment_succeeded(intent)
         return intent
+
+    async def payment_succeeded(self, intent: Record) -> None:
+        """Billing overrides this to propagate a directly confirmed invoice payment."""
 
     def transaction(self, amount: int, currency: str, source: str, kind: str, *, fee: int = 0) -> Record:
         txn = self.new(
@@ -359,7 +364,7 @@ class PaymentsAPI(BaseAPI):
             description=pi.get("description"),
             disputed=False,
             failure_balance_transaction=None,
-            failure_code=None if success else "card_declined",
+            failure_code=None if success else DECLINES.get(pm["_scenario"], ("card_declined", None))[0],
             failure_message=None if success else "Your card was declined.",
             fraud_details={},
             on_behalf_of=None,
@@ -380,7 +385,7 @@ class PaymentsAPI(BaseAPI):
                 "card": {
                     k: copy.deepcopy(v)
                     for k, v in pm["card"].items()
-                    if k not in {"checks", "generated_from", "networks"}
+                    if k not in {"generated_from", "networks", "display_brand", "three_d_secure_usage"}
                 },
                 "type": "card",
             },
@@ -400,6 +405,9 @@ class PaymentsAPI(BaseAPI):
             _scenario=pm["_scenario"],
         )
         charge["refunds"]["url"] = "/v1/charges/" + charge["id"] + "/refunds"
+        charge["payment_method_details"]["card"].update(
+            installments=None, network=pm["card"]["brand"], three_d_secure=None
+        )
         charge["metadata"] = copy.deepcopy(pi["metadata"])
         if captured:
             self.capture_accounting(charge, charge["amount"])
@@ -452,6 +460,7 @@ class PaymentsAPI(BaseAPI):
             intent.update(status="succeeded", amount_received=amount, amount_capturable=0)
             await self.emit("charge.captured", charge)
             await self.emit("payment_intent.succeeded", intent, previous)
+            await self.payment_succeeded(intent)
         elif not setup and operation == "increment_authorization":
             if intent["status"] != "requires_capture":
                 self.invalid_state("Only uncaptured PaymentIntents can have their authorization incremented.")

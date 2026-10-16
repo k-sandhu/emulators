@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import timedelta
 
 import httpx
+import pytest
 import stripe
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -169,3 +170,35 @@ async def test_oauth_connect_roundtrip(client: httpx.AsyncClient) -> None:
         data={"grant_type": "refresh_token", "refresh_token": data["refresh_token"]},
     )
     assert refreshed.status_code == 200
+
+
+@pytest.mark.parametrize("mode", ["async", "manual"])
+async def test_webhook_pending_count_after_deferred_delivery(
+    client: httpx.AsyncClient, stripe_hub: EmulatorHub, mode: str
+) -> None:
+    receiver = FastAPI()
+    received: list[bytes] = []
+
+    @receiver.post("/hook")
+    async def hook(request: Request) -> dict:
+        received.append(await request.body())
+        return {}
+
+    ctx = stripe_hub.context("stripe")
+    ctx.webhooks.mode = mode
+    stripe_hub.webhook_transport = httpx.ASGITransport(app=receiver)
+    await post(
+        client,
+        "webhook_endpoints",
+        {"url": "https://consumer.example/hook", "enabled_events[]": "customer.created"},
+    )
+    await post(client, "customers", {"name": "Deferred webhook"})
+    events = await get(client, "events", params={"type": "customer.created"})
+    event_id = events["data"][0]["id"]
+    if mode == "manual":
+        assert not received and events["data"][0]["pending_webhooks"] == 1
+        await client.post("/_emulator/webhooks/flush")
+    else:
+        await stripe_hub.drain_webhooks()
+    assert len(received) == 1
+    assert (await get(client, "events/" + event_id))["pending_webhooks"] == 0

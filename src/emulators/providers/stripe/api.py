@@ -168,6 +168,12 @@ class StripeAPI(CommerceAPI):
         )
         obj = value.get("object")
         if obj == "invoice":
+            if value.get("hosted_invoice_url"):
+                result["hosted_invoice_url"] = self.url(
+                    "invoice.stripe.com", f"/i/{self.ctx.world.org.stripe_account_id}/test_{value['id']}"
+                )
+            if value.get("invoice_pdf"):
+                result["invoice_pdf"] = self.url("pay.stripe.com", f"/invoice/{value['id']}/pdf")
             expansions = self.params.get("expand", [])
             legacy_expand = any("payment_intent" in path.split(".") for path in expansions)
             if version < "2025-03-31" or legacy_expand:
@@ -198,6 +204,20 @@ class StripeAPI(CommerceAPI):
             )
             if deliveries:
                 result["pending_webhooks"] = sum(d["status"] != "delivered" for d in deliveries)
+        elif obj == "checkout.session" and value.get("url"):
+            result["url"] = self.url("checkout.stripe.com", "/c/pay/" + value["id"])
+        elif obj == "billing_portal.session" and value.get("url"):
+            result["url"] = self.url("billing.stripe.com", "/p/session/" + value["id"])
+        elif obj == "file" and value.get("url"):
+            result["url"] = self.url("files.stripe.com", f"/v1/files/{value['id']}/contents")
+        elif obj == "charge" and value.get("receipt_url"):
+            result["receipt_url"] = self.url("pay.stripe.com", "/receipts/" + value["payment_intent"])
+        elif obj == "balance_transaction":
+            result["status"] = (
+                "available"
+                if value["available_on"] <= self.now or value["type"] in {"payout", "payout_cancel"}
+                else "pending"
+            )
         return result
 
     def expand(self, record: Record) -> Record:
@@ -263,6 +283,42 @@ async def parameters(request: Request) -> Record:
                 result.update(decode(body))
             except UnicodeDecodeError:
                 fail("Invalid UTF-8 in request body.")
+    for key in {
+        "items",
+        "line_items",
+        "expand",
+        "payment_method_types",
+        "enabled_events",
+        "preferred_locales",
+        "images",
+        "lookup_keys",
+        "types",
+    } & result.keys():
+        if not isinstance(result[key], list):
+            fail("Invalid array", key)
+    for key in {
+        "metadata",
+        "address",
+        "shipping",
+        "invoice_settings",
+        "billing_details",
+        "card",
+        "recurring",
+        "product_data",
+        "price_data",
+        "payment_method_data",
+        "automatic_payment_methods",
+        "evidence",
+        "trial_settings",
+        "subscription_details",
+    } & result.keys():
+        if not isinstance(result[key], dict) and not (
+            result[key] == "" and key in {"metadata", "address", "shipping"}
+        ):
+            fail("Invalid hash", key)
+    for key in {"items", "line_items"} & result.keys():
+        if any(not isinstance(item, dict) for item in result[key]):
+            fail("Invalid hash", key)
     return result
 
 

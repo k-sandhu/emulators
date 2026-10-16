@@ -59,7 +59,8 @@ account-scoped.
 Connect's headless OAuth flow supports `/oauth/authorize` with `client_id`,
 `redirect_uri`, `scope=read_only|read_write`, and `state`, followed by a form POST
 to `/oauth/token` with `grant_type=authorization_code` and the returned `code`.
-Refresh grants and `/oauth/deauthorize` are available. Read-only access tokens
+Refresh grants and `/oauth/deauthorize` are available; deauthorization revokes
+the client's local access/refresh grants. Read-only access tokens
 cannot mutate merchant resources.
 
 ## Wire conventions
@@ -216,7 +217,8 @@ Quantity/price changes on subscription updates support `proration_behavior=none`
 `create_prorations` (pending adjustment), and `always_invoice` (immediate invoice).
 Credit balances are consumed at invoice finalization. Renewals include pending
 invoice items. Month/year boundaries use calendar dates rather than fixed
-30/365-day arithmetic.
+30/365-day arithmetic. Confirming an invoice's PaymentIntent directly also pays
+the invoice and activates its incomplete subscription.
 
 ## Seeded data
 
@@ -284,6 +286,8 @@ and clock lifecycle operations. Idempotent replays emit no new events.
 
 Test clocks advance their own attached customers without moving the shared hub
 clock. Use `POST /v1/test_helpers/test_clocks/{id}/advance` for those subscriptions.
+`advance_time` also expires overdue Checkout sessions and settles pending payouts
+whose arrival date has passed.
 
 ## Known gaps
 
@@ -302,8 +306,8 @@ clock. Use `POST /v1/test_helpers/test_clocks/{id}/advance` for those subscripti
   scheduler, automatic invoice finalization timer, full retry/dunning schedule,
   `unpaid` transition policy, or delayed asynchronous payment settlement. Test
   clock advance limits and customer-count restrictions are not enforced.
-- Basic OAuth exchanges work locally. Deauthorization returns the Stripe response
-  shape; it does not model Connect platform membership removal. Multi-account
+- Basic OAuth exchanges work locally. Deauthorization revokes local grants but
+  does not model Connect platform membership removal. Multi-account
   data isolation is limited to rejecting account IDs other than Halcyon's.
 - Version handling covers the billing field migrations described above. Unknown
   optional request parameters and unsupported expansion names are not exhaustively
@@ -332,6 +336,23 @@ setup, capture, refunds, catalog, subscriptions, invoice payment, Checkout,
 webhook configuration, multipart uploads, events, balance, and test clocks through
 `emulator_intercept`. HTTP tests also verify official SDK webhook signatures,
 retries, permission denials, prefix routing, real PDF bytes, and accounting effects.
+
+The focused suites pass: **73 HTTP tests and 9 official SDK tests**. Ruff check and
+format checks cover only the provider and its tests, respecting ownership of the
+shared working tree.
+
+A repository-wide run during concurrent provider development recorded **746 passed,
+5 failed, 25 errors, and 2 skipped**. Its blockers were outside Stripe's allowed
+edit paths: Box route initialization raised `UnboundLocalError` for `content`,
+Dropbox was being edited and raised a syntax error, Zoom's acceptance flow returned
+404, and a Microsoft notification test received five notifications instead of three.
+The shared Stripe acceptance test's receiver returned 422 because its function-local
+`Request` import and deferred annotation were interpreted as a required query
+parameter. The provider recorded those failed deliveries correctly; the dedicated
+HTTP and SDK receiver tests use a module-level annotation and verify delivery and
+signatures successfully. A fresh temporary directory was used for that full run
+to avoid the machine's locked default pytest temp directory. These cross-provider
+and acceptance-fixture fixes belong to the coordinator.
 
 Reference contracts: [PaymentIntents](https://docs.stripe.com/api/payment_intents/confirm),
 [modern invoices](https://docs.stripe.com/api/invoices/object?api-version=2025-09-30.clover),

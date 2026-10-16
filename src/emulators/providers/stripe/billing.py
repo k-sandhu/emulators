@@ -357,6 +357,8 @@ class BillingAPI(PaymentsAPI):
         return invoice
 
     async def mark_invoice_paid(self, invoice: Record) -> Record:
+        if invoice["status"] == "paid":
+            return invoice
         invoice.update(
             status="paid",
             amount_paid=invoice["amount_due"],
@@ -376,6 +378,21 @@ class BillingAPI(PaymentsAPI):
         await self.emit("invoice.payment_succeeded", invoice)
         await self.emit("invoice.paid", invoice)
         return invoice
+
+    async def payment_succeeded(self, intent: Record) -> None:
+        for invoice in self.ctx.store.collection("invoices"):
+            if invoice.get("_payment_intent") == intent["id"] and invoice["status"] == "open":
+                await self.mark_invoice_paid(invoice)
+        for session in self.ctx.store.collection("checkout/sessions"):
+            if session["status"] != "open":
+                continue
+            paid = session.get("payment_intent") == intent["id"]
+            if session.get("subscription"):
+                subscription = self.ctx.store.collection("subscriptions").get(session["subscription"])
+                paid = paid or bool(subscription and subscription["status"] == "active")
+            if paid:
+                session.update(status="complete", payment_status="paid", url=None)
+                await self.emit("checkout.session.completed", session)
 
     async def pay_invoice(self, invoice: Record, p: Record) -> Record:
         if invoice["status"] == "paid":
@@ -785,19 +802,32 @@ class BillingAPI(PaymentsAPI):
             return item
         if collection == "invoices":
             if record_id in {"upcoming", "create_preview"}:
-                subscription = self.get("subscriptions", p["subscription"]) if p.get("subscription") else None
-                invoice = self.make_invoice(
-                    {
-                        **p,
-                        "customer": p.get("customer") or (subscription["customer"] if subscription else None),
-                    },
-                    subscription=subscription,
-                    preview=True,
-                )
-                self.ctx.store.collection("invoices").delete(invoice["id"])
-                invoice["id"] = "upcoming_in_" + self.ctx.ids.base62(24)
-                invoice["status"] = "draft"
-                return invoice
+                snapshot = self.ctx.store.snapshot()
+                try:
+                    subscription = (
+                        self.get("subscriptions", p["subscription"]) if p.get("subscription") else None
+                    )
+                    if not subscription and p.get("subscription_details", {}).get("items"):
+                        subscription = self.make_subscription(
+                            {"customer": p.get("customer"), **p["subscription_details"]}
+                        )
+                    invoice = self.make_invoice(
+                        {
+                            **p,
+                            "customer": p.get("customer")
+                            or (subscription["customer"] if subscription else None),
+                        },
+                        subscription=subscription,
+                        preview=True,
+                    )
+                    invoice["id"] = "upcoming_in_" + self.ctx.ids.base62(24)
+                    invoice["status"] = "draft"
+                    invoice["lines"]["url"] = f"/v1/invoices/{invoice['id']}/lines"
+                    for line in invoice["lines"]["data"]:
+                        line["invoice"] = invoice["id"]
+                    return copy.deepcopy(invoice)
+                finally:
+                    self.ctx.store.restore(snapshot)
             if method == "POST" and not record_id:
                 invoice = self.make_invoice(p)
                 await self.emit("invoice.created", invoice)

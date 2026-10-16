@@ -153,6 +153,10 @@ class StripeProvider(Provider):
                     secret, client_id = client_id, None
                 code_grant = ctx.tokens.get(p.get("code"), "code")
                 client_id = client_id or (code_grant.client_id if code_grant else "emulator-client")
+                if secret and not secret.startswith("sk_test_"):
+                    raise OAuthError("invalid_client", "Invalid API key.", 401)
+                if not ctx.tokens.lenient_clients and secret != SECRET_KEY:
+                    raise OAuthError("invalid_client", "Invalid API key.", 401)
                 if p.get("grant_type") == "authorization_code":
                     grant = ctx.tokens.redeem_code(
                         p.get("code"),
@@ -168,8 +172,6 @@ class StripeProvider(Provider):
                     raise OAuthError(
                         "unsupported_grant_type", "Only authorization_code and refresh_token are supported."
                     )
-                if secret and not secret.startswith("sk_test_"):
-                    raise OAuthError("invalid_client", "Invalid API key.", 401)
             except OAuthError as exc:
                 return JSONResponse(
                     {"error": exc.error, "error_description": exc.description}, status_code=exc.status
@@ -206,16 +208,23 @@ class StripeProvider(Provider):
                     "token_type": "bearer",
                     "stripe_publishable_key": PUBLIC_KEY,
                     "stripe_user_id": ctx.world.org.stripe_account_id,
-                    "scope": grant.scopes[0] if grant.scopes else "read_write",
+                    "scope": grant.extra.get(
+                        "stripe_scope", grant.scopes[0] if grant.scopes else "read_write"
+                    ),
                 }
             )
 
         @app.post("/oauth/deauthorize")
         async def deauthorize(request: Request) -> Record:
             p = await parameters(request)
-            StripeAPI(ctx, request, p).authorize("account", "write")
+            api = StripeAPI(ctx, request, p)
+            api.authorize("account", "write")
+            api.required(p, "client_id", "stripe_user_id")
             if p.get("stripe_user_id") != ctx.world.org.stripe_account_id:
                 fail("No such account.", "stripe_user_id")
+            for grant in ctx.store.collection("_grants"):
+                if grant["client_id"] == p["client_id"]:
+                    ctx.tokens.revoke(grant["id"])
             return {"stripe_user_id": ctx.world.org.stripe_account_id}
 
 
@@ -281,6 +290,14 @@ async def advance_time(ctx: ProviderContext, payload: Record) -> Record:
     ctx.clock.advance(timedelta(seconds=seconds))
     api = StripeAPI(ctx)
     renewed = await api.renew(ctx.clock.timestamp())
+    for session in ctx.store.collection("checkout/sessions"):
+        if session["status"] == "open" and session["expires_at"] <= api.now:
+            session["status"] = "expired"
+            await api.emit("checkout.session.expired", session)
+    for payout in ctx.store.collection("payouts"):
+        if payout["status"] == "pending" and payout["arrival_date"] <= api.now:
+            payout["status"] = "paid"
+            await api.emit("payout.paid", payout)
     return {"now": ctx.clock.timestamp(), "invoices_created": renewed}
 
 

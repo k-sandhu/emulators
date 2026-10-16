@@ -486,6 +486,8 @@ class CommerceAPI(BillingAPI):
             await self.confirm_intent(intent, {}, setup=setup)
             if intent["status"] != "succeeded":
                 return session
+        if session["status"] == "complete":
+            return session
         session.update(
             status="complete",
             payment_status="no_payment_required" if session["mode"] == "setup" else "paid",

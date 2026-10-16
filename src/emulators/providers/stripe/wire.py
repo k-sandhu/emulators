@@ -103,6 +103,18 @@ def decode(data: str | bytes | Iterable[tuple[str, str]]) -> Record:
                     node = node[part]
             else:
                 fail(f"Conflicting parameters for {key}.", key)
+
+    def validate(value: Any) -> None:
+        if isinstance(value, list):
+            if any(v is None for v in value):
+                fail("Invalid array: array indices must be contiguous.")
+            for v in value:
+                validate(v)
+        elif isinstance(value, dict):
+            for v in value.values():
+                validate(v)
+
+    validate(root)
     return root
 
 
@@ -121,10 +133,21 @@ def metadata(record: Record, params: Record) -> None:
         elif isinstance(params["metadata"], dict):
             target = record.setdefault("metadata", {})
             for key, value in params["metadata"].items():
+                if isinstance(value, (dict, list)):
+                    fail("Metadata values must be strings.", "metadata")
+                if len(key) > 40 or "[" in key or "]" in key:
+                    fail(
+                        "Metadata keys must be at most 40 characters and cannot contain square brackets.",
+                        "metadata",
+                    )
+                if len(str(value)) > 500:
+                    fail("Metadata values must be at most 500 characters.", "metadata")
                 if value == "":
                     target.pop(key, None)
                 else:
                     target[key] = str(value)
+            if len(target) > 50:
+                fail("You can set at most 50 metadata keys.", "metadata")
         else:
             fail("Invalid hash", "metadata")
 

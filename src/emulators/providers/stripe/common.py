@@ -244,6 +244,13 @@ class BaseAPI:
         return record
 
     def update(self, record: Record, params: Record, fields: set[str]) -> Record:
+        def merge(target: Record, incoming: Record) -> None:
+            for key, value in incoming.items():
+                if isinstance(value, dict) and isinstance(target.get(key), dict):
+                    merge(target[key], value)
+                else:
+                    target[key] = copy.deepcopy(value) if value != "" else None
+
         for key in fields & params.keys():
             value = params[key]
             if key in {"active", "cancel_at_period_end", "auto_advance"}:
@@ -251,7 +258,7 @@ class BaseAPI:
 
                 value = boolean(value)
             if isinstance(value, dict) and isinstance(record.get(key), dict):
-                record[key].update(copy.deepcopy(value))
+                merge(record[key], value)
             else:
                 record[key] = copy.deepcopy(value) if value != "" else None
         metadata(record, params)

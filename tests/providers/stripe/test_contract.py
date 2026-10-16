@@ -169,6 +169,9 @@ async def test_checkout_setup_subscription_and_prefix_links(stripe_hub: Emulator
         base_url="http://localhost:44080/stripe",
         headers={"Authorization": "Bearer " + SECRET_KEY},
     ) as client:
+        seeded_invoice = (await get(client, "invoices", params={"limit": 1}))["data"][0]
+        assert seeded_invoice["invoice_pdf"].startswith("http://localhost:44080/stripe/")
+        assert (await client.get(seeded_invoice["invoice_pdf"])).content.startswith(b"%PDF")
         price = (await get(client, "prices", params={"lookup_keys[]": "bookkeeping_monthly"}))["data"][0]
         for mode in ("setup", "subscription"):
             session = await post(
@@ -199,3 +202,70 @@ def test_form_metadata_numeric_keys_and_unindexed_objects() -> None:
     assert decode("items[][price]=one&items[][quantity]=2&items[][price]=two") == {
         "items": [{"price": "one", "quantity": "2"}, {"price": "two"}]
     }
+
+
+async def test_advance_time_settles_balance_payout_and_checkout_expiry(client: httpx.AsyncClient) -> None:
+    pi = await post(
+        client,
+        "payment_intents",
+        {
+            "amount": 1000,
+            "currency": "usd",
+            "payment_method": "pm_card_visa",
+            "confirm": "true",
+            "expand[]": "latest_charge.balance_transaction",
+        },
+    )
+    txn = pi["latest_charge"]["balance_transaction"]
+    assert txn["status"] == "pending"
+    payout = await post(client, "payouts", {"amount": 100, "currency": "usd"})
+    await post(client, "payouts/" + payout["id"], {"metadata[batch]": "test"})
+    session = await post(client, "checkout/sessions", {"mode": "setup"})
+    response = await client.post("/_emulator/actions/advance_time", json={"seconds": 3 * 86400})
+    assert response.status_code == 200
+    assert (await get(client, "balance_transactions/" + txn["id"]))["status"] == "available"
+    assert (await get(client, "payouts/" + payout["id"]))["status"] == "paid"
+    assert (await get(client, "checkout/sessions/" + session["id"]))["status"] == "expired"
+
+
+async def test_preview_does_not_change_store_or_consume_pending_items(
+    client: httpx.AsyncClient, stripe_hub: EmulatorHub
+) -> None:
+    customer, price = await customer_and_price(client)
+    item = await post(client, "invoiceitems", {"customer": customer["id"], "amount": 1000, "currency": "usd"})
+    ctx = stripe_hub.context("stripe")
+    before = ctx.store.snapshot()
+    preview = await post(
+        client,
+        "invoices/create_preview",
+        {
+            "customer": customer["id"],
+            "subscription_details[items][0][price]": price["id"],
+            "pending_invoice_items_behavior": "include",
+        },
+    )
+    assert preview["total"] == price["unit_amount"] + 1000
+    assert ctx.store.snapshot() == before
+    assert (await get(client, "invoiceitems/" + item["id"]))["invoice"] is None
+
+
+@pytest.mark.parametrize(
+    ("resource", "data"),
+    [
+        ("customers", {"metadata[x][y]": "invalid"}),
+        ("customers", {"invoice_settings": "invalid"}),
+        ("subscriptions", {"customer": "cus_missing", "items": "invalid"}),
+        (
+            "payment_methods",
+            {"card[number]": "4242424242424241", "card[exp_month]": "12", "card[exp_year]": "2030"},
+        ),
+        ("customers", {"metadata[x]": "x" * 501}),
+    ],
+)
+async def test_malformed_parameters_return_stripe_errors(
+    client: httpx.AsyncClient, resource: str, data: dict[str, str]
+) -> None:
+    response = await client.post("/v1/" + resource, data=data)
+    assert response.status_code == 400
+    assert response.json()["error"]["type"] == "invalid_request_error"
+    assert response.headers["request-id"]

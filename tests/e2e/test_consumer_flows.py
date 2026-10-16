@@ -16,6 +16,7 @@ from urllib.parse import parse_qs, quote, urlparse
 
 import httpx
 import pytest
+from fastapi import FastAPI, Request
 
 from emulators.testing.helpers import bearer, mint
 
@@ -528,7 +529,6 @@ async def test_backbone_twilio_sms(make_client) -> None:
 async def test_backbone_stripe_webhook_signature(make_client) -> None:
     requires("emulators.providers.stripe")
     import stripe as stripe_sdk
-    from fastapi import FastAPI, Request
 
     received: list[tuple[bytes, str]] = []
     receiver = FastAPI()

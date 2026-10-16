@@ -94,7 +94,9 @@ async def test_subscription_incomplete_and_trial(client: httpx.AsyncClient) -> N
     assert subscription["status"] == "incomplete"
     invoice = subscription["latest_invoice"]
     assert invoice["status"] == "open" and invoice["confirmation_secret"]["client_secret"].startswith("pi_")
-    await post(client, "invoices/" + invoice["id"] + "/pay", {"payment_method": "pm_card_visa"})
+    pi_id = invoice["payments"]["data"][0]["payment"]["payment_intent"]
+    await post(client, f"payment_intents/{pi_id}/confirm", {"payment_method": "pm_card_visa"})
+    assert (await get(client, "invoices/" + invoice["id"]))["status"] == "paid"
     assert (await get(client, "subscriptions/" + subscription["id"]))["status"] == "active"
     trial = await post(
         client,

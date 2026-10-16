@@ -213,3 +213,6 @@ def test_connect_oauth_read_only_and_refresh(emulators: EmulatorHub) -> None:
     )
     with pytest.raises(stripe.PermissionError):
         stripe.Customer.create(api_key=refreshed.access_token, name="Denied")
+    stripe.OAuth.deauthorize(client_id="ca_sdk", stripe_user_id=ctx.world.org.stripe_account_id)
+    with pytest.raises(stripe.AuthenticationError):
+        stripe.Customer.list(api_key=refreshed.access_token)
