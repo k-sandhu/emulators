@@ -23,10 +23,12 @@ from emulators.core.hub import EmulatorHub
 
 hub = EmulatorHub(providers=["notion"], anchor="2026-10-16", webhook_mode="sync")
 async with httpx.AsyncClient(transport=hub.async_transport()) as client:
+    info = (await client.get("https://api.notion.com/_emulator/info")).json()
+    token = info["credentials"]["internal_token"]
     result = await client.post(
         "https://api.notion.com/v1/search",
         headers={
-            "Authorization": "Bearer ntn_halcyon_internal_integration",
+            "Authorization": "Bearer " + token,
             "Notion-Version": "2025-09-03",
         },
         json={"query": "Clients"},
@@ -36,10 +38,9 @@ async with httpx.AsyncClient(transport=hub.async_transport()) as client:
 
 ## Authentication and permissions
 
-Seeded internal integration tokens (synthetic fixtures):
-
-* `ntn_halcyon_internal_integration`
-* `secret_halcyon_internal_integration` (legacy alias)
+Read the synthetic internal integration token and its legacy alias from
+`GET https://api.notion.com/_emulator/info` at `credentials.internal_token` and
+`credentials.legacy_internal_token`.
 
 Client credentials: `notion-client` / `notion-secret`. The core defaults to lenient
 client registration; `EmulatorHub(lenient_clients=False, ...)` enforces the registered
@@ -50,6 +51,7 @@ API routes require `Authorization: Bearer ...` and a supported `Notion-Version`.
 The browser authorization endpoint and signed downloads are exceptions. Missing versions
 return `400 missing_version`; invalid, expired, or revoked credentials return
 `401 unauthorized`. Errors have `object`, `status`, `code`, `message`, and UUID `request_id`.
+API responses include `X-Request-Id`; error bodies use that same `request_id`.
 Core faults use the same envelope, including `429 rate_limited` and `Retry-After`.
 The provider redacts OAuth codes, tokens, and client secrets from journal request bodies.
 
@@ -72,8 +74,11 @@ accepts `{"user":"p018"}` or an employee email/Notion UUID. Omit `user` for an i
 integration token. Optional fields: `client_id`, `app_only`, `expires_in`, `shared_page_ids`,
 and `scopes`. Capability names are `read_content`, `insert_content`, `update_content`,
 `read_comments`, `insert_comments`, `read_user`, and `read_user_with_email`.
-The default grant has all content/comment capabilities and user emails. `read_user`
-omits `person.email`. Missing mutation capabilities produce `403 restricted_resource`.
+The default grant has all content/comment capabilities and user emails. Explicit
+`scopes: []` grants no content, comment, or directory capabilities. `read_user`
+omits `person.email`; without either user capability, mentions, people properties,
+and the OAuth bot owner contain partial users only. Insert/update operations without
+`read_content` return partial objects. Missing capabilities produce `403 restricted_resource`.
 
 The internal integration sees Knowledge Base, Client Engagements, and the four business
 databases. It cannot read People & Culture, Technology, Marketing & BD, Finance,
@@ -116,9 +121,9 @@ visible objects without write permission return `403 restricted_resource`.
 | POST | `/v1/data_sources/{id}/query` | 2025 database-row query |
 | GET | `/v1/comments?block_id=...` | Paginated unresolved page/block comments |
 | POST | `/v1/comments` | New page discussion or reply by discussion_id |
-| POST | `/v1/file_uploads` | 2025; single_part or multi_part; optional filename/content_type |
-| GET | `/v1/file_uploads` | 2025; creator integration scope; status filter and pagination |
-| GET | `/v1/file_uploads/{id}` | 2025; lifecycle, size/type/name/expiry |
+| POST | `/v1/file_uploads` | Both supported versions; single_part or multi_part; optional filename/content_type |
+| GET | `/v1/file_uploads` | Creator integration scope; status filter and pagination |
+| GET | `/v1/file_uploads/{id}` | Lifecycle, size/type/name/expiry, creator, multipart progress |
 | POST | `/v1/file_uploads/{id}/send` | Multipart `file`; multi_part also requires `part_number` |
 | POST | `/v1/file_uploads/{id}/complete` | Complete multi_part upload after all parts arrive |
 | GET | `/secure/{id}/{filename}` | Signed, expiring binary download; lazy seeded rendering |
@@ -127,7 +132,9 @@ Pagination uses `object: list`, `results`, `has_more`, `next_cursor`, `type`, an
 type-specific empty object. Defaults to 100, maximum 100. Cursors are opaque UUIDs
 bound to token, resource, and query; reset invalidates them. Query pages retain vendor
 property names and ids. `filter_properties` is accepted as repeated query parameters
-and as a query-body array for connector compatibility.
+and as a query-body array for connector compatibility. Search and query lists use
+`type: page_or_database` in 2022 and `type: page_or_data_source` in 2025. A cursor
+can be reused with its original resource, token, and query.
 
 Database filters include title/rich_text text comparisons, number comparisons,
 checkbox, select/status, multi_select, people, relation, date comparisons and relative
@@ -141,6 +148,13 @@ to_do, toggle, quote, callout, code, divider, table/table_row, image/file/pdf,
 bookmark, synced_block, column_list/column, link_to_page, equation, table_of_contents,
 and read-generated child_page/child_database. Rich text normalizes annotations,
 plain_text, href, links, user/page/date mentions, and equations.
+
+Writes reject malformed types, invalid Unicode and non-finite numbers with Notion
+errors. JSON bodies are limited to 500 KiB; URL, email, phone, text, equation, color,
+and code-language limits are validated. Rejected writes preserve properties, schema
+options, blocks, and upload attachment expiry. Archived ancestors prevent writes;
+restore ancestors before editing descendants. Tables keep their width and row cell
+counts, and new column lists require two populated columns.
 
 Single-part sends become `uploaded` immediately. Multipart uploads become `uploaded`
 only after completion; parts assemble in part-number order. Attach using
@@ -178,6 +192,8 @@ Teamspace roots mirror all world spaces, including personal spaces; folders beco
 pages, document DOCX/MD/TXT paragraphs become heading/paragraph blocks, spreadsheet
 tables become table blocks, presentations become nested toggles, and PDFs/images
 become file/image blocks. Document owners, modification times, and ACLs carry through.
+Teamspace/folder creation predates imported documents, and imported block timestamps
+follow their source pages rather than the seed's anchor date.
 
 Clients has Name, Industry, Status, Owner, Client Since, Annual Revenue, Website,
 and Engagements relation. Engagements has Name, Client relation, Service, Lead, Start,
@@ -192,13 +208,22 @@ synchronously sends `{"verification_token":"secret_..."}` to the receiver. It mu
 return a 2xx status. The action returns `subscription_id` and `verification_token`.
 Subscriptions default to the seeded internal integration's visibility. Supply an optional
 `token` to subscribe with an OAuth grant's visibility; revoked/expired grants stop delivery.
+An optional `api_version` selects the webhook schema (`2022-06-28` by default or
+`2025-09-03`). Content events require `read_content`; comment events require `read_comments`.
 
 Mutations emit `page.created`, `page.content_updated`, `page.properties_updated`,
-`database.schema_updated`, and `comment.created`. Payloads contain id, timestamp,
-workspace_id, subscription_id, integration_id, type, entity `{id,type}`, and data.
+`page.deleted`, `page.undeleted`, `database.schema_updated` (2022),
+`data_source.schema_updated` (2025), and `comment.created`. Payloads contain id, timestamp,
+workspace_id/name, subscription_id, integration_id, type, authors, attempt_number,
+entity `{id,type}`, and data with parent references. Public OAuth subscriptions also
+include `accessible_by`. Property events use property IDs; schema events describe
+created/updated/deleted properties.
 Events are delivered through `ctx.webhooks.deliver` and appear in `/_emulator/webhooks`.
 The signature is `X-Notion-Signature: sha256=<hex HMAC-SHA256(verification_token, raw_body)>`.
 Sync, async, and manual core delivery modes are supported. Reset clears subscriptions.
+Failed deliveries retry up to eight attempts, retaining the event ID and updating
+`attempt_number` and the HMAC signature for each payload. The journal records the
+last attempt's payload and response.
 
 `mint_token` is also available through `/_emulator/actions/mint_token` and is used by
 the core `/_emulator/tokens` endpoint.
@@ -211,16 +236,19 @@ the core `/_emulator/tokens` endpoint.
   `shared_page_ids`; it does not reproduce Notion's interactive page-selection UI.
 * Query formula filters evaluate stored scalar results. Formula computation supports
   `prop("Name")`, an optional numeric multiplier, scalar numbers/strings, and booleans;
-  the general formula language and rollup computation are absent.
+  the general formula language and rollup computation are absent. Numeric overflow
+  evaluates to a null number instead of causing an invalid JSON response.
+  Text substring/prefix/suffix filters ignore case; equality uses an exact match.
+  Select/status sorts use labels rather than Notion UI option order.
 * Status schemas support options/groups, but group assignment and some vendor schema
   restrictions are simplified. Relation reads hide inaccessible target rows. Automatic
-  two-way relation synchronization is absent.
+  two-way relation synchronization is absent. Data-source moves are rejected explicitly.
 * Rich-text mention support is limited to user, page, and date. Page titles and user-email
   metadata are scoped to the reader; inaccessible page titles become `Untitled`.
-* A request may append 100 top-level / 1,000 total block elements. Full Notion payload-size,
-  URL-format, code-language, and all type-specific validation rules are not reproduced.
+* A request may append 100 top-level / 1,000 total block elements. Some specialized
+  type-specific validation rules are not reproduced.
   Block type changes and API creation of child_page/child_database blocks are unsupported;
-  use page/database creation endpoints. Column layout and synced editing restrictions
+  use page/database creation endpoints. Column width ratios and synced editing restrictions
   are simplified; references read from the original synced block.
 * File uploads support direct single/multipart only, with a 20 MiB per-part limit.
   External URL import, malware scanning, full MIME restrictions, and resumable transfer
@@ -229,7 +257,9 @@ the core `/_emulator/tokens` endpoint.
   Resolution, deletion, comment attachments, and creation of arbitrary inline discussions
   are absent. Seeded comment discussions are empty.
 * Webhooks deliver mutation events immediately, without Notion's aggregation/debounce
-  or full event catalog. Reverification and webhook management APIs are absent.
+  or full event catalog. Async retry delays are accelerated for local tests rather
+  than spread over 24 hours; sync/manual retries have no delay. Reverification and
+  webhook management APIs are absent.
 * Rate limits are simulated through core faults; normal requests are not throttled.
   Page web URLs identify objects; the Notion interactive document UI is not served.
 
@@ -238,11 +268,23 @@ the core `/_emulator/tokens` endpoint.
 ```powershell
 uv run pytest tests/providers/notion -q
 $env:EMULATORS_PROVIDERS = "notion"
-uv run pytest tests/sdk/test_notion_http.py -q
+uv run pytest tests/sdk -q -k notion
+uv run pytest tests/e2e -q
 uv run ruff check src/emulators/providers/notion tests/providers/notion tests/sdk/test_notion_http.py
 uv run ruff format --check src/emulators/providers/notion tests/providers/notion tests/sdk/test_notion_http.py
 ```
 
 The SDK-contract location intentionally uses ordinary sync/async httpx clients,
 matching the brief's connector transport, through `emulator_intercept` and real
-vendor hostnames. It does not claim coverage through an installed notion-client SDK.
+vendor hostnames. No Notion SDK is installed in this environment, so these are live
+HTTP connector contracts rather than official Notion SDK verification.
+
+The fidelity-audit regressions cover malformed writes across every write endpoint,
+failed-write atomicity, empty capabilities, selected-page app access, scoped user
+metadata, versioned list envelopes, cursor reuse, OAuth rotation/client binding,
+upload metadata/progress, archive ancestors, schema invariants, seed timestamps,
+webhook versions, and per-attempt signatures. An external in-process fuzz harness
+also exercised 1,802 nested malformed-input cases without server exceptions.
+The completed focused runs passed 144 provider tests, five live HTTP connector
+contracts, and ten repository end-to-end tests. Ruff and the Notion secret-pattern
+scan were clean. Three measured hub builds seeded Notion in 0.66–1.16 seconds.

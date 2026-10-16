@@ -16,7 +16,6 @@ from emulators.providers.notion.common import (
     authenticate,
     body,
     envelope,
-    fail,
     invalid,
     paginate,
     policy,
@@ -29,7 +28,8 @@ from emulators.providers.notion.common import (
     uid,
 )
 from emulators.providers.notion.events import emit
-from emulators.providers.notion.properties import attachment, check_upload_access
+from emulators.providers.notion.properties import attach_uploads, attachment, check_upload_access
+from emulators.providers.notion.validation import archive_value, color, editable, string, url
 
 TEXT_BLOCKS = {
     "paragraph",
@@ -79,12 +79,86 @@ TYPES = TEXT_BLOCKS | {
     "audio",
     "breadcrumb",
 }
+LANGUAGES = {
+    "abap",
+    "arduino",
+    "bash",
+    "basic",
+    "c",
+    "clojure",
+    "coffeescript",
+    "c++",
+    "c#",
+    "css",
+    "dart",
+    "diff",
+    "docker",
+    "elixir",
+    "elm",
+    "erlang",
+    "flow",
+    "fortran",
+    "f#",
+    "gherkin",
+    "glsl",
+    "go",
+    "graphql",
+    "groovy",
+    "haskell",
+    "html",
+    "java",
+    "javascript",
+    "json",
+    "julia",
+    "kotlin",
+    "latex",
+    "less",
+    "lisp",
+    "livescript",
+    "lua",
+    "makefile",
+    "markdown",
+    "markup",
+    "matlab",
+    "mermaid",
+    "nix",
+    "objective-c",
+    "ocaml",
+    "pascal",
+    "perl",
+    "php",
+    "plain text",
+    "powershell",
+    "prolog",
+    "protobuf",
+    "python",
+    "r",
+    "reason",
+    "ruby",
+    "rust",
+    "sass",
+    "scala",
+    "scheme",
+    "scss",
+    "shell",
+    "sql",
+    "swift",
+    "typescript",
+    "vb.net",
+    "verilog",
+    "vhdl",
+    "visual basic",
+    "webassembly",
+    "xml",
+    "yaml",
+    "java/c/c++/c#",
+}
 
 
 def normalize(
     ctx: ProviderContext, kind: str, raw: Any, grant: Grant, *, old: dict[str, Any] | None = None
 ) -> dict[str, Any]:
-    if kind not in TYPES or not isinstance(raw, dict):
+    if not isinstance(kind, str) or kind not in TYPES or not isinstance(raw, dict):
         invalid(f"Unsupported or invalid block type: {kind}.")
     if any(key.startswith("_") for key in raw):
         invalid("Block content contains an unsupported field.")
@@ -94,6 +168,7 @@ def normalize(
         data["rich_text"] = rich_text(data.get("rich_text", []), ctx)
         if kind != "code":
             data.setdefault("color", "default")
+            color(data["color"])
         if kind.startswith("heading_"):
             data.setdefault("is_toggleable", False)
             if not isinstance(data["is_toggleable"], bool):
@@ -103,9 +178,12 @@ def normalize(
             if not isinstance(data["checked"], bool):
                 invalid("to_do.checked must be boolean.")
         if kind == "callout" and ("icon" in raw or "icon" not in data):
-            data["icon"] = attachment(ctx, data.get("icon", {"type": "emoji", "emoji": "💡"}))
+            data["icon"] = attachment(ctx, data.get("icon", {"type": "emoji", "emoji": "💡"}), icon=True)
         if kind == "code":
             data.setdefault("language", "plain text")
+            string(data["language"], "code.language", empty=False)
+            if data["language"] not in LANGUAGES:
+                invalid("code.language must be a supported Notion code language.")
             data["caption"] = rich_text(data.get("caption", []), ctx)
     elif kind in ("image", "file", "pdf", "video", "audio"):
         if any(key in raw for key in ("external", "file_upload")):
@@ -118,8 +196,7 @@ def normalize(
         if kind == "file":
             data.setdefault("name", "")
     elif kind in ("bookmark", "embed"):
-        if not isinstance(data.get("url"), str):
-            invalid("url must be a string.")
+        url(data.get("url"))
         data["caption"] = rich_text(data.get("caption", []), ctx)
     elif kind == "table":
         width = data.get("table_width")
@@ -135,24 +212,26 @@ def normalize(
         data["cells"] = [rich_text(cell, ctx) for cell in data["cells"]]
     elif kind == "synced_block":
         data.setdefault("synced_from", None)
-        if data["synced_from"]:
+        if data["synced_from"] is not None:
+            if not isinstance(data["synced_from"], dict):
+                invalid("synced_from must be null or an object containing block_id.")
             source_id = uid(data["synced_from"].get("block_id"))
             source = require(ctx, grant, "blocks", source_id)
             if source["type"] != "synced_block" or source["synced_block"].get("synced_from"):
                 invalid("synced_from must refer to an original synced block.")
             data["synced_from"] = {"type": "block_id", "block_id": source_id}
     elif kind == "link_to_page":
-        target_type = data.get("type") or next((k for k in ("page_id", "database_id") if k in data), "")
+        target_type = data.get("type", next((k for k in ("page_id", "database_id") if k in data), ""))
         if target_type not in ("page_id", "database_id"):
             invalid("link_to_page requires page_id or database_id.")
-        target = uid(data[target_type])
+        target = uid(data.get(target_type))
         require(ctx, grant, "pages" if target_type == "page_id" else "databases", target)
         data = {"type": target_type, target_type: target}
     elif kind == "equation":
-        if not isinstance(data.get("expression"), str):
-            invalid("equation.expression must be a string.")
+        string(data.get("expression"), "equation.expression", maximum=1000)
     elif kind == "table_of_contents":
         data.setdefault("color", "default")
+        color(data["color"])
     return data
 
 
@@ -171,7 +250,11 @@ def append(
     def build(item: Any, owner: dict[str, Any], depth: int) -> dict[str, Any]:
         if not isinstance(item, dict) or depth > 2:
             invalid("Blocks may be nested at most two levels in one request.")
-        kind = item.get("type") or next((k for k in item if k in TYPES), "")
+        kind = item.get("type", next((k for k in item if k in TYPES), ""))
+        if not isinstance(kind, str) or kind not in TYPES:
+            invalid("Each block requires a supported block type.")
+        if item.get("object", "block") != "block":
+            invalid("object must be block.")
         data = item.get(kind)
         if not isinstance(data, dict):
             invalid("Each block requires a type and its content object.")
@@ -216,6 +299,12 @@ def append(
             record["_children"].append(entry["id"])
         if kind == "table" and not children:
             invalid("A new table must contain at least one table_row.")
+        if kind == "column_list" and len(children) < 2:
+            invalid("A new column_list must contain at least two columns.")
+        if kind == "column" and (owner.get("type") != "column_list" or not children):
+            invalid("Columns must belong to a column_list and contain at least one child.")
+        if kind == "table_row" and owner.get("type") != "table":
+            invalid("Table rows must belong to a table.")
         if owner.get("type") == "table" and (
             kind != "table_row" or len(normalized["cells"]) != owner["table"]["table_width"]
         ):
@@ -226,6 +315,7 @@ def append(
     records = [build(item, parent, 0) for item in raw]
     for record in staged:
         ctx.store["blocks"].put(record)
+        attach_uploads(ctx, record)
     position = order.index(after) + 1 if after else len(order)
     order[position:position] = [record["id"] for record in records]
     parent["_children"] = order
@@ -244,8 +334,8 @@ def container(ctx: ProviderContext, grant: Grant, block_id: str, *, write: bool 
         else "blocks"
     )
     record = require(ctx, grant, kind, record_id, write=write)
-    if write and any(r.get("archived") for r in ancestors(ctx, record)):
-        fail(409, "conflict_error", "Cannot edit a block that is archived. Restore it first.")
+    if write:
+        editable(ctx, record)
     return record
 
 
@@ -267,11 +357,18 @@ def as_block(record: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-async def content_event(ctx: ProviderContext, record: dict[str, Any]) -> None:
+async def content_event(
+    ctx: ProviderContext, record: dict[str, Any], changed: list[dict[str, Any]] | None = None
+) -> None:
     page = next((r for r in ancestors(ctx, record) if r["object"] == "page"), None)
     if page:
         touch(ctx, page)
-        await emit(ctx, "page.content_updated", page["id"])
+        await emit(
+            ctx,
+            "page.content_updated",
+            page["id"],
+            data={"updated_blocks": [{"id": item["id"], "type": "block"} for item in (changed or [record])]},
+        )
 
 
 def build(app: FastAPI, ctx: ProviderContext) -> None:
@@ -302,9 +399,11 @@ def build(app: FastAPI, ctx: ProviderContext) -> None:
             invalid("This block does not support children.")
         if record.get("type") == "synced_block" and record["synced_block"].get("synced_from"):
             invalid("Append children to the original synced block.")
+        if record.get("type", "").startswith("heading_") and not record[record["type"]]["is_toggleable"]:
+            invalid("A heading must be toggleable to contain children.")
         payload = await body(request)
         records = append(ctx, record, payload.get("children"), grant, payload.get("after"))
-        await content_event(ctx, record)
+        await content_event(ctx, record, records)
         return {
             "object": "list",
             "results": [serialize(request, ctx, r, grant) for r in records],
@@ -324,20 +423,32 @@ def build(app: FastAPI, ctx: ProviderContext) -> None:
     async def update(block_id: str, request: Request) -> dict[str, Any]:
         grant = authenticate(request, ctx)
         capability(grant, "update_content")
-        record = require(ctx, grant, "blocks", block_id, write=True)
+        current = require(ctx, grant, "blocks", block_id, write=True)
+        record = copy.deepcopy(current)
         payload = await body(request)
+        archived = archive_value(payload)
+        editable(ctx, current, payload)
         kind = record["type"]
         if any(k in TYPES and k != kind for k in payload) or ("type" in payload and payload["type"] != kind):
             invalid("A block's type cannot be changed.")
         if kind in payload:
+            if isinstance(payload[kind], dict) and "children" in payload[kind]:
+                invalid("Append children through the block children endpoint.")
             check_upload_access(ctx, payload[kind], grant.client_id)
             record[kind] = normalize(ctx, kind, payload[kind], grant, old=record[kind])
-        if "archived" in payload or "in_trash" in payload:
-            archived = payload.get("in_trash", payload.get("archived"))
-            if not isinstance(archived, bool):
-                invalid("archived/in_trash must be a boolean.")
+        if kind == "table_row":
+            parent = ctx.store["blocks"].get(record["parent"].get("block_id"))
+            if parent and len(record[kind]["cells"]) != parent["table"]["table_width"]:
+                invalid("Table row cell count must match table_width.")
+        if kind == "table" and record[kind]["table_width"] != current[kind]["table_width"]:
+            invalid("table_width cannot be changed.")
+        if kind.startswith("heading_") and record.get("_children") and not record[kind]["is_toggleable"]:
+            invalid("A heading containing children must remain toggleable.")
+        if archived is not None:
             record.update(archived=archived, in_trash=archived)
         touch(ctx, record, grant)
+        ctx.store["blocks"].put(record)
+        attach_uploads(ctx, record)
         await content_event(ctx, record)
         return serialize(request, ctx, record, grant)
 
@@ -348,5 +459,8 @@ def build(app: FastAPI, ctx: ProviderContext) -> None:
         record = container(ctx, grant, block_id, write=True)
         record.update(archived=True, in_trash=True)
         touch(ctx, record, grant)
-        await content_event(ctx, record)
+        if record["object"] == "page":
+            await emit(ctx, "page.deleted", record["id"])
+        else:
+            await content_event(ctx, record)
         return serialize(request, ctx, as_block(record), grant)

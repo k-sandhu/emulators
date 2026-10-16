@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from fastapi import FastAPI
 
+from emulators.core.middleware import FaultRule
 from emulators.core.provider import Provider, ProviderContext
 from emulators.providers.notion import auth, blocks, databases, directory, extras, pages
 from emulators.providers.notion.common import INTERNAL_TOKEN, LEGACY_TOKEN, error_body
-from emulators.providers.notion.events import configure_webhook
+from emulators.providers.notion.events import NotionWebhooks, configure_webhook
 from emulators.providers.notion.journal import NotionJournal
+from emulators.providers.notion.middleware import NotionHeaders
 from emulators.providers.notion.seed import seed
 
 
@@ -51,7 +54,31 @@ class NotionProvider(Provider):
     def seed(self, ctx: ProviderContext) -> None:
         seed(ctx)
 
+    def fault_response(
+        self, rule: FaultRule, scope: dict[str, Any] | None = None
+    ) -> tuple[int, dict[str, str], bytes]:
+        status, headers, content = super().fault_response(rule, scope)
+        try:
+            request_id = json.loads(content).get("request_id")
+        except (ValueError, AttributeError):
+            request_id = None
+        if request_id:
+            headers["x-request-id"] = request_id
+        return status, headers, content
+
     def build(self, app: FastAPI, ctx: ProviderContext) -> None:
+        app.add_middleware(NotionHeaders)
+        current = ctx.webhooks
+        ctx.webhooks = NotionWebhooks(
+            ctx.name,
+            ctx.store,
+            ctx.clock,
+            current.ids,
+            mode=current.mode,
+            transport_factory=current.transport_factory,
+            max_attempts=8,
+            timeout_s=current.timeout_s,
+        )
         ctx.journal = NotionJournal()
         auth.build(app, ctx)
         directory.build(app, ctx)

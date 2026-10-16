@@ -31,6 +31,7 @@ from emulators.providers.notion.common import (
 )
 from emulators.providers.notion.events import emit
 from emulators.providers.notion.properties import (
+    attach_uploads,
     attachment,
     check_upload_access,
     computed,
@@ -38,6 +39,7 @@ from emulators.providers.notion.properties import (
     schema,
 )
 from emulators.providers.notion.query import compile_filter, evaluate, sorted_rows
+from emulators.providers.notion.validation import archive_value, editable
 
 
 def normalize_relations(ctx: ProviderContext, grant: Grant, specs: dict[str, Any]) -> None:
@@ -75,6 +77,25 @@ def update_schema(ctx: ProviderContext, source: dict[str, Any], raw: Any, grant:
     touch(ctx, source, grant)
 
 
+def schema_changes(before: dict[str, Any], after: dict[str, Any]) -> list[dict[str, str]]:
+    previous = {p["id"]: p for p in before.values()}
+    current = {p["id"]: p for p in after.values()}
+    changes = []
+    for property_id in previous.keys() | current.keys():
+        if previous.get(property_id) == current.get(property_id):
+            continue
+        prop = current.get(property_id) or previous[property_id]
+        action = (
+            "deleted"
+            if property_id not in current
+            else "created"
+            if property_id not in previous
+            else "updated"
+        )
+        changes.append({"id": property_id, "name": prop["name"], "action": action})
+    return sorted(changes, key=lambda p: p["id"])
+
+
 def build(app: FastAPI, ctx: ProviderContext) -> None:
     @app.post("/v1/databases")
     async def create(request: Request) -> dict[str, Any]:
@@ -85,8 +106,7 @@ def build(app: FastAPI, ctx: ProviderContext) -> None:
         if not isinstance(raw_parent, dict):
             invalid("parent must be an object containing page_id.")
         parent = require(ctx, grant, "pages", raw_parent.get("page_id"), write=True)
-        if any(r.get("archived") for r in ancestors(ctx, parent)):
-            fail(409, "conflict_error", "Cannot create a database under an archived page.")
+        editable(ctx, parent)
         check_upload_access(ctx, payload, grant.client_id)
         db_id, source_id = ctx.ids.guid(), ctx.ids.guid()
         initial = payload.get("initial_data_source", {}) if version(request) == NEW else payload
@@ -102,7 +122,7 @@ def build(app: FastAPI, ctx: ProviderContext) -> None:
             **envelope(db_id, "database", {"type": "page_id", "page_id": parent["id"]}, ctx.clock.now()),
             "title": rich_text(payload.get("title", []), ctx),
             "description": rich_text(payload.get("description", []), ctx),
-            "icon": attachment(ctx, payload.get("icon")),
+            "icon": attachment(ctx, payload.get("icon"), icon=True),
             "cover": attachment(ctx, payload.get("cover")),
             "is_inline": payload.get("is_inline", False),
             "url": "",
@@ -123,6 +143,7 @@ def build(app: FastAPI, ctx: ProviderContext) -> None:
         }
         ctx.store["databases"].put(db)
         ctx.store["data_sources"].put(source)
+        attach_uploads(ctx, db)
         parent["_children"].append(db_id)
         touch(ctx, parent, grant)
         return serialize(request, ctx, db, grant)
@@ -138,39 +159,44 @@ def build(app: FastAPI, ctx: ProviderContext) -> None:
         grant = authenticate(request, ctx)
         capability(grant, "update_content")
         current = require(ctx, grant, "databases", database_id, write=True)
+        if version(request) == OLD and len(current["_sources"]) != 1:
+            invalid("Use the 2025-09-03 API for a database with multiple data sources.")
         record = copy.deepcopy(current)
         payload = await body(request)
+        archived = archive_value(payload)
+        editable(ctx, current, payload)
         check_upload_access(ctx, payload, grant.client_id)
         for field in ("title", "description"):
             if field in payload:
                 record[field] = rich_text(payload[field], ctx)
         for field in ("icon", "cover"):
             if field in payload:
-                record[field] = attachment(ctx, payload[field])
+                record[field] = attachment(ctx, payload[field], icon=field == "icon")
         if "is_inline" in payload:
             if not isinstance(payload["is_inline"], bool):
                 invalid("is_inline must be boolean.")
             record["is_inline"] = payload["is_inline"]
-        if "archived" in payload or "in_trash" in payload:
-            archived = payload.get("in_trash", payload.get("archived"))
-            if not isinstance(archived, bool):
-                invalid("archived/in_trash must be boolean.")
+        if archived is not None:
             record.update(archived=archived, in_trash=archived)
+        changes = []
         if "properties" in payload:
             if version(request) == NEW:
                 invalid("Update data source properties through /v1/data_sources/{id}.")
             if len(record["_sources"]) != 1:
                 invalid("Use the 2025-09-03 API for a database with multiple data sources.")
             source = ctx.store["data_sources"].get(record["_sources"][0])
+            before = copy.deepcopy(source["properties"])
             update_schema(ctx, source, payload["properties"], grant)
+            changes = schema_changes(before, source["properties"])
         touch(ctx, record, grant)
         ctx.store["databases"].put(record)
+        attach_uploads(ctx, record)
         await emit(
             ctx,
             "database.schema_updated",
             record["id"],
             "database",
-            {"updated_properties": list(payload.get("properties", {}))},
+            {"updated_properties": changes},
         )
         return serialize(request, ctx, record, grant)
 
@@ -204,10 +230,11 @@ def build(app: FastAPI, ctx: ProviderContext) -> None:
             {"source": source["id"], "filter": payload.get("filter"), "sorts": payload.get("sorts", [])},
             sort_keys=True,
         )
-        result = paginate(ctx, rows, payload, kind="page_or_database", key=binding, grant=grant)
+        list_kind = "page_or_data_source" if version(request) == NEW else "page_or_database"
+        result = paginate(ctx, rows, payload, kind=list_kind, key=binding, grant=grant)
         result["results"] = [serialize(request, ctx, r, grant) for r in result["results"]]
         selected = request.query_params.getlist("filter_properties") or payload.get("filter_properties", [])
-        if selected and not isinstance(selected, list):
+        if not isinstance(selected, list) or any(not isinstance(v, str) for v in selected):
             invalid("filter_properties must be an array.")
         if selected:
             for record in result["results"]:
@@ -259,6 +286,8 @@ def build(app: FastAPI, ctx: ProviderContext) -> None:
         if not isinstance(parent, dict):
             invalid("parent must be an object containing database_id.")
         db = require(ctx, grant, "databases", parent.get("database_id"), write=True)
+        editable(ctx, db)
+        check_upload_access(ctx, payload, grant.client_id)
         source_id = ctx.ids.guid()
         specs = schema(payload.get("properties", {"Name": {"title": {}}}), source_id)
         normalize_relations(ctx, grant, specs)
@@ -269,11 +298,14 @@ def build(app: FastAPI, ctx: ProviderContext) -> None:
             "database_parent": db["parent"],
             "title": rich_text(payload.get("title", []), ctx),
             "description": [],
-            "icon": db["icon"],
+            "icon": attachment(ctx, payload.get("icon", db["icon"]), icon=True)
+            if "icon" in payload
+            else copy.deepcopy(db["icon"]),
             "properties": specs,
             **policy(db),
         }
         ctx.store["data_sources"].put(record)
+        attach_uploads(ctx, record)
         db["_sources"].append(source_id)
         touch(ctx, db, grant)
         return serialize(request, ctx, record, grant)
@@ -286,17 +318,28 @@ def build(app: FastAPI, ctx: ProviderContext) -> None:
         current = require(ctx, grant, "data_sources", data_source_id, write=True)
         record = copy.deepcopy(current)
         payload = await body(request)
+        archived = archive_value(payload)
+        editable(ctx, current, payload)
+        check_upload_access(ctx, payload, grant.client_id)
         for field in ("title", "description"):
             if field in payload:
                 record[field] = rich_text(payload[field], ctx)
-        if "in_trash" in payload or "archived" in payload:
-            value = payload.get("in_trash", payload.get("archived"))
-            if not isinstance(value, bool):
-                invalid("in_trash must be boolean.")
-            record.update(archived=value, in_trash=value)
+        if "icon" in payload:
+            record["icon"] = attachment(ctx, payload["icon"], icon=True)
+        if "parent" in payload:
+            invalid("Moving data sources is not supported by this emulator.")
+        if archived is not None:
+            record.update(archived=archived, in_trash=archived)
         if "properties" in payload:
             update_schema(ctx, record, payload["properties"], grant)
         touch(ctx, record, grant)
         ctx.store["data_sources"].put(record)
-        await emit(ctx, "database.schema_updated", record["parent"]["database_id"], "database")
+        attach_uploads(ctx, record)
+        await emit(
+            ctx,
+            "data_source.schema_updated",
+            record["id"],
+            "data_source",
+            {"updated_properties": schema_changes(current["properties"], record["properties"])},
+        )
         return serialize(request, ctx, record, grant)

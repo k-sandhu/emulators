@@ -9,7 +9,12 @@ import pytest
 
 pytestmark = pytest.mark.sdk
 BASE = "https://api.notion.com/v1"
-TOKEN = "ntn_halcyon_internal_integration"
+
+
+def internal_token() -> str:
+    response = httpx.get("https://api.notion.com/_emulator/info")
+    response.raise_for_status()
+    return response.json()["credentials"]["internal_token"]
 
 
 @pytest.mark.parametrize("version", ["2022-06-28", "2025-09-03"])
@@ -17,7 +22,7 @@ def test_connector_search_database_query_and_recursive_ingestion(
     emulator_intercept: Any, version: str
 ) -> None:
     with httpx.Client(
-        headers={"Authorization": "Bearer " + TOKEN, "Notion-Version": version}, timeout=30
+        headers={"Authorization": "Bearer " + internal_token(), "Notion-Version": version}, timeout=30
     ) as client:
         me = client.get(BASE + "/users/me")
         me.raise_for_status()
@@ -73,7 +78,7 @@ def test_connector_search_database_query_and_recursive_ingestion(
 
 async def test_async_connector_page_blocks_comments_and_file_download(emulator_intercept: Any) -> None:
     async with httpx.AsyncClient(
-        headers={"Authorization": "Bearer " + TOKEN, "Notion-Version": "2025-09-03"}, timeout=30
+        headers={"Authorization": "Bearer " + internal_token(), "Notion-Version": "2025-09-03"}, timeout=30
     ) as client:
         root = (
             await client.post(
@@ -134,3 +139,98 @@ async def test_async_connector_page_blocks_comments_and_file_download(emulator_i
         archived = await client.patch(BASE + "/pages/" + page_id, json={"in_trash": True})
         archived.raise_for_status()
         assert archived.json()["archived"]
+
+
+def test_connector_versioned_shapes_errors_and_capabilities(emulator_intercept: Any) -> None:
+    with httpx.Client(
+        headers={"Authorization": "Bearer " + internal_token(), "Notion-Version": "2025-09-03"}
+    ) as client:
+        response = client.post(
+            BASE + "/search",
+            json={"query": "Clients", "filter": {"property": "object", "value": "data_source"}},
+        )
+        response.raise_for_status()
+        assert response.json()["type"] == "page_or_data_source"
+        assert response.headers["x-request-id"]
+        source = response.json()["results"][0]
+        queried = client.post(f"{BASE}/data_sources/{source['id']}/query", json={"page_size": 100})
+        queried.raise_for_status()
+        assert queried.json()["type"] == "page_or_data_source"
+        assert queried.json()["next_cursor"] is None and not queried.json()["has_more"]
+        bad = client.post(BASE + "/search", json={"filter": False})
+        assert bad.status_code == 400 and bad.json()["code"] == "validation_error"
+        assert bad.headers["x-request-id"] == bad.json()["request_id"]
+        limited = client.post("https://api.notion.com/_emulator/tokens", json={"scopes": []}).json()
+        denied = client.post(
+            BASE + "/search", headers={"Authorization": "Bearer " + limited["access_token"]}, json={}
+        )
+        assert denied.status_code == 403 and denied.json()["code"] == "restricted_resource"
+
+
+def test_connector_oauth_rotation_and_client_binding(emulator_intercept: Any) -> None:
+    from urllib.parse import parse_qs, urlparse
+
+    with httpx.Client(headers={"Notion-Version": "2022-06-28"}) as client:
+        authorize = client.get(
+            BASE + "/oauth/authorize",
+            params={
+                "client_id": "notion-client",
+                "redirect_uri": "https://consumer.example/callback",
+                "response_type": "code",
+                "owner": "user",
+                "login_hint": "maya.chen@halcyonadvisory.example",
+            },
+        )
+        code = parse_qs(urlparse(authorize.headers["location"]).query)["code"][0]
+        credentials = httpx.BasicAuth("notion-client", "notion-secret")
+        wrong = client.post(
+            BASE + "/oauth/token",
+            auth=httpx.BasicAuth("other-client", "other-secret"),
+            json={
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": "https://consumer.example/callback",
+            },
+        )
+        assert wrong.status_code == 400
+        result = client.post(
+            BASE + "/oauth/token",
+            auth=credentials,
+            json={
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": "https://consumer.example/callback",
+            },
+        )
+        result.raise_for_status()
+        pair = result.json()
+        refreshed = client.post(
+            BASE + "/oauth/token",
+            auth=credentials,
+            json={"grant_type": "refresh_token", "refresh_token": pair["refresh_token"]},
+        )
+        refreshed.raise_for_status()
+        active = refreshed.json()
+        assert (
+            client.get(
+                BASE + "/users/me", headers={"Authorization": "Bearer " + pair["access_token"]}
+            ).status_code
+            == 401
+        )
+        assert (
+            client.post(
+                BASE + "/oauth/token",
+                auth=credentials,
+                json={"grant_type": "refresh_token", "refresh_token": pair["refresh_token"]},
+            ).status_code
+            == 400
+        )
+        client.post(
+            BASE + "/oauth/revoke", auth=credentials, json={"token": active["access_token"]}
+        ).raise_for_status()
+        assert (
+            client.post(
+                BASE + "/oauth/introspect", auth=credentials, json={"token": active["access_token"]}
+            ).json()["active"]
+            is False
+        )

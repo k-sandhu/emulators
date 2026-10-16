@@ -221,7 +221,7 @@ async def test_page_create_retrieve_update_archive_restore_and_rich_text(client:
     conflict = await client.patch(
         "/v1/blocks/" + page["id"] + "/children", json={"children": [{"divider": {}}]}
     )
-    assert conflict.status_code == 409
+    assert conflict.status_code == 400 and conflict.json()["code"] == "validation_error"
     assert (await client.patch("/v1/pages/" + page["id"], json={"in_trash": False})).json()[
         "archived"
     ] is False

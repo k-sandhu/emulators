@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import timedelta
 from typing import Any
 
+from emulators.core.clock import parse_instant
 from emulators.core.ids import stable_guid, stable_hash
 from emulators.core.provider import ProviderContext
 from emulators.providers.notion.common import (
@@ -61,7 +62,7 @@ def block(
                 "type": "page_id" if parent["object"] == "page" else "block_id",
                 "page_id" if parent["object"] == "page" else "block_id": parent["id"],
             },
-            ctx.world.anchor,
+            parse_instant(parent["created_time"]),
         ),
         "type": kind,
         kind: data,
@@ -69,6 +70,11 @@ def block(
         "_children": [],
         **policy(parent),
     }
+    record.update(
+        last_edited_time=parent["last_edited_time"],
+        created_by=parent["created_by"],
+        last_edited_by=parent["last_edited_by"],
+    )
     ctx.store["blocks"].put(record)
     parent["_children"].append(record_id)
     parent["has_children"] = True
@@ -85,8 +91,9 @@ def database(
     source_id: str | None = None,
 ) -> dict[str, Any]:
     source_id = source_id or sid("source", record_id)
+    created = parse_instant(parent["created_time"])
     db = {
-        **envelope(record_id, "database", {"type": "page_id", "page_id": parent["id"]}, ctx.world.anchor),
+        **envelope(record_id, "database", {"type": "page_id", "page_id": parent["id"]}, created),
         "title": rich_text(title),
         "description": [],
         "icon": None,
@@ -101,9 +108,7 @@ def database(
     parent["_children"].append(record_id)
     ctx.store["data_sources"].put(
         {
-            **envelope(
-                source_id, "data_source", {"type": "database_id", "database_id": record_id}, ctx.world.anchor
-            ),
+            **envelope(source_id, "data_source", {"type": "database_id", "database_id": record_id}, created),
             "title": rich_text(title),
             "description": [],
             "icon": None,
@@ -175,6 +180,7 @@ def seed(ctx: ProviderContext) -> None:
             ],
         )
     roots = {}
+    workspace_created = min(doc.created for doc in ctx.world.documents) - timedelta(days=1)
     for space in ctx.world.spaces:
         acl = {space.owner_id: "owner"}
         for principal, access in space.members:
@@ -189,7 +195,12 @@ def seed(ctx: ProviderContext) -> None:
             }
         access = {"_acl": acl, "_internal": space.id in ("knowledge", "clients")}
         roots[space.id] = page(
-            ctx, sid("space", space.id), space.name, {"type": "workspace", "workspace": True}, access
+            ctx,
+            sid("space", space.id),
+            space.name,
+            {"type": "workspace", "workspace": True},
+            access,
+            at=workspace_created,
         )
         roots[space.id]["_world_space"] = space.id
     folders = {}
@@ -203,6 +214,7 @@ def seed(ctx: ProviderContext) -> None:
                 name,
                 {"type": "page_id", "page_id": parent["id"]},
                 parent,
+                at=workspace_created,
             )
     for doc in ctx.world.documents:
         parent = folders.get((doc.space_id, doc.folder), roots[doc.space_id])

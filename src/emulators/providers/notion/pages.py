@@ -15,7 +15,6 @@ from emulators.providers.notion.blocks import append
 from emulators.providers.notion.common import (
     NEW,
     allowed,
-    ancestors,
     authenticate,
     body,
     envelope,
@@ -31,7 +30,14 @@ from emulators.providers.notion.common import (
     world_user,
 )
 from emulators.providers.notion.events import emit
-from emulators.providers.notion.properties import attachment, check_upload_access, computed, values
+from emulators.providers.notion.properties import (
+    attach_uploads,
+    attachment,
+    check_upload_access,
+    computed,
+    values,
+)
+from emulators.providers.notion.validation import archive_value, editable
 
 TITLE_SCHEMA = {"title": {"id": "title", "name": "title", "type": "title", "title": {}}}
 
@@ -48,6 +54,8 @@ def parent_for(
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     if not isinstance(raw, dict):
         invalid("parent must be an object.")
+    if sum(k in raw for k in ("page_id", "database_id", "data_source_id", "workspace")) != 1:
+        invalid("parent must contain exactly one parent reference.")
     kind = raw.get("type") or next(
         (k for k in ("page_id", "database_id", "data_source_id", "workspace") if k in raw), ""
     )
@@ -65,8 +73,7 @@ def parent_for(
         )
     if kind == "page_id":
         parent = require(ctx, grant, "pages", raw.get(kind), write=True)
-        if any(r.get("archived") for r in ancestors(ctx, parent)):
-            fail(409, "conflict_error", "Cannot create content under an archived page.")
+        editable(ctx, parent)
         return {"type": "page_id", "page_id": parent["id"]}, parent, TITLE_SCHEMA
     if kind == "database_id":
         if version(request) == NEW:
@@ -81,8 +88,7 @@ def parent_for(
         source = require(ctx, grant, "data_sources", raw.get(kind), write=True)
     else:
         invalid("parent must specify page_id, database_id, data_source_id, or workspace.")
-    if any(r.get("archived") for r in ancestors(ctx, source)):
-        fail(409, "conflict_error", "Cannot create a page under an archived database.")
+    editable(ctx, source)
     return (
         {
             "type": "data_source_id",
@@ -117,13 +123,14 @@ def build(app: FastAPI, ctx: ProviderContext) -> None:
         capability(grant, "insert_content")
         payload = await body(request)
         parent, access, specs = parent_for(ctx, grant, payload.get("parent"), request)
+        specs = copy.deepcopy(specs)
         check_upload_access(ctx, payload, grant.client_id)
         properties = values(ctx, specs, payload.get("properties", {}))
         validate_relations(ctx, grant, specs, properties)
         record = {
             **envelope(ctx.ids.guid(), "page", parent, ctx.clock.now()),
             "properties": properties,
-            "icon": attachment(ctx, payload.get("icon")),
+            "icon": attachment(ctx, payload.get("icon"), icon=True),
             "cover": attachment(ctx, payload.get("cover")),
             "url": "",
             "public_url": None,
@@ -131,9 +138,14 @@ def build(app: FastAPI, ctx: ProviderContext) -> None:
             **policy(access),
         }
         computed(record, specs)
+        if "children" in payload and not isinstance(payload["children"], list):
+            invalid("children must be an array.")
         if payload.get("children"):
             append(ctx, record, payload["children"], grant)
         ctx.store["pages"].put(record)
+        if parent["type"] == "data_source_id":
+            access["properties"] = specs
+        attach_uploads(ctx, record)
         if parent["type"] == "page_id":
             access["_children"].append(record["id"])
             touch(ctx, access, grant)
@@ -161,29 +173,45 @@ def build(app: FastAPI, ctx: ProviderContext) -> None:
         current = require(ctx, grant, "pages", page_id, write=True)
         record = copy.deepcopy(current)
         payload = await body(request)
+        archived = archive_value(payload)
+        editable(ctx, current, payload)
         if "parent" in payload:
             invalid("A page's parent cannot be changed through this endpoint.")
         check_upload_access(ctx, payload, grant.client_id)
-        specs = page_schema(ctx, record)
+        specs = copy.deepcopy(page_schema(ctx, record))
         if "properties" in payload:
             record["properties"] = values(ctx, specs, payload["properties"], record["properties"])
             validate_relations(ctx, grant, specs, record["properties"])
         for key in ("icon", "cover"):
             if key in payload:
-                record[key] = attachment(ctx, payload[key])
-        if "archived" in payload or "in_trash" in payload:
-            archived = payload.get("in_trash", payload.get("archived"))
-            if not isinstance(archived, bool):
-                invalid("archived/in_trash must be a boolean.")
+                record[key] = attachment(ctx, payload[key], icon=key == "icon")
+        if archived is not None:
             record.update(archived=archived, in_trash=archived)
         touch(ctx, record, grant)
         computed(record, specs)
         ctx.store["pages"].put(record)
+        if record["parent"]["type"] == "data_source_id":
+            ctx.store["data_sources"].get(record["parent"]["data_source_id"])["properties"] = specs
+        attach_uploads(ctx, record)
+        event_type = (
+            "page.deleted"
+            if archived is True and not current["archived"]
+            else "page.undeleted"
+            if archived is False and current["archived"]
+            else "page.properties_updated"
+        )
         await emit(
             ctx,
-            "page.properties_updated",
+            event_type,
             record["id"],
-            data={"updated_properties": list(payload.get("properties", {}))},
+            data={
+                "updated_properties": [
+                    p["id"]
+                    for key in payload.get("properties", {})
+                    for name, p in record["properties"].items()
+                    if key == name or key == p["id"]
+                ]
+            },
         )
         return serialize(request, ctx, record, grant)
 

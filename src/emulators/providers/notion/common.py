@@ -5,6 +5,8 @@ from __future__ import annotations
 import copy
 import hashlib
 import hmac
+import json
+from contextvars import ContextVar
 from datetime import datetime, timedelta
 from typing import Any, NoReturn
 from urllib.parse import quote, unquote
@@ -17,6 +19,7 @@ from emulators.core.clock import isoformat_z
 from emulators.core.errors import EmulatorError
 from emulators.core.ids import stable_guid, stable_hash
 from emulators.core.provider import ProviderContext, url_for_host
+from emulators.providers.notion import validation
 
 OLD = "2022-06-28"
 NEW = "2025-09-03"
@@ -27,14 +30,22 @@ ANNOTATIONS = dict(
     bold=False, italic=False, strikethrough=False, underline=False, code=False, color="default"
 )
 WRITE_ROLES = {"owner", "editor"}
+REQUEST_ID: ContextVar[str | None] = ContextVar("notion_request_id", default=None)
 
 
 def error_body(status: int, code: str, message: str) -> dict[str, Any]:
-    return {"object": "error", "status": status, "code": code, "message": message, "request_id": str(uuid4())}
+    return {
+        "object": "error",
+        "status": status,
+        "code": code,
+        "message": message,
+        "request_id": REQUEST_ID.get() or str(uuid4()),
+    }
 
 
 def fail(status: int, code: str, message: str) -> NoReturn:
-    raise EmulatorError(status, error_body(status, code, message))
+    response = error_body(status, code, message)
+    raise EmulatorError(status, response, headers={"x-request-id": response["request_id"]})
 
 
 def invalid(message: str) -> NoReturn:
@@ -61,7 +72,7 @@ def person_id(world_id: str) -> str:
 
 
 def rich_text(items: Any, ctx: ProviderContext | None = None) -> list[dict[str, Any]]:
-    if isinstance(items, str):
+    if isinstance(items, str) and ctx is None:
         items = [{"type": "text", "text": {"content": items}}] if items else []
     if not isinstance(items, list) or len(items) > 100:
         invalid("rich_text must be an array containing at most 100 items.")
@@ -70,6 +81,8 @@ def rich_text(items: Any, ctx: ProviderContext | None = None) -> list[dict[str, 
         if not isinstance(raw, dict):
             invalid("Each rich text item must be an object.")
         kind = raw.get("type", "text")
+        if not isinstance(kind, str) or kind not in ("text", "mention", "equation"):
+            invalid("Unsupported rich text type.")
         data = copy.deepcopy(raw.get(kind, {}))
         if not isinstance(data, dict) or not isinstance(raw.get("annotations", {}), dict):
             invalid("Rich text content and annotations must be objects.")
@@ -84,8 +97,13 @@ def rich_text(items: Any, ctx: ProviderContext | None = None) -> list[dict[str, 
             ):
                 invalid("text.link must be null or an object containing url.")
             href = (data.get("link") or {}).get("url")
+            if href is not None:
+                validation.url(href, "text.link.url")
+            data = {"content": text, "link": {"url": href} if href is not None else None}
         elif kind == "mention":
-            mention_type = data.get("type") or next((k for k in ("user", "page", "date") if k in data), "")
+            mention_type = data.get("type", next((k for k in ("user", "page", "date") if k in data), ""))
+            if not isinstance(mention_type, str) or mention_type not in ("user", "page", "date"):
+                invalid("Unsupported mention type.")
             data["type"] = mention_type
             target = data.get(mention_type, {})
             if not isinstance(target, dict):
@@ -102,23 +120,29 @@ def rich_text(items: Any, ctx: ProviderContext | None = None) -> list[dict[str, 
                 text = title_of(page) if page else "Untitled"
                 href = f"https://www.notion.so/{target_id.replace('-', '')}"
             elif mention_type == "date" and isinstance(target.get("start"), str):
-                data["date"] = {
-                    "start": target["start"],
-                    "end": target.get("end"),
-                    "time_zone": target.get("time_zone"),
-                }
+                data["date"] = validation.date_value(target)
                 text = target["start"]
             else:
                 invalid("Unsupported mention type; expected user, page or date.")
+            data = {"type": mention_type, mention_type: data[mention_type]}
         elif kind == "equation" and isinstance(data.get("expression"), str):
-            text = data["expression"]
+            text = validation.string(data["expression"], "equation.expression", maximum=1000)
+            data = {"expression": text}
         else:
             invalid(f"Unsupported rich text type: {kind}.")
+        annotations = raw.get("annotations", {})
+        if any(
+            key in annotations and not isinstance(annotations[key], bool)
+            for key in ANNOTATIONS
+            if key != "color"
+        ):
+            invalid("Rich text annotations must be boolean.")
+        validation.color(annotations.get("color", "default"))
         result.append(
             {
                 "type": kind,
                 kind: data,
-                "annotations": {**ANNOTATIONS, **raw.get("annotations", {})},
+                "annotations": {key: annotations.get(key, default) for key, default in ANNOTATIONS.items()},
                 "plain_text": text,
                 "href": href,
             }
@@ -155,11 +179,15 @@ def public(value: Any, *, preserve_keys: bool = False) -> Any:
 
 async def body(request: Request) -> dict[str, Any]:
     try:
-        value = await request.json()
-    except (ValueError, UnicodeDecodeError):
+        raw = await request.body()
+        if len(raw) > 500 * 1024:
+            invalid("Request body must not exceed 500 KB.")
+        value = json.loads(raw, parse_constant=validation.not_json)
+    except (ValueError, UnicodeDecodeError, RecursionError):
         fail(400, "invalid_json", "Error parsing JSON body.")
     if not isinstance(value, dict):
         invalid("Request body must be an object.")
+    validation.json_values(value)
     return value
 
 
@@ -181,7 +209,7 @@ def authenticate(request: Request, ctx: ProviderContext) -> Grant:
 
 
 def world_user(ctx: ProviderContext, value: str | None) -> str | None:
-    if not value:
+    if not isinstance(value, str) or not value:
         return None
     for person in ctx.world.active_employees:
         if value.lower() in (person.id, person.email.lower(), person_id(person.id)):
@@ -209,14 +237,14 @@ def ancestors(ctx: ProviderContext, record: dict[str, Any]) -> list[dict[str, An
 
 def role(ctx: ProviderContext, grant: Grant, record: dict[str, Any]) -> str | None:
     chain = ancestors(ctx, record)
+    selected = grant.extra.get("shared_page_ids")
+    if selected is not None and not any(r["id"] in selected for r in chain):
+        return None
     if grant.app_only:
         if record.get("_internal"):
             return "editor"
         return None
     person = world_user(ctx, grant.user_id)
-    selected = grant.extra.get("shared_page_ids")
-    if selected is not None and not any(r["id"] in selected for r in chain):
-        return None
     return record.get("_acl", {}).get(person)
 
 
@@ -297,6 +325,8 @@ def paginate(
     binding = stable_hash(key, grant.token if grant else "")
     start = 0
     cursor = params.get("start_cursor")
+    if "start_cursor" in params and (not isinstance(cursor, str) or not cursor):
+        invalid("start_cursor must be a non-empty string.")
     if cursor:
         saved = ctx.store["_cursors"].get(str(cursor))
         if saved is None or saved["binding"] != binding:
@@ -315,6 +345,15 @@ def paginate(
         "type": kind,
         kind: {},
     }
+
+
+def user_value(ctx: ProviderContext, user_id: str, grant: Grant | None) -> dict[str, Any]:
+    user = public(ctx.store["users"].get(user_id) or partial_user(user_id))
+    if grant is not None and not any(s in grant.scopes for s in ("read_user", "read_user_with_email")):
+        return partial_user(user_id)
+    if grant is not None and "read_user_with_email" not in grant.scopes and "person" in user:
+        user["person"] = {}
+    return user
 
 
 def file_object(request: Request, ctx: ProviderContext, file_id: str) -> dict[str, Any]:
@@ -364,14 +403,13 @@ def wire_value(
             else:
                 result["plain_text"] = title_of(target)
             result["href"] = url_for_host(request, ctx, "www.notion.so", "/" + target_id.replace("-", ""))
-        elif (
-            mention.get("type") == "user"
-            and grant
-            and grant.scopes
-            and "read_user_with_email" not in grant.scopes
-        ):
-            if "person" in mention["user"]:
-                mention["user"]["person"] = {}
+        elif mention.get("type") == "user":
+            mention["user"] = user_value(ctx, mention["user"]["id"], grant)
+            result["plain_text"] = mention["user"].get("name", "@Anonymous")
+    if raw.get("type") == "people" and isinstance(raw.get("people"), list):
+        result["people"] = [user_value(ctx, value["id"], grant) for value in raw["people"]]
+    elif raw.get("object") == "property_item" and raw.get("type") == "people":
+        result["people"] = user_value(ctx, raw["people"]["id"], grant)
     return result
 
 
@@ -380,6 +418,13 @@ def serialize(
 ) -> dict[str, Any]:
     result = wire_value(request, ctx, record, grant)
     kind = result.get("object")
+    if (
+        grant is not None
+        and "read_content" not in grant.scopes
+        and kind in ("page", "database", "data_source", "block")
+    ):
+        keys = {"object", "id", "properties"} if kind == "data_source" else {"object", "id"}
+        return {key: value for key, value in result.items() if key in keys}
     if kind != "block":
         result.pop("has_children", None)
     if kind in ("page", "database"):

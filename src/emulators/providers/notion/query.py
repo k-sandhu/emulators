@@ -7,6 +7,7 @@ from typing import Any
 
 from emulators.core.clock import parse_instant
 from emulators.providers.notion.common import invalid, property_by_key, text_of, uid
+from emulators.providers.notion.validation import iso_date
 
 OPERATORS = {
     "title": {
@@ -128,7 +129,7 @@ OPERATORS = {
 
 
 def compile_filter(raw: Any, specs: dict[str, Any], depth: int = 0) -> Any:
-    if raw is None:
+    if raw is None and depth == 0:
         return None
     if not isinstance(raw, dict) or not raw:
         invalid("filter must be a non-empty object.")
@@ -143,12 +144,19 @@ def compile_filter(raw: Any, specs: dict[str, Any], depth: int = 0) -> Any:
         if name not in ("created_time", "last_edited_time"):
             invalid("timestamp must be created_time or last_edited_time.")
         kind = name
+        name = "$" + name
     elif "property" in raw:
         name, spec = property_by_key(specs, raw["property"])
         kind = spec["type"]
     else:
         invalid("A filter requires a property or timestamp.")
     condition = raw.get(kind)
+    if (kind == "title" and "rich_text" in raw) or (
+        kind in ("url", "email", "phone_number") and "rich_text" in raw
+    ):
+        condition = raw["rich_text"]
+    elif kind in ("created_by", "last_edited_by"):
+        condition = raw.get("people")
     if kind == "formula":
         if not isinstance(condition, dict) or len(condition) != 1:
             invalid("formula filter requires string, number, checkbox, or date.")
@@ -157,15 +165,15 @@ def compile_filter(raw: Any, specs: dict[str, Any], depth: int = 0) -> Any:
             invalid("Unsupported formula filter type.")
         comparison = "rich_text" if subtype == "string" else subtype
     else:
-        comparison = kind
+        comparison = "people" if kind in ("created_by", "last_edited_by") else kind
     if comparison not in OPERATORS or not isinstance(condition, dict) or len(condition) != 1:
         invalid(f"Invalid {kind} filter condition.")
     operator, target = next(iter(condition.items()))
     if operator not in OPERATORS[comparison]:
         invalid(f"Unsupported {comparison} filter operator: {operator}.")
     if operator in ("is_empty", "is_not_empty"):
-        if not isinstance(target, bool):
-            invalid(f"{operator} must be boolean.")
+        if target is not True:
+            invalid(f"{operator} must be true.")
     elif operator in (
         "past_week",
         "past_month",
@@ -178,10 +186,7 @@ def compile_filter(raw: Any, specs: dict[str, Any], depth: int = 0) -> Any:
         if target != {}:
             invalid(f"{operator} requires an empty object.")
     elif comparison in ("date", "created_time", "last_edited_time"):
-        try:
-            parse_instant(target)
-        except (ValueError, TypeError, AttributeError):
-            invalid("Date filter requires an ISO 8601 date.")
+        iso_date(target)
     elif comparison == "number":
         if isinstance(target, bool) or not isinstance(target, (int, float)):
             invalid("Number filter requires a number.")
@@ -203,18 +208,20 @@ def evaluate(node: Any, row: dict[str, Any], now: datetime) -> bool:
     if node[0] == "or":
         return any(evaluate(n, row, now) for n in node[1])
     _, name, kind, comparison, operator, target = node
-    if name in ("created_time", "last_edited_time") and name not in row["properties"]:
-        value = row[name]
-    else:
-        value = row["properties"].get(name, {}).get(kind)
+    value = row[name[1:]] if name.startswith("$") else row["properties"].get(name, {}).get(kind)
     if kind == "formula":
-        value = (value or {}).get((value or {}).get("type"))
+        subtype = {"rich_text": "string", "checkbox": "boolean"}.get(comparison, comparison)
+        if value and value.get("type") != subtype:
+            return False
+        value = (value or {}).get(subtype)
     if kind in ("title", "rich_text"):
         value = text_of(value or [])
     elif kind in ("select", "status"):
         value = (value or {}).get("name")
     elif kind in ("people", "relation"):
         value = [v["id"] for v in (value or [])]
+    elif kind in ("created_by", "last_edited_by"):
+        value = [value["id"]] if value else []
     elif kind == "multi_select":
         value = [v["name"] for v in (value or [])]
     if operator in ("is_empty", "is_not_empty"):
@@ -284,11 +291,13 @@ def sorted_rows(rows: list[dict[str, Any]], sorts: Any, specs: dict[str, Any]) -
         invalid("sorts must be an array.")
     compiled = []
     for sort in sorts:
-        if not isinstance(sort, dict) or sort.get("direction", "ascending") not in (
+        if not isinstance(sort, dict) or sort.get("direction") not in (
             "ascending",
             "descending",
         ):
             invalid("Invalid sort direction.")
+        if ("timestamp" in sort) == ("property" in sort):
+            invalid("Sort must specify exactly one property or timestamp.")
         if "timestamp" in sort and sort["timestamp"] in ("created_time", "last_edited_time"):
             compiled.append((sort["timestamp"], None, sort.get("direction") == "descending"))
         elif "property" in sort:
@@ -306,6 +315,7 @@ def sorted_rows(rows: list[dict[str, Any]], sorts: Any, specs: dict[str, Any]) -
                 value = (value or {}).get("name")
             elif kind == "date":
                 value = (value or {}).get("start")
+                value = parse_instant(value) if value else None
             elif kind == "formula":
                 value = (value or {}).get((value or {}).get("type"))
             if isinstance(value, (list, dict)):

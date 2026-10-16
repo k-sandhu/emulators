@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import mimetypes
+import re
 from datetime import timedelta
 from typing import Any
 from urllib.parse import quote
@@ -18,7 +19,6 @@ from emulators.providers.notion.auth import capability
 from emulators.providers.notion.blocks import container
 from emulators.providers.notion.common import (
     BOT_ID,
-    NEW,
     authenticate,
     body,
     fail,
@@ -31,10 +31,25 @@ from emulators.providers.notion.common import (
     serialize,
     stamp,
     uid,
-    version,
 )
 from emulators.providers.notion.events import emit
+from emulators.providers.notion.validation import editable, string
 from emulators.world.documents import render
+
+
+def upload_metadata(filename: Any, content_type: Any) -> tuple[str | None, str | None]:
+    if filename is not None:
+        string(filename, "filename", empty=False)
+        filename = re.sub(r"\s", "_", filename.replace('"', ""))
+    if content_type and not re.fullmatch(r"[\w.+-]+/[\w.+-]+", content_type):
+        invalid("content_type must be a MIME type string.")
+    if not content_type or content_type == "application/octet-stream":
+        content_type = mimetypes.guess_type(filename)[0] if filename else None
+    if filename and content_type and "." not in filename.rsplit("/", 1)[-1]:
+        filename += mimetypes.guess_extension(content_type) or ""
+    if filename and len(filename.encode("utf-8")) > 900:
+        invalid("filename must be at most 900 bytes including its extension.")
+    return filename, content_type
 
 
 def build(app: FastAPI, ctx: ProviderContext) -> None:
@@ -72,6 +87,7 @@ def build(app: FastAPI, ctx: ProviderContext) -> None:
             require(
                 ctx, grant, "pages" if record["object"] == "page" else "blocks", record["id"], comment=True
             )
+        editable(ctx, record)
         if not payload.get("rich_text"):
             invalid("rich_text is required.")
         comment = {
@@ -92,10 +108,6 @@ def build(app: FastAPI, ctx: ProviderContext) -> None:
         await emit(ctx, "comment.created", comment["id"], "comment", {"page_id": record["id"]})
         return serialize(request, ctx, comment, grant)
 
-    def new_version(request: Request) -> None:
-        if version(request) != NEW:
-            fail(400, "invalid_request_url", "File uploads require Notion-Version 2025-09-03.")
-
     def upload_record(upload_id: str, client_id: str) -> dict[str, Any]:
         record = ctx.store["file_uploads"].get(uid(upload_id))
         if record is None or record["_client_id"] != client_id:
@@ -106,6 +118,8 @@ def build(app: FastAPI, ctx: ProviderContext) -> None:
 
     def upload_wire(request: Request, record: dict[str, Any]) -> dict[str, Any]:
         result = public(record)
+        if record["_mode"] == "multi_part":
+            result["number_of_parts"] = {"total": record["_number_of_parts"], "sent": len(record["_parts"])}
         if record["status"] == "pending":
             result["upload_url"] = url_for_host(
                 request, ctx, "api.notion.com", f"/v1/file_uploads/{record['id']}/send"
@@ -119,7 +133,6 @@ def build(app: FastAPI, ctx: ProviderContext) -> None:
     @app.post("/v1/file_uploads")
     async def create_upload(request: Request) -> dict[str, Any]:
         grant = authenticate(request, ctx)
-        new_version(request)
         capability(grant, "insert_content")
         payload = await body(request)
         mode = payload.get("mode", "single_part")
@@ -129,25 +142,39 @@ def build(app: FastAPI, ctx: ProviderContext) -> None:
             )
         count = payload.get("number_of_parts", 1)
         if mode == "multi_part" and (
-            not isinstance(count, int)
+            "number_of_parts" not in payload
+            or not isinstance(count, int)
             or isinstance(count, bool)
             or not 1 <= count <= 10000
             or not payload.get("filename")
         ):
             invalid("multi_part requires filename and number_of_parts from 1 to 10000.")
+        if "number_of_parts" in payload and (
+            not isinstance(count, int) or isinstance(count, bool) or not 1 <= count <= 10000
+        ):
+            invalid("number_of_parts must be an integer from 1 to 10000.")
         filename = payload.get("filename")
+        if "filename" in payload and not isinstance(filename, str):
+            invalid("filename must be a string.")
         if filename is not None and (not isinstance(filename, str) or len(filename.encode()) > 900):
             invalid("filename must be at most 900 bytes.")
+        content_type = payload.get("content_type")
+        if "content_type" in payload and (
+            not isinstance(content_type, str) or not re.fullmatch(r"[\w.+-]+/[\w.+-]+", content_type)
+        ):
+            invalid("content_type must be a MIME type string.")
+        filename, content_type = upload_metadata(filename, content_type)
         record = {
             "object": "file_upload",
             "id": ctx.ids.guid(),
             "created_time": stamp(ctx.clock.now()),
             "last_edited_time": stamp(ctx.clock.now()),
+            "created_by": {"id": BOT_ID, "type": "bot"},
+            "in_trash": False,
             "expiry_time": stamp(ctx.clock.now() + timedelta(hours=1)),
             "status": "pending",
             "filename": filename,
-            "content_type": payload.get("content_type")
-            or (mimetypes.guess_type(filename)[0] if filename else None),
+            "content_type": content_type,
             "content_length": None,
             "_client_id": grant.client_id,
             "_mode": mode,
@@ -160,7 +187,6 @@ def build(app: FastAPI, ctx: ProviderContext) -> None:
     @app.get("/v1/file_uploads")
     async def uploads(request: Request) -> dict[str, Any]:
         grant = authenticate(request, ctx)
-        new_version(request)
         rows = [
             upload_record(r["id"], grant.client_id)
             for r in ctx.store["file_uploads"]
@@ -184,13 +210,11 @@ def build(app: FastAPI, ctx: ProviderContext) -> None:
     @app.get("/v1/file_uploads/{file_upload_id}")
     async def retrieve_upload(file_upload_id: str, request: Request) -> dict[str, Any]:
         grant = authenticate(request, ctx)
-        new_version(request)
         return upload_wire(request, upload_record(file_upload_id, grant.client_id))
 
     @app.post("/v1/file_uploads/{file_upload_id}/send")
     async def send_upload(file_upload_id: str, request: Request) -> dict[str, Any]:
         grant = authenticate(request, ctx)
-        new_version(request)
         capability(grant, "insert_content")
         record = upload_record(file_upload_id, grant.client_id)
         if record["status"] != "pending":
@@ -203,6 +227,7 @@ def build(app: FastAPI, ctx: ProviderContext) -> None:
         if not isinstance(file, UploadFile):
             invalid("file must be provided as multipart/form-data.")
         content = await file.read()
+        await file.close()
         if len(content) > 20 * 1024 * 1024:
             invalid("A file part must be no larger than 20 MiB.")
         part = 1
@@ -213,11 +238,16 @@ def build(app: FastAPI, ctx: ProviderContext) -> None:
                 invalid("multi_part send requires part_number.")
             if not 1 <= part <= record["_number_of_parts"]:
                 invalid("part_number is outside number_of_parts.")
+        filename, content_type = upload_metadata(
+            record["filename"]
+            or (file.filename or "untitled").replace("%22", '"').replace("%0A", "\n").replace("%0D", "\r"),
+            record["content_type"] or file.content_type,
+        )
         blob = ctx.store.blobs.put(content)
         record["_parts"][str(part)] = blob
         record["content_length"] = sum(ctx.store.blobs.size(key) for key in record["_parts"].values())
-        record["filename"] = record["filename"] or file.filename or "untitled"
-        record["content_type"] = record["content_type"] or file.content_type or "application/octet-stream"
+        record["filename"] = filename
+        record["content_type"] = content_type or "application/octet-stream"
         record["last_edited_time"] = stamp(ctx.clock.now())
         if record["_mode"] == "single_part":
             record["status"] = "uploaded"
@@ -234,8 +264,9 @@ def build(app: FastAPI, ctx: ProviderContext) -> None:
     @app.post("/v1/file_uploads/{file_upload_id}/complete")
     async def complete_upload(file_upload_id: str, request: Request) -> dict[str, Any]:
         grant = authenticate(request, ctx)
-        new_version(request)
         capability(grant, "insert_content")
+        if await request.body():
+            await body(request)
         record = upload_record(file_upload_id, grant.client_id)
         if record["_mode"] != "multi_part" or record["status"] != "pending":
             invalid("Only pending multi_part uploads can be completed.")

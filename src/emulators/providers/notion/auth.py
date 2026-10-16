@@ -25,6 +25,7 @@ from emulators.providers.notion.common import (
     person_id,
     public,
     uid,
+    user_value,
     version,
     world_user,
 )
@@ -40,14 +41,14 @@ CAPABILITIES = [
 
 
 def capability(grant: Grant, wanted: str) -> None:
-    if grant.scopes and wanted not in grant.scopes:
+    if wanted not in grant.scopes:
         fail(403, "restricted_resource", f"This integration does not have {wanted} capability.")
 
 
 def bot(ctx: ProviderContext, grant: Grant) -> dict[str, Any]:
     result = public(ctx.store["users"].get(BOT_ID))
     if pid := world_user(ctx, grant.user_id):
-        result["bot"]["owner"] = {"type": "user", "user": public(ctx.store["users"].get(person_id(pid)))}
+        result["bot"]["owner"] = {"type": "user", "user": user_value(ctx, person_id(pid), grant)}
     return result
 
 
@@ -58,7 +59,7 @@ def issue_pair(ctx: ProviderContext, source: Grant) -> dict[str, Any]:
         scopes=source.scopes,
         prefix="ntn_",
         ttl=timedelta(hours=1),
-        extra=source.extra,
+        extra={k: v for k, v in source.extra.items() if k not in ("access_token", "refresh_token")},
     )
     refresh = ctx.tokens.issue_refresh(
         client_id=source.client_id,
@@ -89,15 +90,26 @@ def mint_token(ctx: ProviderContext, payload: dict[str, Any]) -> dict[str, Any]:
         invalid("user must be an active employee's world id, Notion UUID, or email.")
     extra = {}
     if "shared_page_ids" in payload:
+        if not isinstance(payload["shared_page_ids"], list):
+            invalid("shared_page_ids must be an array.")
         extra["shared_page_ids"] = [uid(v) for v in payload["shared_page_ids"]]
-    seconds = int(payload.get("expires_in", 3600))
+    seconds = payload.get("expires_in", 3600)
+    if not isinstance(seconds, int) or isinstance(seconds, bool) or abs(seconds) > 315360000:
+        invalid("expires_in must be an integer within ten years.")
+    scopes = payload.get("scopes", CAPABILITIES)
+    if not isinstance(scopes, list) or any(not isinstance(s, str) for s in scopes):
+        invalid("scopes must be an array of capability names.")
+    if "app_only" in payload and not isinstance(payload["app_only"], bool):
+        invalid("app_only must be boolean.")
+    if not isinstance(payload.get("client_id", "notion-client"), str):
+        invalid("client_id must be a string.")
     grant = ctx.tokens.issue_access(
         client_id=payload.get("client_id", "notion-client"),
         user_id=person,
-        scopes=payload.get("scopes", CAPABILITIES),
+        scopes=scopes,
         app_only=bool(payload.get("app_only", person is None)),
         prefix="ntn_",
-        ttl=timedelta(seconds=seconds),
+        ttl=timedelta(seconds=seconds) if seconds else timedelta(microseconds=1),
         extra=extra,
     )
     return {
@@ -175,6 +187,9 @@ def build(app: FastAPI, ctx: ProviderContext) -> None:
         version(request)
         client_id = client_auth(request)
         payload = await body(request)
+        for field in ("grant_type", "code", "redirect_uri", "refresh_token"):
+            if field in payload and not isinstance(payload[field], str):
+                fail(400, "invalid_request", f"{field} must be a string.")
         try:
             if payload.get("grant_type") == "authorization_code":
                 grant = ctx.tokens.resolve(payload.get("code"), "code")
@@ -206,6 +221,8 @@ def build(app: FastAPI, ctx: ProviderContext) -> None:
         version(request)
         client_id = client_auth(request)
         payload = await body(request)
+        if not isinstance(payload.get("token"), str) or not payload["token"]:
+            fail(400, "invalid_request", "token must be a non-empty string.")
         grant = ctx.tokens.resolve(payload.get("token"))
         result = {"active": bool(grant and grant.client_id == client_id), "request_id": ctx.ids.guid()}
         if result["active"]:
@@ -217,6 +234,8 @@ def build(app: FastAPI, ctx: ProviderContext) -> None:
         version(request)
         client_id = client_auth(request)
         payload = await body(request)
+        if not isinstance(payload.get("token"), str) or not payload["token"]:
+            fail(400, "invalid_request", "token must be a non-empty string.")
         grant = ctx.tokens.get(payload.get("token"))
         if grant and grant.client_id == client_id:
             ctx.tokens.revoke(grant.token)
