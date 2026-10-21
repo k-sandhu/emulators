@@ -33,6 +33,66 @@ WRITABLE = [
 ]
 
 
+@pytest.mark.parametrize("resource", ["Invoices", "CreditNotes"])
+async def test_settled_transactions_cannot_change_line_amount_types(
+    client: httpx.AsyncClient, resource: str
+) -> None:
+    taxes = (await client.get(BASE + "/TaxRates")).json()["TaxRates"]
+    tax = next(t for t in taxes if t["EffectiveRate"] == 13 and t["ReportTaxType"] == "OUTPUT")
+    lines = [{"Quantity": 1, "UnitAmount": 100, "AccountCode": "4200", "TaxType": tax["TaxType"]}]
+    invoice = await create_invoice(client, LineItems=lines)
+    if resource == "Invoices":
+        path = BASE + "/Invoices/" + invoice["InvoiceID"]
+        paid = await client.put(
+            BASE + "/Payments",
+            json={
+                "Invoice": {"InvoiceID": invoice["InvoiceID"]},
+                "Account": {"Code": "1000"},
+                "Date": "2026-10-16",
+                "Amount": invoice["Total"],
+            },
+        )
+        assert paid.status_code == 200, paid.text
+    else:
+        credit = await client.put(
+            BASE + "/CreditNotes",
+            json={
+                "Type": "ACCRECCREDIT",
+                "Contact": invoice["Contact"],
+                "Date": "2026-10-16",
+                "Status": "AUTHORISED",
+                "LineItems": lines,
+            },
+        )
+        assert credit.status_code == 200, credit.text
+        path = BASE + "/CreditNotes/" + credit.json()["CreditNotes"][0]["CreditNoteID"]
+        allocated = await client.put(
+            path + "/Allocations",
+            json={"Allocations": [{"Invoice": {"InvoiceID": invoice["InvoiceID"]}, "Amount": 100}]},
+        )
+        assert allocated.status_code == 200, allocated.text
+    before = (await client.get(path)).json()[resource]
+    rejected = await client.post(path, json={"LineAmountTypes": "Inclusive"})
+    assert rejected.status_code == 400, rejected.text
+    assert (await client.get(path)).json()[resource] == before
+
+
+async def test_line_amount_type_change_recomputes_generated_tax(client: httpx.AsyncClient) -> None:
+    taxes = (await client.get(BASE + "/TaxRates")).json()["TaxRates"]
+    tax = next(t for t in taxes if t["EffectiveRate"] == 13 and t["ReportTaxType"] == "OUTPUT")
+    invoice = await create_invoice(
+        client,
+        LineItems=[{"Quantity": 1, "UnitAmount": 100, "AccountCode": "4200", "TaxType": tax["TaxType"]}],
+    )
+    path = BASE + "/Invoices/" + invoice["InvoiceID"]
+    for mode, total_amount, tax_amount in [("Inclusive", 100, 11.5), ("Exclusive", 113, 13)]:
+        response = await client.post(path, json={"LineAmountTypes": mode})
+        assert response.status_code == 200, response.text
+        changed = response.json()["Invoices"][0]
+        assert changed["Total"] == total_amount and changed["TotalTax"] == tax_amount
+        assert changed["AmountDue"] == total_amount
+
+
 @pytest.mark.parametrize(("resource", "field"), WRITABLE)
 async def test_wrong_id_types_are_validation_errors(
     client: httpx.AsyncClient, resource: str, field: str

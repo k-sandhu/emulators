@@ -162,6 +162,9 @@ async def test_or_groups_query_sort_paging_archived_and_date(client: httpx.Async
             ]
         },
         {"sorts": ["unknown"]},
+        {"sorts": [{"propertyName": [], "direction": "ASCENDING"}]},
+        {"sorts": [{"propertyName": "name", "direction": []}]},
+        {"filterGroups": [{"filters": [{"propertyName": [], "operator": "EQ", "value": "x"}]}]},
         {"sorts": ["name", "domain"]},
         {"query": {}},
         {"filterGroups": {}},
@@ -170,3 +173,34 @@ async def test_or_groups_query_sort_paging_archived_and_date(client: httpx.Async
 async def test_search_validation_before_evaluation(client: httpx.AsyncClient, payload: dict) -> None:
     result = await client.post("/crm/v3/objects/companies/search", json=payload)
     assert result.status_code == 400, result.text
+
+
+async def test_search_body_limit_includes_filters(client: httpx.AsyncClient) -> None:
+    response = await client.post(
+        "/crm/v3/objects/companies/search",
+        json={
+            "filterGroups": [{"filters": [{"propertyName": "name", "operator": "EQ", "value": "a" * 3000}]}]
+        },
+    )
+    assert response.status_code == 400
+    assert response.json()["category"] == "VALIDATION_ERROR"
+
+
+async def test_enumeration_token_filters_are_case_sensitive(client: httpx.AsyncClient) -> None:
+    await setup_records(client)
+    for value, expected in (("lead", 2), ("LEAD", 0)):
+        response = await client.post(
+            "/crm/v3/objects/companies/search",
+            json={
+                "filterGroups": [
+                    {
+                        "filters": [
+                            {"propertyName": "city", "operator": "EQ", "value": "SearchFixture"},
+                            {"propertyName": "lifecyclestage", "operator": "CONTAINS_TOKEN", "value": value},
+                        ]
+                    }
+                ],
+            },
+        )
+        assert response.status_code == 200
+        assert response.json()["total"] == expected

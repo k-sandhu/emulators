@@ -285,6 +285,12 @@ space's roles. Selected fieldwork issues have
 engagement-team/partner issue security. For example, p026 can view ENG-1 but cannot view ENG-3;
 p001 can view both. ENG viewer roles cannot mutate issues.
 
+Jira parent links follow the supported default hierarchy: Task, Story and Bug may
+belong to an Epic; an Epic cannot parent another Epic. Validation considers the
+complete resulting issue, so changing a parented Task into an Epic is rejected
+without changing its other fields.
+This follows Atlassian's [default hierarchy](https://support.atlassian.com/automation/kb/automation-rule-or-update-parent-key-value-when-issue-is-created/).
+
 ## Webhooks and actions
 
 `POST /_emulator/actions/configure_webhook` registers a synthetic dynamic subscription:

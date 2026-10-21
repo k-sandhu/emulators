@@ -45,7 +45,10 @@ from box_sdk_gen import (  # noqa: E402
     CreateCollaborationRole,
     CreateCommentItem,
     CreateCommentItemTypeField,
+    CreateFolderFolderUploadEmail,
+    CreateFolderFolderUploadEmailAccessField,
     CreateFolderParent,
+    CreateFolderSyncState,
     CreateGroupMembershipGroup,
     CreateGroupMembershipUser,
     CreateTaskItem,
@@ -87,6 +90,22 @@ def token_status(token: str) -> int:
         "https://api.box.com/2.0/users/me", headers={"Authorization": f"Bearer {token}"}, timeout=10
     )
     return response.status_code
+
+
+def test_folder_creation_options_decode_and_persist_in_sdk(admin: BoxClient) -> None:
+    folder = admin.folders.create_folder(
+        "SDK synced folder",
+        CreateFolderParent(id="0"),
+        sync_state=CreateFolderSyncState.SYNCED,
+        folder_upload_email=CreateFolderFolderUploadEmail(
+            access=CreateFolderFolderUploadEmailAccessField.COLLABORATORS
+        ),
+        fields=["sync_state", "folder_upload_email"],
+    )
+    assert folder.sync_state.value == "synced"
+    assert folder.folder_upload_email.access.value == "collaborators"
+    stored = admin.folders.get_folder_by_id(folder.id, fields=["sync_state"])
+    assert stored.sync_state.value == "synced"
 
 
 def folder_named(client: BoxClient, parent: str, name: str) -> str:

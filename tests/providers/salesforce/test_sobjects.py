@@ -511,17 +511,49 @@ async def test_cascade_delete_and_clear_references(admin: Actor) -> None:
     assert (await admin.get(f"/sobjects/Engagement__c/{engagement}")).json()["Account__c"] is None
 
 
+async def test_upsert_update_only_does_not_create_missing_record(admin: Actor) -> None:
+    path = "/sobjects/Account/QuickBooks_Customer_Id__c/UPDATE-ONLY-MISSING"
+    before = await admin.query("SELECT COUNT() FROM Account")
+    response = await admin.patch(path, {"Name": "Must not create"}, params={"updateOnly": "true"})
+    err(response, 404, "NOT_FOUND")
+    assert await admin.query("SELECT COUNT() FROM Account") == before
+    created = await admin.patch(path, {"Name": "May create"}, params={"updateOnly": "false"})
+    assert created.status_code == 201
+    updated = await admin.patch(path, {"Name": "Existing only"}, params={"updateOnly": "true"})
+    assert updated.status_code == 200 and updated.json()["created"] is False
+    assert (await admin.get(path)).json()["Name"] == "Existing only"
+
+
+@pytest.mark.parametrize("version", ["45.0", "46.0"])
+async def test_upsert_response_changes_at_api_46(admin: Actor, version: str) -> None:
+    path = (
+        f"https://halcyonadvisory.my.salesforce.com/services/data/v{version}"
+        "/sobjects/Account/QuickBooks_Customer_Id__c/VERSIONED-UPSERT"
+    )
+    created = await admin.patch(path, {"Name": "Versioned"})
+    assert created.status_code == 201
+    expected = {"id": created.json()["id"], "success": True, "errors": []}
+    assert created.json() == (expected if version == "45.0" else {**expected, "created": True})
+    updated = await admin.patch(path, {"Name": "Versioned update"})
+    if version == "45.0":
+        assert updated.status_code == 204 and updated.content == b""
+    else:
+        assert updated.status_code == 200
+        assert updated.json() == {**expected, "created": False}
+
+
 async def test_upsert_by_external_id(admin: Actor) -> None:
     created = await admin.patch("/sobjects/Account/QuickBooks_Customer_Id__c/QB-900", {"Name": "Upserted Co"})
     assert created.status_code == 201
     rid = created.json()["id"]
-    assert created.json() == {"id": rid, "success": True, "errors": []}
+    assert created.json() == {"id": rid, "success": True, "errors": [], "created": True}
     got = (await admin.get("/sobjects/Account/QuickBooks_Customer_Id__c/QB-900")).json()
     assert got["Id"] == rid and got["QuickBooks_Customer_Id__c"] == "QB-900" and got["Name"] == "Upserted Co"
     updated = await admin.patch(
         "/sobjects/Account/QuickBooks_Customer_Id__c/QB-900", {"Name": "Renamed Co", "Rating": "Hot"}
     )
-    assert updated.status_code == 204
+    assert updated.status_code == 200
+    assert updated.json() == {"id": rid, "success": True, "errors": [], "created": False}
     again = (
         await admin.get(
             f"/sobjects/Account/{rid}", params={"fields": "Name,Rating,QuickBooks_Customer_Id__c"}
@@ -535,12 +567,12 @@ async def test_upsert_by_external_id(admin: Actor) -> None:
     assert (await admin.delete("/sobjects/Account/QuickBooks_Customer_Id__c/QB-900")).status_code == 204
     err(await admin.get("/sobjects/Account/QuickBooks_Customer_Id__c/QB-900"), 404, "NOT_FOUND")
     code = await admin.patch("/sobjects/Engagement__c/Engagement_Code__c/e001", {"Status__c": "On Hold"})
-    assert code.status_code == 204
+    assert code.status_code == 200
     assert (await admin.rows("SELECT Status__c FROM Engagement__c WHERE Engagement_Code__c = 'e001'"))[0][
         "Status__c"
     ] == "On Hold"
     by_id = await admin.patch(f"/sobjects/Account/Id/{rid}", {"Rating": "Cold"})
-    assert by_id.status_code in (204, 404)
+    err(by_id, 404, "NOT_FOUND")
 
 
 async def test_relationship_traversal_resources(admin: Actor) -> None:
@@ -789,7 +821,7 @@ async def test_lookups_by_external_id_in_request_bodies(admin: Actor) -> None:
         "INVALID_FIELD",
     )
     upserted = await admin.patch("/sobjects/Contact/Id/" + contact.json()["id"], {"Title": "x"})
-    assert upserted.status_code in (204, 404)
+    assert upserted.status_code == 200
 
 
 async def test_chatter_me_and_apex_rest_not_found(admin: Actor) -> None:

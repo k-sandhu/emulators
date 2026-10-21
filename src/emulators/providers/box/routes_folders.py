@@ -123,9 +123,17 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         body = await json_body(request)
         name = validate_name(require_str(body, "name"))
         parent = p.get_item("folder", ref_id(body, "parent"), access.UPLOAD)
+        sync_state = body.get("sync_state", "not_synced")
+        if not isinstance(sync_state, str) or sync_state not in SYNC_STATES:
+            raise errors.invalid_parameter(
+                "sync_state", f"sync_state must be one of {', '.join(SYNC_STATES)}"
+            )
+        if "folder_upload_email" in body:
+            upload_email_access(body["folder_upload_email"])
         now = now_iso(ctx)
         record = ops.create_folder(p, parent, name, now)
-        if isinstance(body.get("folder_upload_email"), dict):
+        record["sync_state"] = sync_state
+        if "folder_upload_email" in body:
             record["folder_upload_email"] = upload_email(record, body["folder_upload_email"])
         await events.emit(p, "ITEM_CREATE", record)
         return created(api.shaper(p, request).folder(record, parse_fields(request)))
@@ -273,7 +281,7 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         return no_content()
 
 
-def upload_email(record: Record, value: Any) -> Record | None:
+def upload_email_access(value: Any) -> str | None:
     if value is None:
         return None
     level = value.get("access") if isinstance(value, dict) else None
@@ -281,6 +289,13 @@ def upload_email(record: Record, value: Any) -> Record | None:
         raise errors.invalid_parameter(
             "folder_upload_email.access", "access must be 'open' or 'collaborators'"
         )
+    return level
+
+
+def upload_email(record: Record, value: Any) -> Record | None:
+    level = upload_email_access(value)
+    if level is None:
+        return None
     existing = record.get("folder_upload_email")
     address = existing["email"] if existing else f"upload.{record['id']}@u.box.com"
     return {"access": level, "email": address}

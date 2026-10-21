@@ -406,3 +406,13 @@ faults on `/oauth2/*` are OAuth-shaped.
   `/s/<hash>` has a (minimal HTML) landing page; password-protected landing pages are not interactive.
 * Seeded ids are derived from the world (stable across runs); runtime ids count up from fixed bases
   (files `5000000000001`, folders `500000000001`, versions `9000000000001`).
+
+## Folder creation validation
+
+The [create-folder contract](https://developer.box.com/reference/post-folders/) supports
+`sync_state` and `folder_upload_email.access`. Both are validated before the folder
+or its parent's metadata changes. A rejected request does not reserve the requested
+name. Valid sync state and upload-email options persist and are available through
+the usual `fields` projection. HTTP regressions are in
+`tests/providers/box/test_review_creation.py`; the official `box-sdk-gen` suite verifies
+the same options through its generated create/retrieve methods.

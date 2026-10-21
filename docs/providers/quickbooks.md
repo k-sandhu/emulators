@@ -127,7 +127,11 @@ Payments require TotalAmt, enforce linked-party consistency, and cannot apply mo
 than their total. Unapplied payments reduce customer balances. Customer/account
 balances roll up through nested ancestors; renamed parents update descendant names.
 Invoices derive default due dates from TxnDate and terms (including due on receipt).
-Replacing lines recalculates tax; PDF caches invalidate when transactions change.
+Replacing lines recalculates tax; sales lines without `ItemRef` are documentation
+whose amounts and tax do not contribute to totals. PDF caches invalidate when transactions change.
+Invoice deposits debit `DepositToAccountRef` (default Undeposited Funds) and reduce
+receivables alongside invoice/customer balances. Edits and voids reverse these postings;
+cash-basis P&L recognises the deposited share on the invoice date.
 
 ### Query language
 
@@ -265,6 +269,9 @@ The audit checked [Intuit's query restrictions and escaping](https://help.develo
 [Invoice delete/void contracts](https://developer.intuit.com/docs/api/accounting/invoice),
 [Payment required fields](https://developer.intuit.com/app/developer/qbo/docs/api/accounting/all-entities/payment),
 and [OAuth authorization](https://developer.intuit.com/app/developer/qbo/docs/develop/authentication-and-authorization/oauth-2.0).
+Deposit posting and itemless-line handling follow the
+[Invoice reference](https://developer.intuit.com/docs/api/accounting/invoice) and
+[SalesItemLineDetail contract](https://static.developer.intuit.com/sdkdocs/qbv3doc/ippdotnetdevkitv3/html/0efbacc4-d46c-1b41-513e-6eca01825ab4.htm).
 The original field-projection and cross-client refresh tests were corrected to follow
 these contracts. An in-process adversarial probe sent 2,296 malformed-field requests
 after fixes with no exceptions or 500 responses; seed construction was about 0.2 seconds.
@@ -272,7 +279,6 @@ Regression tests cover malformed bodies and nested fields across every entity, m
 atomicity, payment reversals, auth isolation, query ordering/escaping, default XML,
 webhook filtering, reports and SDK flows.
 
-Final validation: 124 QuickBooks provider tests, 7 QuickBooks SDK tests and all
-10 end-to-end tests passed. A clean full-suite run finished with **3,557 passed,
-1 skipped** (the optional MP4 parser check needs `mutagen`). Ruff checks and
-format checks passed on the QuickBooks paths; a secret-pattern scan found no hits.
+Latest provider validation: 129 QuickBooks provider tests and 7 QuickBooks SDK tests
+passed using `uv run --frozen pytest`; Ruff lint and formatting checks passed on
+the QuickBooks paths. The integration coordinator runs the complete repository suite.

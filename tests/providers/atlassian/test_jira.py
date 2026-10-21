@@ -61,6 +61,37 @@ async def test_myself_projects_users_and_issue_wire_shapes(
     assert set(projected["fields"]) == {"summary", "status"}
 
 
+@pytest.mark.parametrize("parent_first", [True, False])
+async def test_epics_cannot_parent_other_epics(
+    client: httpx.AsyncClient, auth: dict[str, str], parent_first: bool
+) -> None:
+    parent = await create_issue(client, auth, issuetype={"name": "Epic"})
+    fields = {
+        "project": {"key": "OPS"},
+        "summary": "Invalid epic child",
+        **(
+            {"parent": {"key": parent["key"]}, "issuetype": {"name": "Epic"}}
+            if parent_first
+            else {
+                "issuetype": {"name": "Epic"},
+                "parent": {"key": parent["key"]},
+            }
+        ),
+    }
+    response = await client.post(JIRA + "/issue", headers=auth, json={"fields": fields})
+    assert response.status_code == 400
+    assert "errorMessages" in response.json()
+    child = await create_issue(client, auth, parent={"key": parent["key"]})
+    before = (await client.get(child["self"], headers=auth)).json()
+    update = await client.put(
+        child["self"],
+        headers=auth,
+        json={"fields": {"summary": "Must not change", "issuetype": {"name": "Epic"}}},
+    )
+    assert update.status_code == 400
+    assert (await client.get(child["self"], headers=auth)).json() == before
+
+
 @pytest.mark.parametrize("method", ["get", "post"])
 async def test_jql_paging_projection_current_user_and_updates(
     client: httpx.AsyncClient, auth: dict[str, str], method: str

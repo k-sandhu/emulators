@@ -154,7 +154,9 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         auth = require_auth(request, ctx)
         record = _mg_or_404(ctx, auth, sid)
         params, _ = await form_params(request)
-        _apply_mg(record, params)
+        updated = dict(record)
+        _apply_mg(updated, params)
+        record.update(updated)
         _touch_iso(ctx, record)
         return render_messaging_service(record, request, ctx)
 
@@ -267,7 +269,9 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         auth = require_auth(request, ctx)
         record = _vs_or_404(ctx, auth, sid)
         params, _ = await form_params(request)
-        _apply_verify_service(record, params)
+        updated = dict(record)
+        _apply_verify_service(updated, params)
+        record.update(updated)
         _touch_iso(ctx, record)
         return render_verify_service(record, request, ctx)
 
@@ -304,14 +308,12 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
                 raise invalid_param("CustomCode", custom, code=60200)
             if not re.fullmatch(r"\d{4,10}", custom):
                 raise invalid_param("CustomCode", custom, code=60200)
-        code_length = int(service.get("code_length") or 6)
-        code = custom or ctx.ids.digits(code_length, leading_nonzero=False).rjust(code_length, "0")
         now = ctx.clock.now()
         key = to.removeprefix("whatsapp:")
         attempt = {"time": iso8601(now), "channel": channel, "attempt_sid": "VL" + ctx.ids.hex(32)}
 
         # A second start for the same recipient while one is pending re-sends on the SAME
-        # verification (new code, one more send attempt) until the send limit is hit.
+        # verification. Twilio preserves the code and original expiry on each resend.
         record = next(
             (
                 v
@@ -325,10 +327,11 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
                 raise fail(429, 60203, "Max send attempts reached")
             record["send_code_attempts"].append(attempt)
             record["channel"] = channel
-            record["code"] = code
-            record["expires_at"] = isoformat_z(utc(now) + VERIFICATION_TTL)
+            code = record["code"]
             record["date_updated"] = iso8601(now)
         else:
+            code_length = int(service.get("code_length") or 6)
+            code = custom or ctx.ids.digits(code_length, leading_nonzero=False).rjust(code_length, "0")
             sid_ = new_sid(ctx, "VE", "verifications")
             record = {
                 "id": sid_,

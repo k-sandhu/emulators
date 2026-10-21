@@ -248,13 +248,27 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         principal = authenticate(ctx, request)
         admin = principal.authorize(LIST_UPCOMING)
         host = lookup.acting_user(ctx, principal, user_id, admin_level=admin)
+        now = ctx.clock.now()
+        until = now + timedelta(hours=24)
         rows = []
         for m in meetings:
-            if m["host_id"] != host["id"]:
-                continue
             if m["type"] == 1:
                 continue
-            for occ in upcoming_occurrences(m, ctx.clock.now()):
+            invited = any(
+                entry.get("email", "").lower() == host["email"].lower()
+                for entry in m["settings"].get("meeting_invitees", [])
+            )
+            world_ids = m.get("_world_meeting_ids", [])
+            world_invited = {
+                isoformat_z(wm.start)
+                for wm in world.meetings
+                if wm.id in world_ids and host.get("_person_id") in wm.all_attendee_ids()
+            }
+            for occ in upcoming_occurrences(m, now):
+                if parse_instant(occ["start_time"]) >= until:
+                    continue
+                if m["host_id"] != host["id"] and not invited and occ["start_time"] not in world_invited:
+                    continue
                 rows.append(
                     {
                         "id": m["id"],

@@ -355,6 +355,8 @@ def validate_fields(
                     "issuetype": parent["fields"]["issuetype"],
                 },
             }
+    if result.get("parent") and result["issuetype"]["name"] == "Epic":
+        fail(request, 400, "An epic cannot have another epic as its parent.")
     return result
 
 

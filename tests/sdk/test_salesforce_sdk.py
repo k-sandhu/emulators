@@ -154,7 +154,7 @@ def test_error_classes_carry_salesforce_error_arrays(sf: Salesforce) -> None:
 
 def test_external_id_upsert_and_get_by_custom_id(sf: Salesforce) -> None:
     assert sf.Account.upsert("QuickBooks_Customer_Id__c/QB-SDK-1", {"Name": "Upserted via SDK"}) == 201
-    assert sf.Account.upsert("QuickBooks_Customer_Id__c/QB-SDK-1", {"Rating": "Warm"}) == 204
+    assert sf.Account.upsert("QuickBooks_Customer_Id__c/QB-SDK-1", {"Rating": "Warm"}) == 200
     got = sf.Account.get_by_custom_id("QuickBooks_Customer_Id__c", "QB-SDK-1")
     assert got["Name"] == "Upserted via SDK" and got["Rating"] == "Warm"
     raw = sf.Account.upsert("QuickBooks_Customer_Id__c/QB-SDK-2", {"Name": "Second"}, raw_response=True)

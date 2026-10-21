@@ -103,7 +103,7 @@ there is no cursor in the response body. Preserve the next URL as returned.
 | GET | `/v1/licenses` | Meetings license capacity; admin scope |
 | GET | `/avatars/{id}.png` | Lazily generated, cached PNG |
 | GET | `/v1/meetings` | `meetingType` (default `meetingSeries`), `state`, `from`, `to`, `hostEmail`, `meetingSeriesId`, `siteUrl`, `max` |
-| POST | `/v1/meetings` | Title, agenda, start/end, timezone, invitees, password, auto-record; admin hostEmail |
+| POST | `/v1/meetings` | Title, agenda, start/end, timezone, invitees, password, auto-record; admin hostEmail; invalid response timezone headers reject before creating schedules or invitees |
 | GET | `/v1/meetings/{id}` | Series, scheduled meeting or ended instance |
 | PUT, PATCH | `/v1/meetings/{id}` | Update series/schedule; PATCH `agenda:null` removes agenda; replace invitees when supplied |
 | DELETE | `/v1/meetings/{id}` | Host/admin; series deletion removes schedules/invitees; ended instances are rejected; 204 |

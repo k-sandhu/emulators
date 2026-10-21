@@ -79,6 +79,7 @@ def validate(ctx: ProviderContext, kind: str, payload: dict[str, Any]) -> None:
             if (
                 not isinstance(operator, str)
                 or operator not in OPERATORS
+                or not isinstance(name, str)
                 or not ctx.store[f"properties:{kind}"].get(name)
             ):
                 fail(400, "Invalid property or search operator.")
@@ -114,7 +115,11 @@ def validate(ctx: ProviderContext, kind: str, payload: dict[str, Any]) -> None:
             name, direction = sort.get("propertyName"), sort.get("direction", "ASCENDING")
         else:
             fail(400, "Invalid sort rule.")
-        if not ctx.store[f"properties:{kind}"].get(name) or direction not in ("ASCENDING", "DESCENDING"):
+        if (
+            not isinstance(name, str)
+            or not ctx.store[f"properties:{kind}"].get(name)
+            or direction not in ("ASCENDING", "DESCENDING")
+        ):
             fail(400, "Invalid sort property or direction.")
     if not isinstance(payload.get("query", ""), str) or len(payload.get("query", "")) > 3000:
         fail(400, "Invalid search query.")
@@ -137,9 +142,9 @@ def matches_filter(ctx: ProviderContext, kind: str, props: dict[str, str], item:
     wanted = comparable(ctx, kind, name, item["value"])
     if op in ("CONTAINS_TOKEN", "NOT_CONTAINS_TOKEN"):
         pattern = "^" + re.escape(str(wanted)).replace(r"\*", ".*") + "$"
-        found = any(
-            re.fullmatch(pattern, token, re.IGNORECASE) for token in re.findall(r"[\w@.\-]+", str(raw))
-        )
+        definition = ctx.store[f"properties:{kind}"].get(name)
+        flags = 0 if definition["type"] == "enumeration" else re.IGNORECASE
+        found = any(re.fullmatch(pattern, token, flags) for token in re.findall(r"[\w@.\-]+", str(raw)))
         return found if op == "CONTAINS_TOKEN" else not found
     if op == "BETWEEN":
         return wanted <= value <= comparable(ctx, kind, name, item["highValue"])

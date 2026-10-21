@@ -444,7 +444,11 @@ def register(api: Api) -> None:
             body = {k: v for k, v in data.items() if k != "attributes"}
             rec = dml.update(obj.name, matches[0]["Id"], body)
             mark_referenced(req, obj, rec)
+            if float(req.version) >= 46:
+                return json_response({**create_result(rec["Id"]), "created": False})
             return no_content()
+        if float(req.version) >= 61 and (req.q("updateOnly") or "").lower() == "true":
+            raise not_found()
         f = obj.field(field_name)
         if f is None or f.name == "Id":
             raise not_found()
@@ -452,7 +456,10 @@ def register(api: Api) -> None:
         rec = dml.insert(obj.name, body)
         mark_referenced(req, obj, rec)
         location = f"/services/data/v{req.version}/sobjects/{obj.name}/{rec['Id']}"
-        return json_response(create_result(rec["Id"]), 201, {"Location": location})
+        result = create_result(rec["Id"])
+        if float(req.version) >= 46:
+            result["created"] = True
+        return json_response(result, 201, {"Location": location})
 
     @r.route("DELETE", "sobjects/{type}/{a}/{b:path}")
     def delete_external(req: ApiRequest) -> ApiResponse:

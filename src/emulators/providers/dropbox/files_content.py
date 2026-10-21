@@ -154,17 +154,24 @@ def upload(c: m.Call) -> Any:
         raise api_error(tag("payload_too_large"))
     verify_hash(a, c.body)
     session_id = "pid_upload_session:" + m.new_token(c.ctx, "session", 40)
-    rec = commit_file(
-        c,
-        path,
-        c.body,
-        mode=mode,
-        mode_rev=mode_rev,
-        autorename_=a.bool("autorename"),
-        client_modified=a.ts("client_modified"),
-        strict_conflict=a.bool("strict_conflict"),
-        fail=upload_fail(session_id),
-    )
+    try:
+        rec = commit_file(
+            c,
+            path,
+            c.body,
+            mode=mode,
+            mode_rev=mode_rev,
+            autorename_=a.bool("autorename"),
+            client_modified=a.ts("client_modified"),
+            strict_conflict=a.bool("strict_conflict"),
+            fail=upload_fail(session_id),
+        )
+    except EmulatorError as exc:
+        if isinstance(exc.body, dict) and exc.body.get("error", {}).get(".tag") == "path":
+            # UploadWriteFailed promises these bytes can be committed using the returned ID.
+            sess = new_session(c, close=False, session_id=session_id)
+            append_chunk(c, sess, 0, c.body, None)
+        raise
     return m.leaf(m.file_metadata(c, rec))
 
 
@@ -176,8 +183,10 @@ def session_data(c: m.Call, sess: dict[str, Any]) -> bytes:
     return b"".join(blobs.get(key) for _, key, _ in sorted(sess["parts"]))
 
 
-def new_session(c: m.Call, *, close: bool, kind: str = "sequential") -> dict[str, Any]:
-    sid = "pid_upload_session:" + m.new_token(c.ctx, "session", 40)
+def new_session(
+    c: m.Call, *, close: bool, kind: str = "sequential", session_id: str | None = None
+) -> dict[str, Any]:
+    sid = session_id or "pid_upload_session:" + m.new_token(c.ctx, "session", 40)
     sess = {
         "id": sid,
         "account": c.actor.id,

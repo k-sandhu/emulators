@@ -248,8 +248,18 @@ Google-only hub; cross-system regression coverage lives in
   do not exist locally. Building resources are read-only world office projections.
 - The remaining Docs API (styles, tables, tabs, named ranges, suggestions and other batch
   request types) is outside this minimal implementation.
+  Non-body segments are unavailable. `targetRevisionId` does not perform historical
+  collaborator-change merging; use `requiredRevisionId` for optimistic concurrency.
 
 ## Validation and references
+
+Docs edit regressions in `tests/providers/google/test_review_docs.py` follow the
+[request unions and insertion rules](https://developers.google.com/workspace/docs/api/reference/rest/v1/documents/request)
+and [atomic batch/write-control contract](https://developers.google.com/workspace/docs/api/reference/rest/v1/documents/batchUpdate).
+Each operation and insertion location is unambiguous, missing document segments are
+rejected, and Google-documented control/private-use characters are stripped from
+inserted text. Invalid batches retain the prior content and revision. The official
+discovery-client suite also checks rejection and normalized text through the SDK.
 
 Provider tests cover HTTP auth, OIDC, Directory hierarchy, group membership, Drive ACLs,
 queries/fields, downloads, exports, uploads, file mutations, revisions, push channels,

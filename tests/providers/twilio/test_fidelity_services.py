@@ -189,6 +189,45 @@ async def test_verifications_expire_after_ten_minutes(twilio: httpx.AsyncClient)
     assert gone.status_code == 404 and gone.json()["code"] == 20404
 
 
+async def test_verify_resend_preserves_original_code_and_expiry(twilio: httpx.AsyncClient) -> None:
+    sid = (await seeded_verify_service(twilio))["sid"]
+    hub = twilio.hub  # type: ignore[attr-defined]
+    hub.clock.freeze()
+    first = (await start(twilio, sid)).json()
+    record = hub.context("twilio").store.collection("verifications").get(first["sid"])
+    code, expiry = record["code"], record["expires_at"]
+    hub.clock.advance(timedelta(minutes=9))
+    again = await start(twilio, sid)
+    assert again.status_code == 201 and again.json()["sid"] == first["sid"]
+    assert record["code"] == code
+    assert record["expires_at"] == expiry
+    messages = (await twilio.get(messages_url(twilio), params={"To": CONTACT})).json()["messages"]
+    assert code in messages[0]["body"]
+    hub.clock.advance(timedelta(minutes=1))
+    expired = await check(twilio, sid, code)
+    assert expired.status_code == 404
+    fresh = (await start(twilio, sid)).json()
+    assert fresh["sid"] != first["sid"]
+
+
+@pytest.mark.parametrize(
+    ("host", "version", "changes"),
+    [
+        (MESSAGING, "v1", {"FriendlyName": "Changed", "ValidityPeriod": "0"}),
+        (VERIFY, "v2", {"FriendlyName": "Changed", "CodeLength": "3"}),
+    ],
+)
+async def test_rejected_service_update_is_atomic(
+    twilio: httpx.AsyncClient, host: str, version: str, changes: dict[str, str]
+) -> None:
+    services = (await twilio.get(f"{host}/{version}/Services")).json()["services"]
+    url = f"{host}/{version}/Services/{services[0]['sid']}"
+    before = (await twilio.get(url)).json()
+    rejected = await twilio.post(url, data=changes)
+    assert rejected.status_code == 400
+    assert (await twilio.get(url)).json() == before
+
+
 async def test_verify_service_defaults(twilio: httpx.AsyncClient) -> None:
     created = (await twilio.post(f"{VERIFY}/v2/Services", data={"FriendlyName": "Plain"})).json()
     assert created["lookup_enabled"] is False  # real default; the seeded service turns it on

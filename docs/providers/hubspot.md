@@ -140,7 +140,11 @@ Up to five groups, six filters per group, and 18 filters in total are accepted.
 Sorts accept a property string (prefix `-` for descending) or
 `{"propertyName":"amount","direction":"DESCENDING"}`. Search stops at 10,000
 results; archived objects are excluded. Numeric/date comparisons use property types;
-enumeration comparisons preserve case. Search sees writes immediately.
+enumeration comparisons preserve case for every operator, including token searches.
+The complete search request body is limited to 3,000 characters, including filters.
+Search sees writes immediately.
+These limits and enumeration case rules follow the official
+[CRM Search guide](https://developers.hubspot.com/docs/api-reference/latest/crm/search-the-crm).
 
 All values are stored as HubSpot property strings. Dates/datetimes accept ISO values
 or epoch milliseconds. Requested existing properties without a value return null;

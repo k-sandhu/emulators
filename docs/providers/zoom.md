@@ -117,7 +117,7 @@ IDs: `{userId}` is a 22-char user id, an email, or `me`. `{meetingId}` is 10-11 
 | GET / POST / PATCH / DELETE | `/v2/groups`, `/v2/groups/{id}` | Department, role and "All Staff" world groups. |
 | GET / POST / DELETE | `/v2/groups/{id}/members`, `/members/{memberId}` | `group_ids` on users stay in sync. |
 | GET | `/v2/users/{userId}/meetings` | `type` scheduled\|live\|upcoming\|upcoming_meetings\|previous_meetings, `from`/`to`, `timezone`, paging. Series appear once (type 8). Instant meetings are excluded; upcoming/previous are based on scheduled times, including meetings that were never started. |
-| GET | `/v2/users/{userId}/upcoming_meetings` | One row per upcoming occurrence. |
+| GET | `/v2/users/{userId}/upcoming_meetings` | One row per occurrence in the next 24 hours, including meetings hosted by the user and invitations from the world or `settings.meeting_invitees`. |
 | POST | `/v2/users/{userId}/meetings` | `topic`, `type` 1\|2\|3\|8, `start_time` (`...Z` = GMT, bare = local in `timezone`), `duration` (1..1440), `password`, `default_password`, `agenda`, `recurrence`, `settings`, `schedule_for`. `201` with `start_url` (zak), `join_url ...?pwd=`, password fields, settings, occurrences. Recurrence supports up to 60 occurrences. Emits `meeting.created`. |
 | GET | `/v2/meetings/{meetingId}` | `occurrence_id`, `show_previous_occurrences`. Occurrences default to the ones still to come. |
 | PATCH / DELETE | `/v2/meetings/{meetingId}` | `204`; type updates persist; `occurrence_id` edits/deletes one occurrence (including agenda/settings overrides); emit `meeting.updated` (with `old_object`) / `meeting.deleted`. |

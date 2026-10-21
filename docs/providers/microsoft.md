@@ -97,7 +97,7 @@ the shared account picker lists active employees. The form-post response submits
 | DELETE | `/groups/{id}/members/{id}/$ref`, `/groups/{id}/owners/{id}/$ref` | Owner or tenant admin; final owner cannot be removed |
 | GET | `/users/$count`, `/groups/$count`, `/groups/{id}/members/$count` | Plain text; `ConsistencyLevel: eventual` required; other directory relationships also support count |
 | GET | `/groups/{id}/members/microsoft.graph.user`, `/me/memberOf/microsoft.graph.group` | User/group casts on directory relationship collections, including transitive variants |
-| POST | `/$batch` | Up to 20 requests; dependencies, failure propagation, same-app dispatch; canonical content headers, no subresponse Content-Length, binary bodies base64 encoded |
+| POST | `/$batch` | Up to 20 requests; case-insensitive IDs/dependencies, failure propagation, same-app dispatch; canonical content headers, no subresponse Content-Length, binary request bodies decoded from base64url and binary responses base64 encoded |
 
 Directory collections default to 100 records, capped at 999. OData filtering, ordering,
 selection, searching and skip-token paging use the shared OData engine. `$search` and
@@ -285,6 +285,22 @@ The subscription lifetime table currently lists 10,080 minutes for Outlook; this
 uses the brief's confirmed 10,070-minute boundary, with tests at and above the boundary.
 
 ## Reference and verification
+
+Batch validation follows the official [JSON batching reference](https://learn.microsoft.com/en-us/graph/json-batching):
+IDs are unique without regard to case, bodies require an explicit Content-Type, and
+binary request bodies are base64url decoded before reaching the resource handler.
+Header names and values are checked against
+[HTTP field syntax](https://www.rfc-editor.org/rfc/rfc9110.html#section-5.5) before
+dispatch; control characters and unencodable values receive Graph-shaped 400 errors,
+while HTTP token punctuation, horizontal tabs, and Latin-1 field bytes are preserved.
+The full JSON envelope rejects nonfinite numbers and invalid Unicode before writes.
+URLs and JSON bodies are serialized during preflight; malformed Unicode or an
+unbuildable URL receives a Graph-shaped 400, while valid Unicode paths/text work.
+The entire batch structure and dependency graph are checked before dispatch, so a
+malformed batch cannot leave an earlier write applied. Valid batches remain a set
+of separate requests; individual failures do not roll back successful requests.
+`tests/providers/microsoft/test_batch.py` covers those contracts and binary download
+verification after a batch upload.
 
 Wire shapes follow the official [users reference](https://learn.microsoft.com/en-us/graph/api/user-list?view=graph-rest-1.0),
 [authorization-code protocol](https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-auth-code-flow),

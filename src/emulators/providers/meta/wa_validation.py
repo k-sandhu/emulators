@@ -137,6 +137,20 @@ def send_payload(ctx: ProviderContext, kind: str, payload: Any) -> Any:
         itype = string_value(ctx, payload.get("type"), "interactive.type")
         if itype not in ("button", "list"):
             invalid_param(ctx, "Supported interactive types are button and list.")
+        if "header" in payload:
+            header = object_value(ctx, payload["header"], "interactive.header")
+            htype = string_value(ctx, header.get("type"), "interactive.header.type")
+            if htype == "text":
+                string_value(ctx, header.get("text"), "interactive.header.text", maximum=60)
+            elif itype == "button" and htype in ("image", "video", "document"):
+                media_ref(ctx, object_value(ctx, header.get(htype), f"header.{htype}"), htype)
+            else:
+                invalid_param(
+                    ctx, "List headers must be text; button headers support text, image, video or document."
+                )
+        if "footer" in payload:
+            footer = object_value(ctx, payload["footer"], "interactive.footer")
+            string_value(ctx, footer.get("text"), "interactive.footer.text", maximum=60)
         body = object_value(ctx, payload.get("body"), "interactive.body")
         string_value(ctx, body.get("text"), "interactive.body.text", maximum=1024)
         action = object_value(ctx, payload.get("action"), "interactive.action")
@@ -169,6 +183,8 @@ def send_payload(ctx: ProviderContext, kind: str, payload: Any) -> Any:
                     row = object_value(ctx, raw_row, "row")
                     ids.append(string_value(ctx, row.get("id"), "row.id", maximum=200))
                     string_value(ctx, row.get("title"), "row.title", maximum=24)
+                    if "description" in row:
+                        string_value(ctx, row["description"], "row.description", maximum=72, empty=True)
             if not sections or count > 10 or len(ids) != len(set(ids)):
                 invalid_param(ctx, "A list must have 1-10 rows with unique ids.")
     return payload

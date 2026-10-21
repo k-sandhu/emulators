@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import re
+from datetime import timedelta
 from typing import Any
 
 import httpx
 
+from emulators.core.clock import isoformat_z, parse_instant
 from tests.providers.zoom.conftest import (
     ADVISORY_ID,
     BLUEFIN_ID,
@@ -462,15 +464,36 @@ async def test_registrants_require_registration_to_be_enabled(
     ).status_code == 204
 
 
-async def test_upcoming_meetings_endpoint(zoom: httpx.AsyncClient, host: dict[str, str]) -> None:
-    body = (await zoom.get(f"{V2}/users/me/upcoming_meetings", headers=host)).json()
-    assert (
-        body["total_records"] == len(body["meetings"]) == 9
-    )  # two more occurrences per series; one is cancelled
+async def test_upcoming_meetings_endpoint(zoom: httpx.AsyncClient, staff: dict[str, str], ctx: Any) -> None:
+    ctx.clock.freeze()
+    now = ctx.clock.now()
+    expected = await create(zoom, staff, start_time=isoformat_z(now + timedelta(hours=2)))
+    later = await create(zoom, staff, start_time=isoformat_z(now + timedelta(hours=25)))
+    body = (await zoom.get(f"{V2}/users/me/upcoming_meetings", headers=staff)).json()
+    assert body["total_records"] == len(body["meetings"])
+    ids = {meeting["id"] for meeting in body["meetings"]}
+    assert expected["id"] in ids and later["id"] not in ids
+    assert all(
+        now <= parse_instant(row["start_time"]) < now + timedelta(hours=24) for row in body["meetings"]
+    )
     assert {"id", "topic", "type", "start_time", "duration", "timezone", "join_url"} <= set(
         body["meetings"][0]
     )
     assert [m["start_time"] for m in body["meetings"]] == sorted(m["start_time"] for m in body["meetings"])
+
+
+async def test_upcoming_meetings_includes_invited_user(
+    zoom: httpx.AsyncClient, host: dict[str, str], staff: dict[str, str], ctx: Any
+) -> None:
+    meeting = await create(
+        zoom,
+        host,
+        start_time=isoformat_z(ctx.clock.now() + timedelta(hours=2)),
+        settings={"meeting_invitees": [{"email": STAFF}]},
+    )
+    body = (await zoom.get(f"{V2}/users/me/upcoming_meetings", headers=staff)).json()
+    assert meeting["id"] in {row["id"] for row in body["meetings"]}
+    assert all("start_url" not in row and "password" not in row for row in body["meetings"])
 
 
 async def test_granular_scopes_work_like_classic_ones(zoom: httpx.AsyncClient) -> None:
