@@ -74,7 +74,9 @@ async def test_authorization_code_pkce_refresh_and_replay(make_client: Callable[
         bad = await client.post(f"{LOGIN}/common/oauth2/v2.0/token", data=data)
         assert bad.status_code == 400 and bad.json()["error"] == "invalid_grant"
         data["code_verifier"] = verifier
+        issued_before = client.hub.clock.timestamp()
         result = await client.post(f"{LOGIN}/common/oauth2/v2.0/token", data=data)
+        issued_after = client.hub.clock.timestamp()
         assert result.status_code == 200, result.text
         body = result.json()
         claims = jwt.decode(
@@ -87,7 +89,7 @@ async def test_authorization_code_pkce_refresh_and_replay(make_client: Callable[
         assert claims["scp"] == "User.Read Mail.Read"
         assert claims["tid"] == client.hub.world.org.microsoft_tenant_id
         assert claims["exp"] - claims["iat"] == 3600
-        assert abs(claims["iat"] - client.hub.clock.timestamp()) <= 1
+        assert issued_before <= claims["iat"] <= issued_after
         id_claims = jwt.decode(body["id_token"], options={"verify_signature": False})
         assert id_claims["nonce"] == "opaque-nonce"
         assert (await client.get(f"{GRAPH}/v1.0/me", headers=bearer(body["access_token"]))).json()[
