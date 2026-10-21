@@ -191,6 +191,21 @@ create balance transactions with a fee rounded in cents from `amount × 0.029 + 
 Refund totals cannot exceed captured funds. The failed-refund card leaves charge
 refund totals unchanged. Disputes withdraw the amount plus a synthetic $15 fee.
 
+Confirmation applies `capture_method`, `receipt_email`, `shipping`, and
+`setup_future_usage` before the payment attempt. Receipt and shipping details
+propagate to the resulting charge; future-use settings attach the card to the
+intent's customer after successful authorization. A publishable-key confirmation
+can change an existing future-use setting only from `on_session` to `off_session`.
+
+For either supported 3DS card, `error_on_requires_action=true` or
+`off_session=true` declines an unauthenticated payment with a 402
+`authentication_required` card error. The failed charge and
+`payment_intent.payment_failed` event persist, no funds enter the balance, and
+the intent returns to `requires_payment_method`. Idempotent retries replay that
+failure without creating another charge or event. An on-session retry can
+authenticate the card or select a different one. Manual confirmation still
+requires a secret-key reconfirmation after the `complete_3ds` action.
+
 | Test card | Outcome |
 | --- | --- |
 | `4242424242424242`, `5555555555554444`, `378282246310005` | Success |
@@ -364,9 +379,12 @@ webhook configuration, multipart uploads, events, balance, and test clocks throu
 `emulator_intercept`. HTTP tests also verify official SDK webhook signatures,
 retries, permission denials, prefix routing, real PDF bytes, and accounting effects.
 
-The focused suites pass: **118 HTTP tests, 12 official SDK tests, and 10 end-to-end
-tests**. Ruff check and format checks cover only the provider and its tests,
-respecting ownership of the shared working tree. The adversarial HTTP suite exercises
+The focused suites pass: **137 HTTP tests and 13 official SDK tests**. The
+confirmation regressions cover both 3DS cards, create-and-confirm and separate
+confirmation calls, failed-payment accounting and events, idempotent failure
+replay, recovery, confirmation parameter propagation, and publishable-key
+future-use restrictions. Ruff check and format checks cover the provider and its
+tests. The adversarial HTTP suite also exercises
 malformed writes across resource areas, failed-validation atomicity, scoped and
 publishable-key denials, OAuth lifecycle, deleted records, Unicode uploads, and
 billing consistency. A separate 281-request in-process fuzz pass completed without
@@ -374,6 +392,7 @@ server exceptions after the fixes.
 
 
 Reference contracts: [PaymentIntents](https://docs.stripe.com/api/payment_intents/confirm),
+[card authentication failures](https://docs.stripe.com/payments/save-card-without-authentication),
 [modern invoices](https://docs.stripe.com/api/invoices/object?api-version=2025-09-30.clover),
 [subscriptions](https://docs.stripe.com/api/subscriptions/object?api-version=2025-09-30.clover),
 [idempotency](https://docs.stripe.com/api/idempotent_requests), and

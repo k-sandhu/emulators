@@ -23,9 +23,12 @@ from typing import Any
 import httpx
 import pytest
 
+from emulators.core.clock import parse_instant
 from emulators.core.hub import EmulatorHub
 
 ANCHOR = "2026-10-16"
+MESSAGING_TIME = parse_instant(f"{ANCHOR}T12:00:00Z")
+MESSAGING_PROVIDERS = {"meta", "twilio"}
 # Pin the world for the plugin's session hub (emulator_server / emulator_intercept) too.
 os.environ.setdefault("EMULATORS_ANCHOR", ANCHOR)
 if os.name == "nt":
@@ -51,9 +54,22 @@ def make_hub() -> Callable[..., EmulatorHub]:
         hub = _hub(tuple(providers))
         hub.reset()
         hub.webhook_transport = None
+        if MESSAGING_PROVIDERS.intersection(providers) and not os.environ.get("EMULATORS_CLOCK"):
+            # Messaging windows and scheduled sends must not age with the calendar.
+            hub.clock.freeze(MESSAGING_TIME)
         return hub
 
     return factory
+
+
+@pytest.fixture
+def emulators(emulator_hub: EmulatorHub, request: pytest.FixtureRequest) -> EmulatorHub:
+    """Pin messaging SDK fixtures while retaining live timestamps for webhook verifiers."""
+    emulator_hub.reset()
+    messaging_sdk = any(request.path.stem.startswith(f"test_{provider}_") for provider in MESSAGING_PROVIDERS)
+    if messaging_sdk and not os.environ.get("EMULATORS_CLOCK"):
+        emulator_hub.clock.freeze(MESSAGING_TIME)
+    return emulator_hub
 
 
 @pytest.fixture
