@@ -173,6 +173,12 @@ def compute_totals(ctx: ProviderContext, entity: str, record: dict[str, Any]) ->
         for idx, line in enumerate(lines, start=1):
             if line.get("DetailType") == "SalesItemLineDetail":
                 detail = line.setdefault("SalesItemLineDetail", {})
+                if not ref_value(detail.get("ItemRef")):
+                    # Intuit treats itemless sales lines as documentation, ignoring their amount.
+                    line.setdefault("Id", str(idx))
+                    line.setdefault("LineNum", idx)
+                    sales_lines.append(line)
+                    continue
                 item = collection(ctx, "Item").get(ref_value(detail.get("ItemRef")))
                 detail.setdefault("Qty", 1)
                 detail.setdefault("UnitPrice", (item or {}).get("UnitPrice", 0))
@@ -646,7 +652,7 @@ def void_entity(
     existing["_voided"] = True
     if entity == "Invoice":
         unlink_invoice(ctx, str(record_id))
-    for key in ("TotalAmt", "Balance", "UnappliedAmt"):
+    for key in ("TotalAmt", "Balance", "UnappliedAmt", "Deposit"):
         if key in existing:
             existing[key] = 0.0
     for line in existing.get("Line") or []:

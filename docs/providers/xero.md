@@ -311,7 +311,10 @@ standard `/_emulator/tokens` route.
 - Webhooks use the core retry schedule rather than Xero's 24-hour retry/replay
   schedule. A provider supports one configured webhook subscription.
 - Invoice-line updates replace the line-item array rather than merging partial
-  individual lines. Transfer-side tracking and newer credit-note webhook schemas
+  individual lines. Paid/credited invoices reject line, contact and tax-mode edits;
+  Xero additionally permits some non-financial line edits and contact changes after
+  ordinary payments. Tax-mode edits on unsettled documents recompute generated tax.
+  Transfer-side tracking and newer credit-note webhook schemas
   are not implemented.
 
 ## Verification and references

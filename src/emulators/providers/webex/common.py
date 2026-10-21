@@ -168,12 +168,17 @@ def public(record: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in record.items() if not k.startswith("_")}
 
 
-def time_wire(request: Request, record: dict[str, Any]) -> dict[str, Any]:
-    """Meeting APIs use the timezone header for timestamps, independently of scheduling timezone."""
+def response_timezone(request: Request) -> ZoneInfo:
+    """Validate response options before meeting writes commit their state."""
     try:
-        zone = ZoneInfo(request.headers.get("timezone", "UTC"))
+        return ZoneInfo(request.headers.get("timezone", "UTC"))
     except (ValueError, OSError, ZoneInfoNotFoundError):
         return fail(400, "Invalid timezone header.")
+
+
+def time_wire(request: Request, record: dict[str, Any]) -> dict[str, Any]:
+    """Meeting APIs use the timezone header for timestamps, independently of scheduling timezone."""
+    zone = response_timezone(request)
     fields = {
         "start",
         "end",

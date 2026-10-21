@@ -317,6 +317,9 @@ bot). `response_url`s (`https://hooks.slack.com/commands|actions/T/<n>/<secret>`
 
 ## Fidelity audit references
 
+`chat.update` refuses archived conversations with `is_inactive` before changing message
+content or emitting edit events; unarchiving preserves the original message.
+
 The HTTP regressions in `tests/providers/slack/test_fidelity_audit.py` and the official SDK
 contracts cover malformed writes, thread pagination, file visibility and completion, OAuth
 binding/PKCE, webhook overrides and retry behavior. Source references:

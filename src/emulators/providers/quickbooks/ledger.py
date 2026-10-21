@@ -95,6 +95,10 @@ def postings(ctx: ProviderContext) -> list[dict[str, Any]]:
             continue
         cust = ref_value(inv.get("CustomerRef"))
         add(ar, money(inv.get("TotalAmt")), inv.get("TxnDate"), inv, "Invoice", customer=cust)
+        deposit = money(inv.get("Deposit"))
+        deposit_to = ref_value(inv.get("DepositToAccountRef")) or undeposited
+        add(deposit_to, deposit, inv.get("TxnDate"), inv, "Invoice", customer=cust)
+        add(ar, -deposit, inv.get("TxnDate"), inv, "Invoice", customer=cust)
         tax = money((inv.get("TxnTaxDetail") or {}).get("TotalTax"))
         add(tax_payable, -tax, inv.get("TxnDate"), inv, "Invoice", customer=cust)
         for line in inv.get("Line") or []:

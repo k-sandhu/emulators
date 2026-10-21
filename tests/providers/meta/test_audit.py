@@ -368,6 +368,96 @@ async def test_whatsapp_malformed_payloads(
     assert r.status_code == 400 and r.json()["error"]["code"] in (100, 131051), r.text
 
 
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"footer": {"text": "x" * 61}},
+        {"footer": {"text": []}},
+        {"header": {"type": "text", "text": "x" * 61}},
+        {"header": {"type": "unknown", "text": "Title"}},
+        {"header": {"type": "image", "image": {"link": "https://halcyonadvisory.example/a.png"}}},
+        {
+            "action": {
+                "button": "Choose",
+                "sections": [
+                    {
+                        "rows": [
+                            {"id": "option", "title": "Option", "description": "x" * 73},
+                        ]
+                    }
+                ],
+            }
+        },
+    ],
+)
+async def test_interactive_optional_fields_validate_before_sending(
+    client: httpx.AsyncClient, ids: SimpleNamespace, receiver: Receiver, extra: dict[str, Any]
+) -> None:
+    await receiver.configure(client, "whatsapp_business_account")
+    ctx = client.hub.context("meta")  # type: ignore[attr-defined]
+    before = len(ctx.store["wa_messages"])
+    payload = {
+        "type": "list",
+        "body": {"text": "Select an option"},
+        "action": {"button": "Choose", "sections": [{"rows": [{"id": "option", "title": "Option"}]}]},
+        **extra,
+    }
+    response = await client.post(
+        f"{GRAPH}/{ids.phone_number_id}/messages",
+        headers=SYS,
+        json=wa(type="interactive", interactive=payload),
+    )
+    error(response)
+    assert len(ctx.store["wa_messages"]) == before
+    assert receiver.deliveries == []
+
+
+async def test_interactive_optional_field_length_boundaries(
+    client: httpx.AsyncClient, ids: SimpleNamespace
+) -> None:
+    response = await client.post(
+        f"{GRAPH}/{ids.phone_number_id}/messages",
+        headers=SYS,
+        json=wa(
+            type="interactive",
+            interactive={
+                "type": "list",
+                "body": {"text": "Select an option"},
+                "header": {"type": "text", "text": "H" * 60},
+                "footer": {"text": "F" * 60},
+                "action": {
+                    "button": "Choose",
+                    "sections": [
+                        {
+                            "rows": [
+                                {"id": "option", "title": "Option", "description": "D" * 72},
+                            ]
+                        }
+                    ],
+                },
+            },
+        ),
+    )
+    assert response.status_code == 200, response.text
+
+
+@pytest.mark.parametrize("kind", ["image", "video", "document"])
+async def test_interactive_button_header_media_reference(
+    client: httpx.AsyncClient, ids: SimpleNamespace, kind: str
+) -> None:
+    payload = {
+        "type": "button",
+        "body": {"text": "Confirm"},
+        "header": {"type": kind, kind: {"id": "missing-media"}},
+        "action": {"buttons": [{"type": "reply", "reply": {"id": "confirm", "title": "Confirm"}}]},
+    }
+    url = f"{GRAPH}/{ids.phone_number_id}/messages"
+    error(await client.post(url, headers=SYS, json=wa(type="interactive", interactive=payload)))
+    payload["header"][kind] = {"link": "https://halcyonadvisory.example/media"}
+    response = await client.post(url, headers=SYS, json=wa(type="interactive", interactive=payload))
+    assert response.status_code == 200, response.text
+
+
 async def test_template_translation_and_status_filters(
     client: httpx.AsyncClient, ids: SimpleNamespace
 ) -> None:

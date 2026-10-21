@@ -582,3 +582,36 @@ async def test_meeting_api_timezone_headers_convert_without_changing_store(clien
     assert (
         await client.get(f"/v1/meetings/{first['id']}", headers={"timezone": "Bad/Timezone"})
     ).status_code == 400
+
+
+async def test_invalid_timezone_does_not_create_or_update_a_meeting(
+    client: httpx.AsyncClient, hub: EmulatorHub
+) -> None:
+    store = hub.context("webex").store
+    before = store.snapshot()
+    payload = {
+        "title": "Timezone validation",
+        "start": "2026-10-17T15:00:00Z",
+        "end": "2026-10-17T16:00:00Z",
+    }
+    rejected = await client.post("/v1/meetings", json=payload, headers={"timezone": "Bad/Timezone"})
+    assert rejected.status_code == 400
+    assert store.snapshot() == before
+
+    recordings = (
+        await client.get("/v1/recordings", params={"from": "2026-09-01", "to": "2026-10-16"})
+    ).json()["items"]
+    assert recordings
+    before = store.snapshot()
+    rejected = await client.get(f"/v1/recordings/{recordings[0]['id']}", headers={"timezone": "Bad/Timezone"})
+    assert rejected.status_code == 400
+    assert store.snapshot() == before
+    created = (await client.post("/v1/meetings", json=payload)).json()
+    before = store.snapshot()
+    rejected = await client.put(
+        f"/v1/meetings/{created['id']}",
+        json={"title": "Rejected rename"},
+        headers={"timezone": "Bad/Timezone"},
+    )
+    assert rejected.status_code == 400
+    assert store.snapshot() == before

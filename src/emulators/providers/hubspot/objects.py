@@ -352,6 +352,8 @@ def build(app: FastAPI, ctx: ProviderContext) -> None:
         kind = object_type(objectType)
         grant = require(request, ctx, scopes_for(kind))
         payload = await body(request)
+        if len((await request.body()).decode("utf-8-sig")) > 3000:
+            fail(400, "Search request body must not exceed 3,000 characters.")
         limit = integer(payload.get("limit"), 10, 200)
         after = integer(payload.get("after"), 0, 9999, minimum=0)
         rows = sorted(

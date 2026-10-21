@@ -152,6 +152,11 @@ Read receipts apply to inbound messages for that phone number. Reply context and
 reactions must reference the same recipient. Failed status webhooks carry errors
 without conversation or billing objects.
 
+Interactive messages validate optional headers and footers (60 characters), list row
+descriptions (72 characters), and header media references before accepting a send.
+List headers support text; reply-button headers also support image, video and document
+media. Rejected interactive messages create no message or status webhook.
+
 ### Messenger Platform
 
 | Method | Path | Notes |
@@ -285,6 +290,9 @@ The audit used Meta's [WhatsApp Cloud API collection](https://www.postman.com/me
 [media URL contract](https://www.postman.com/meta/whatsapp-business-platform/request/fpj02x0/retrieve-media-url),
 [Messenger collection](https://www.postman.com/meta/messenger-platform-api/collection/iyp204x/messenger-platform-api),
 and Meta's [template language object](https://whatsapp.github.io/WhatsApp-Nodejs-SDK/api-reference/types/language_object/).
+Interactive validation follows Meta's [interactive object](https://whatsapp.github.io/WhatsApp-Nodejs-SDK/api-reference/types/InteractiveObject/),
+[header object](https://whatsapp.github.io/WhatsApp-Nodejs-SDK/api-reference/types/HeaderObject/),
+and [row object](https://whatsapp.github.io/WhatsApp-Nodejs-SDK/api-reference/types/RowObject/) references.
 The developer-reference site was unavailable to the audit browser; Meta-owned
 Postman collections and SDK reference pages supplied the readable primary references.
 

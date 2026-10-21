@@ -142,6 +142,8 @@ async def post_message(call: Call) -> dict[str, Any]:
 async def update(call: Call) -> dict[str, Any]:
     ctx, p = call.ctx, call.params
     channel = access.require_channel(ctx, call.me, p.str("channel"))
+    if channel.get("is_archived"):
+        raise SlackError("is_inactive")
     ts = p.need("ts")
     if parse_ts(ts) is None:
         raise SlackError("message_not_found")

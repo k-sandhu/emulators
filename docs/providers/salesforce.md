@@ -127,7 +127,7 @@ All paths are under `/services/data/vNN.N` unless noted.
 | GET | `/sobjects/{Type}/describe` (+ `/layouts`, `/compactLayouts`, `/approvalLayouts`) | full field metadata; `If-Modified-Since` → 304 |
 | POST | `/sobjects/{Type}` | create → `201 {id, success, errors}` + `Location`; JSON or `multipart/form-data` (`entity_content` + binary part) |
 | GET/PATCH/DELETE | `/sobjects/{Type}/{id}` | `fields=`; PATCH/DELETE → 204; 15- and 18-char ids; `If-Modified-Since`, `If-Unmodified-Since` |
-| GET/PATCH/DELETE | `/sobjects/{Type}/{ExtIdField}/{value}` | external-id get / upsert (201 created, 204 updated) / delete; 300 for several matches |
+| GET/PATCH/DELETE | `/sobjects/{Type}/{ExtIdField}/{value}` | external-id get / upsert (201 created, 200 updated from v46; legacy updates return 204) / delete; `created` result flag from v46; `updateOnly=true` from v61 prevents inserts; 300 for several matches |
 | GET | `/sobjects/{Type}/{id}/{relationship}` | child relationship (`Contacts`) as a query result, or the parent record (`Account`, `Owner`) |
 | GET | `/sobjects/{Type}/{id}/{BlobField}` | `VersionData`, `Body` bytes |
 | GET | `/sobjects/{Type}/updated`, `/deleted` `?start=&end=` | 30-day window, minute resolution |
@@ -370,3 +370,7 @@ Salesforce SDK contract tests. They use synthetic credentials; obtain current te
   OAuth `format=xml|urlencoded` are not implemented.
 * Files: no ContentNote, ContentDistribution or chunked uploads; `ContentDocument` sharing is approximated by
   the visibility of the records it is linked to.
+
+External-ID upsert response versions and `updateOnly` follow the official
+[upsert examples](https://developer.salesforce.com/docs/platform/api-rest/guide/dome-upsert.html)
+and [resource reference](https://developer.salesforce.com/docs/platform/api-rest/guide/resources-sobject-upsert-patch.html).

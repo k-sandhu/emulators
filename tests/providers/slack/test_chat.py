@@ -99,6 +99,20 @@ async def test_bot_must_be_member_unless_chat_write_public(slack: Slack) -> None
     )
 
 
+async def test_updating_archived_channel_message_fails_without_mutation(slack: Slack) -> None:
+    token = await slack.user_token("p001")
+    channel = (await slack.ok("conversations.create", token, name="archived-update-test"))["channel"]["id"]
+    posted = await slack.ok("chat.postMessage", token, channel=channel, text="Original")
+    await slack.ok("conversations.archive", token, channel=channel)
+    assert (
+        await slack.err("chat.update", token, channel=channel, ts=posted["ts"], text="Changed")
+        == "is_inactive"
+    )
+    await slack.ok("conversations.unarchive", token, channel=channel)
+    record = next(m for m in await slack.history(channel, token) if m["ts"] == posted["ts"])
+    assert record["text"] == "Original" and "edited" not in record
+
+
 async def test_blocks_and_attachments(slack: Slack) -> None:
     channel = slack.channel_id("general")
     blocks = [

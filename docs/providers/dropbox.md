@@ -304,6 +304,14 @@ chunk alignment, final close and finish-without-content rules. Identical upload 
 `strict_conflict` applies. Stale update revisions require `autorename` to create a conflicted copy; a strict update of a
 missing file conflicts. Copy references require the same app and continuing source authorization.
 
+A direct upload rejected with `UploadWriteFailed` retains its uploaded bytes in the
+returned `upload_session_id`. As required by Dropbox's
+[official files specification](https://github.com/dropbox/dropbox-api-spec/blob/main/files.stone),
+clients can retry `files/upload_session/finish` using an empty body, the uploaded
+byte count as offset, and a corrected commit path. A successful finish consumes the
+session. HTTP and official-SDK regressions cover recovery and exact content in
+`tests/providers/dropbox/test_review_recovery.py` and `tests/sdk/test_dropbox_audit_sdk.py`.
+
 Shared links enforce their `rlkey` and download setting through both API and browser routes. Link-list continuations retain
 the original path filter, and returned links work in hostname, prefix and dedicated-port modes. Fault responses include
 request IDs, including rate-limit errors with `Retry-After`.

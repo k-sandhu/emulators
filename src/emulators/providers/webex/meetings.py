@@ -29,6 +29,7 @@ from .common import (
     person,
     require_scope,
     required,
+    response_timezone,
     stamp,
     strings,
     subject,
@@ -226,6 +227,7 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
     async def create(request: Request) -> dict[str, Any]:
         grant = authenticate(request, ctx)
         check_scope(grant, "schedules", write=True)
+        response_timezone(request)
         if not is_admin(ctx, grant, "meeting:admin_schedule_write"):
             require_scope(grant, "meeting:schedules_write")
         payload = await body(request)
@@ -287,6 +289,7 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
     async def update(meeting_id: str, request: Request) -> dict[str, Any]:
         grant = authenticate(request, ctx)
         check_scope(grant, "schedules", write=True)
+        response_timezone(request)
         row = get_meeting(ctx, meeting_id, grant, write=True)
         if row["meetingType"] == "meeting":
             fail(400, "An ended meeting cannot be updated.")

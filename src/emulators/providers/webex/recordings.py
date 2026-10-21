@@ -29,6 +29,7 @@ from .common import (
     parent_matches,
     person,
     public,
+    response_timezone,
     stamp,
     strings,
     time_wire,
@@ -243,7 +244,9 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
 
     @app.get("/v1/recordings/{recording_id}")
     async def recording(recording_id: str, request: Request) -> dict[str, Any]:
-        return recording_wire(request, ctx, get_recording(recording_id, request), detail=True)
+        row = get_recording(recording_id, request)
+        response_timezone(request)
+        return recording_wire(request, ctx, row, detail=True)
 
     @app.delete("/v1/recordings/{recording_id}")
     async def delete(recording_id: str, request: Request) -> Response:

@@ -50,6 +50,89 @@ async def create_invoice(client: httpx.AsyncClient, headers: dict[str, str], **e
     return response.json()["Invoice"]
 
 
+async def test_invoice_deposit_moves_cash_and_receivables_and_reverses_on_void(qb: Any) -> None:
+    client, headers = qb
+    ctx = client.hub.contexts["quickbooks"]
+    bank_id = str(ctx.store.meta["system_accounts"]["bank"])
+    ar_id = str(ctx.store.meta["system_accounts"]["ar"])
+
+    async def balance(account_id: str) -> float:
+        response = await client.get(f"{API}/account/{account_id}", headers=headers)
+        assert response.status_code == 200, response.text
+        return response.json()["Account"]["CurrentBalance"]
+
+    async def cash_income() -> float:
+        response = await client.get(
+            f"{API}/reports/ProfitAndLoss",
+            headers=headers,
+            params={"date_macro": "All dates", "accounting_method": "Cash"},
+        )
+        assert response.status_code == 200, response.text
+        income = next(row for row in response.json()["Rows"]["Row"] if row.get("group") == "Income")
+        return float(income["Summary"]["ColData"][1]["value"])
+
+    bank_before, ar_before = await balance(bank_id), await balance(ar_id)
+    income_before = await cash_income()
+    invoice = await create_invoice(client, headers, Deposit=25, DepositToAccountRef={"value": bank_id})
+    assert invoice["Balance"] == 75
+    assert await balance(bank_id) == pytest.approx(bank_before + 25)
+    assert await balance(ar_id) == pytest.approx(ar_before + 75)
+    assert await cash_income() == pytest.approx(income_before + 25)
+    updated = await client.post(
+        f"{API}/invoice",
+        headers=headers,
+        json={"Id": invoice["Id"], "SyncToken": invoice["SyncToken"], "sparse": True, "Deposit": 40},
+    )
+    assert updated.status_code == 200, updated.text
+    invoice = updated.json()["Invoice"]
+    assert invoice["Balance"] == 60
+    assert await balance(bank_id) == pytest.approx(bank_before + 40)
+    assert await balance(ar_id) == pytest.approx(ar_before + 60)
+    assert await cash_income() == pytest.approx(income_before + 40)
+    voided = await client.post(
+        f"{API}/invoice?operation=void",
+        headers=headers,
+        json={"Id": invoice["Id"], "SyncToken": invoice["SyncToken"]},
+    )
+    assert voided.status_code == 200, voided.text
+    assert voided.json()["Invoice"]["Deposit"] == 0
+    assert await balance(bank_id) == bank_before
+    assert await balance(ar_id) == ar_before
+    assert await cash_income() == income_before
+
+
+@pytest.mark.parametrize("entity", ["Invoice", "SalesReceipt", "Estimate", "CreditMemo"])
+async def test_sales_line_without_item_is_documentation_and_does_not_change_totals(
+    qb: Any, entity: str
+) -> None:
+    client, headers = qb
+    response = await client.post(
+        f"{API}/{entity.lower()}",
+        headers=headers,
+        json={
+            "CustomerRef": {"value": "1"},
+            "Line": [
+                {
+                    "DetailType": "SalesItemLineDetail",
+                    "Amount": 100,
+                    "SalesItemLineDetail": {"ItemRef": {"value": "1"}},
+                },
+                {
+                    "DetailType": "SalesItemLineDetail",
+                    "Description": "Documentation, without an item",
+                    "Amount": 1000,
+                    "SalesItemLineDetail": {"TaxCodeRef": {"value": "1"}},
+                },
+            ],
+        },
+    )
+    assert response.status_code == 200, response.text
+    record = response.json()[entity]
+    assert record["TotalAmt"] == 100
+    assert record["TxnTaxDetail"]["TotalTax"] == 0
+    assert any(line.get("Description") == "Documentation, without an item" for line in record["Line"])
+
+
 @pytest.mark.parametrize("entity", list(ENTITIES))
 async def test_every_entity_rejects_malformed_writes_atomically(qb: Any, entity: str) -> None:
     client, headers = qb

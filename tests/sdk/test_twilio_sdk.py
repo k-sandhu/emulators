@@ -359,6 +359,18 @@ def test_verify_resend_and_check_limits(client: Client, emulators: EmulatorHub) 
     )
 
 
+def test_verify_resend_accepts_the_original_code(client: Client, emulators: EmulatorHub) -> None:
+    service = next(s for s in client.verify.v2.services.list() if s.friendly_name == "Halcyon Client Portal")
+    verification_api = client.verify.v2.services(service.sid)
+    first = verification_api.verifications.create(to=CONTACT, channel="sms")
+    record = emulators.context("twilio").store.collection("verifications").get(first.sid)
+    original_code = record["code"]
+    again = verification_api.verifications.create(to=CONTACT, channel="sms")
+    assert again.sid == first.sid
+    checked = verification_api.verification_checks.create(to=CONTACT, code=original_code)
+    assert checked.status == "approved" and checked.valid is True
+
+
 def test_recordings_through_the_call(client: Client) -> None:
     recording = client.recordings.list(limit=1)[0]
     via_call = client.calls(recording.call_sid).recordings(recording.sid).fetch()

@@ -13,6 +13,21 @@ dropbox = pytest.importorskip("dropbox")
 from dropbox import exceptions, files  # noqa: E402
 
 
+def test_failed_upload_recovery_session_decodes_and_commits_in_sdk(emulator_intercept: Any) -> None:
+    dbx = client(emulator_intercept)
+    dbx.files_upload(b"original", "/sdk-recovery.txt")
+    data = b"recoverable bytes"
+    with pytest.raises(exceptions.ApiError) as failed:
+        dbx.files_upload(data, "/sdk-recovery.txt")
+    recovery = failed.value.error.get_path()
+    assert recovery.reason.get_conflict().is_file()
+    cursor = files.UploadSessionCursor(recovery.upload_session_id, len(data))
+    result = dbx.files_upload_session_finish(b"", cursor, files.CommitInfo("/sdk-recovered.txt"))
+    assert result.size == len(data)
+    _, response = dbx.files_download(result.id)
+    assert response.content == data
+
+
 def test_folder_id_descendants_and_idempotent_upload(emulator_intercept: Any) -> None:
     dbx = client(emulator_intercept)
     folder = dbx.files_create_folder_v2("/sdk-audit/nested").metadata

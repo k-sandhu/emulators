@@ -29,6 +29,39 @@ def token(user: str = "p018", **extra: Any) -> str:
     return response.json()["access_token"]
 
 
+def test_docs_sdk_rejects_ambiguous_atomic_edits_and_normalizes_text(emulator_intercept: Any) -> None:
+    service = build("docs", "v1", credentials=Credentials(token()), static_discovery=True)
+    try:
+        document = service.documents().create(body={"title": "SDK edit validation"}).execute()
+        identifier = document["documentId"]
+        with pytest.raises(HttpError) as rejected:
+            service.documents().batchUpdate(
+                documentId=identifier,
+                body={
+                    "requests": [
+                        {"insertText": {"text": "prefix", "location": {"index": 1}}},
+                        {
+                            "insertText": {
+                                "text": "invalid",
+                                "location": {"index": 1},
+                                "endOfSegmentLocation": {},
+                            }
+                        },
+                    ]
+                },
+            ).execute()
+        assert rejected.value.resp.status == 400
+        assert service.documents().get(documentId=identifier).execute() == document
+        service.documents().batchUpdate(
+            documentId=identifier,
+            body={"requests": [{"insertText": {"text": "SDK\u0000\ue000😀", "endOfSegmentLocation": {}}}]},
+        ).execute()
+        result = service.documents().get(documentId=identifier).execute()
+        assert result["body"]["content"][1]["paragraph"]["elements"][0]["textRun"]["content"] == "SDK😀\n"
+    finally:
+        service.close()
+
+
 def test_discovery_drive_list_get_download_permissions_and_changes(emulator_intercept: Any) -> None:
     service = build("drive", "v3", credentials=Credentials(token()), static_discovery=True)
     assert service.about().get(fields="user(emailAddress)").execute() == {

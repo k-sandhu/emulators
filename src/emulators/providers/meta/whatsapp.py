@@ -512,6 +512,10 @@ class WhatsAppMixin:
         payload = send_payload(self.ctx, msg_type, body.get(msg_type))
         if msg_type in ("image", "document", "audio", "video", "sticker"):
             self._validate_media_ref(payload, msg_type)
+        if msg_type == "interactive" and "header" in payload:
+            header = payload["header"]
+            if header["type"] in ("image", "video", "document"):
+                self._validate_media_ref(header[header["type"]], header["type"])
         context = body.get("context")
         if context is not None:
             context = object_value(self.ctx, context, "context")

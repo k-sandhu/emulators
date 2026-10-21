@@ -60,6 +60,18 @@ def test_auth_test_and_default_hostnames(bot: WebClient, credentials: dict[str, 
     assert "chat:write" in response.headers["x-oauth-scopes"]
 
 
+def test_archived_messages_cannot_be_updated(owner: WebClient) -> None:
+    channel = owner.conversations_create(name="sdk-archived-update")["channel"]["id"]
+    posted = owner.chat_postMessage(channel=channel, text="Original")
+    owner.conversations_archive(channel=channel)
+    with pytest.raises(SlackApiError) as error:
+        owner.chat_update(channel=channel, ts=posted["ts"], text="Changed")
+    assert error.value.response["error"] == "is_inactive"
+    owner.conversations_unarchive(channel=channel)
+    messages = owner.conversations_history(channel=channel)["messages"]
+    assert next(message for message in messages if message["ts"] == posted["ts"])["text"] == "Original"
+
+
 def test_post_message_history_replies_and_thread(bot: WebClient) -> None:
     general = channel_id(bot, "general")
     posted = bot.chat_postMessage(channel=general, text="Hello from the SDK :wave:")

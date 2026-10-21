@@ -85,7 +85,9 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
     async def batch_update(fid: str, request: Request) -> dict[str, Any]:
         row = doc(fid, request, write=True)
         data = await json_object(request)
-        control = data.get("writeControl", {})
+        control = data.get("writeControl") or {}
+        if control.get("requiredRevisionId") is not None and control.get("targetRevisionId") is not None:
+            raise google_error(400, "Write control must specify only one revision mode", legacy=False)
         if control.get("requiredRevisionId", row["version"]) != row["version"]:
             raise google_error(
                 400, "The provided revision ID does not match the current revision ID.", legacy=False
@@ -93,11 +95,24 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
         working = copy.deepcopy(row)
         text = "\n".join(working.get("_paragraphs", [])) + "\n"
         replies: list[dict[str, Any]] = []
-        for item in data.get("requests", []):
+        for item in data.get("requests") or []:
+            if (
+                not isinstance(item, dict)
+                or len([key for key, value in item.items() if value is not None]) != 1
+            ):
+                raise google_error(400, "Each request must contain exactly one operation", legacy=False)
             if "insertText" in item:
                 edit = item["insertText"]
-                location = edit.get("location", {}).get("index", utf16_len(text))
-                if not isinstance(location, int):
+                if not isinstance(edit, dict):
+                    raise google_error(400, "Invalid insertText request", legacy=False)
+                targets = [key for key in ("location", "endOfSegmentLocation") if edit.get(key) is not None]
+                if len(targets) != 1:
+                    raise google_error(400, "Specify exactly one insertion location", legacy=False)
+                target = edit[targets[0]]
+                if not isinstance(target, dict) or target.get("segmentId"):
+                    raise google_error(400, "Invalid document segment", legacy=False)
+                location = target.get("index", 0) if targets[0] == "location" else utf16_len(text)
+                if not isinstance(location, int) or isinstance(location, bool):
                     raise google_error(400, "Invalid insertion index", legacy=False)
                 offset = location - 1
                 encoded = text.encode("utf-16-le")
@@ -108,17 +123,20 @@ def register(app: FastAPI, ctx: ProviderContext) -> None:
                 ):
                     raise google_error(400, "Invalid insertion index or text", legacy=False)
                 try:
+                    inserted = re.sub(r"[\u0000-\u0008\u000c-\u001f\ue000-\uf8ff]", "", edit["text"])
                     text = (
-                        encoded[: offset * 2] + edit["text"].encode("utf-16-le") + encoded[offset * 2 :]
+                        encoded[: offset * 2] + inserted.encode("utf-16-le") + encoded[offset * 2 :]
                     ).decode("utf-16-le")
                 except UnicodeDecodeError:
                     raise google_error(400, "Invalid UTF-16 insertion index", legacy=False) from None
                 replies.append({})
             elif "replaceAllText" in item:
                 edit = item["replaceAllText"]
-                contains = edit.get("containsText", {})
+                if not isinstance(edit, dict):
+                    raise google_error(400, "Invalid replaceAllText request", legacy=False)
+                contains = edit.get("containsText") or {}
                 needle = contains.get("text", "")
-                if not needle:
+                if not isinstance(needle, str) or not needle:
                     raise google_error(400, "Missing text to replace", legacy=False)
                 pattern = re.compile(
                     re.escape(needle), flags=0 if contains.get("matchCase") else re.IGNORECASE

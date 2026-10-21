@@ -150,6 +150,16 @@ def _cash_adjusted_postings(ctx: ProviderContext, params: dict[str, str]) -> lis
     by_source: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
     for posting in all_postings:
         by_source[(posting["txn_type"], posting["txn_id"])].append(posting)
+    for invoice in ctx.store.collection("Invoice"):
+        if invoice.get("_deleted") or invoice.get("_voided") or not invoice.get("TotalAmt"):
+            continue
+        ratio = money(invoice.get("Deposit")) / money(invoice["TotalAmt"])
+        if not ratio:
+            continue
+        for posting in by_source[("Invoice", str(invoice["Id"]))]:
+            account = ctx.store.collection("Account").get(posting["account_id"])
+            if (account or {}).get("Classification") == "Revenue":
+                kept.append({**posting, "amount": money(posting["amount"] * ratio)})
     for payment_type, source_type, classification in (
         ("Payment", "Invoice", "Revenue"),
         ("BillPayment", "Bill", "Expense"),

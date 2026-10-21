@@ -308,14 +308,18 @@ def save_invoice(
             and old.get("Allocations")
             and (
                 record["Status"] == "VOIDED"
-                or any(k in value for k in ["LineItems", "Contact", "Date", "CurrencyCode"])
+                or any(
+                    k in value for k in ["LineItems", "LineAmountTypes", "Contact", "Date", "CurrencyCode"]
+                )
             )
         ):
             validation("Remove credit allocations before changing financial details or voiding.")
     if (
         old
         and (old.get("AmountPaid", 0) or old.get("AmountCredited", 0))
-        and any(k in value for k in ["LineItems", "Contact", "Type", "Date", "CurrencyCode"])
+        and any(
+            k in value for k in ["LineItems", "LineAmountTypes", "Contact", "Type", "Date", "CurrencyCode"]
+        )
     ):
         validation("Paid or credited invoices cannot have their financial details changed.", record)
     if record["Status"] == "VOIDED" and (record.get("AmountPaid", 0) or record.get("AmountCredited", 0)):
@@ -330,6 +334,10 @@ def save_invoice(
         record["DueDate"] = msdate(instant(record["Date"]) + timedelta(days=30))
         record["DueDateString"] = instant(record["DueDate"]).strftime("%Y-%m-%dT00:00:00")
     if not old or "LineItems" in value or "LineAmountTypes" in value:
+        if old and old.get("LineAmountTypes") != record.get("LineAmountTypes") and "LineItems" not in value:
+            # Prior response tax amounts belong to the previous tax mode, not this request.
+            for line in record.get("LineItems", []):
+                line.pop("TaxAmount", None)
         if (
             resource in {"Invoices", "CreditNotes"}
             and record["Status"] == "DRAFT"

@@ -236,9 +236,9 @@ no per-message `StatusCallback` is given.
 
 Verification codes are 6 digits (the service's `code_length`), valid for 10
 minutes of emulator clock time. Starting a verification for a recipient that
-already has a pending one **re-sends on the same verification** (same `sid`, a
-new code, one more entry in `send_code_attempts`) — a sixth start returns
-`429` / 60203. A wrong code returns `200` with `status: pending`; five wrong
+already has a pending one **re-sends on the same verification** (same `sid`, the
+same code and original expiry, one more entry in `send_code_attempts`) — a sixth
+start returns `429` / 60203. A wrong code returns `200` with `status: pending`; five wrong
 checks are allowed and the sixth returns `429` / 60202 and marks the
 verification `max_attempts_reached`. Checking an unknown, expired, canceled,
 approved or exhausted verification is `404` / 20404. For tests, the real code is
@@ -250,6 +250,10 @@ record (`"Your Halcyon Client Portal verification code is: …"`) from the firm'
 SMS number (or WhatsApp sender), so it shows up in `Messages` list/fetch like
 any other send. `CustomCode` requires `custom_code_enabled` on the service (the
 seeded service has it enabled).
+
+Resends follow Twilio's [code validity contract](https://www.twilio.com/docs/verify/api/rate-limits-and-timeouts):
+the initial code remains valid for the original ten-minute window; resending does not extend it.
+Rejected Messaging/Verify service updates leave existing settings unchanged.
 
 ### Lookup — `https://lookups.twilio.com`
 
@@ -453,3 +457,4 @@ does not retry HTTP errors).
 - Webhook responses other than the inbound-message TwiML are not interpreted
   (a voice `Url` replying with TwiML does not change the call).
 - Prices are flat per segment/minute approximations, not Twilio's rate card.
+
