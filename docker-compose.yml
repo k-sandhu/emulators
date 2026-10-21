@@ -38,6 +38,9 @@ services:
       - "44114:44114"
       - "44115:44115"
       - "44116:44116"
+      - "44117:44117"
+      - "44118:44118"
+      - "44119:44119"
     volumes:
       - certs:/certs
     healthcheck:
@@ -54,6 +57,8 @@ services:
           - accounts.intuit.com
           - accounts.platform.intuit.com
           - admin.googleapis.com
+          - airtable.com
+          - api.airtable.com
           - api.atlassian.com
           - api.box.com
           - api.ciscospark.com
@@ -64,9 +69,11 @@ services:
           - api.notion.com
           - api.slack.com
           - api.stripe.com
+          - api.trello.com
           - api.twilio.com
           - api.xero.com
           - api.zoom.us
+          - app.asana.com
           - app.box.com
           - app.hubspot.com
           - appcenter.intuit.com
@@ -75,6 +82,7 @@ services:
           - calendar-json.googleapis.com
           - checkout.stripe.com
           - connect.stripe.com
+          - content.airtable.com
           - content.dropboxapi.com
           - content.googleapis.com
           - conversations.twilio.com
@@ -134,16 +142,19 @@ services:
           - slack.com
           - ssrweb.zoom.us
           - test.salesforce.com
+          - trello.com
           - uc.dl.dropboxusercontent.com
           - upload.box.com
           - uploads.stripe.com
           - us06web.zoom.us
+          - v5.airtableusercontent.com
           - verify.twilio.com
           - webexapis.com
           - www.dropbox.com
           - www.facebook.com
           - www.googleapis.com
           - www.notion.so
+          - www.trello.com
           - zoom.us
 
 volumes:

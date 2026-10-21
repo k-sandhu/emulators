@@ -6,6 +6,8 @@
 Every URL below is the vendor's real hostname over HTTPS; the only trust anchor is the emulator CA.
 """
 
+from __future__ import annotations
+
 import httpx
 
 ca = "/certs/ca-bundle.pem"
@@ -47,3 +49,17 @@ with httpx.Client(verify=ca, timeout=20) as c:
     print("zoom users:", users["total_records"])
     r = c.get("https://halcyonadvisory.sharepoint.com/_emulator/health")
     print("sharepoint wildcard host:", r.status_code)
+    for host, path, collection in (
+        ("https://app.asana.com", "/api/1.0/workspaces", "data"),
+        ("https://api.trello.com", "/1/members/me/organizations", None),
+        ("https://api.airtable.com", "/v0/meta/bases", "bases"),
+    ):
+        response = c.post(host + "/_emulator/tokens", json={"user": "p001"})
+        response.raise_for_status()
+        token = response.json()["access_token"]
+        response = c.get(host + path, headers={"Authorization": f"Bearer {token}"})
+        response.raise_for_status()
+        records = response.json()
+        assert records[collection] if collection else records
+    for host in ("https://content.airtable.com", "https://v5.airtableusercontent.com", "https://trello.com"):
+        c.get(host + "/_emulator/health").raise_for_status()
