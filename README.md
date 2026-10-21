@@ -12,24 +12,28 @@ single vendor account.
 | Email & calendar | Outlook (Graph), Gmail, Google Calendar | mailboxes with folders/labels, MIME, attachments, send, delta/history; calendars with recurrence, free/busy |
 | Meetings (audio/video) | Microsoft Teams, Zoom, Google Meet, Webex | online meetings, participants, cloud recordings (valid MP4/M4A), transcripts (WebVTT), attendance, webhooks |
 | Knowledge & work tracking | Notion, Confluence, Jira | page trees, databases, blocks, CQL/JQL, space permissions and page restrictions |
+| Project tracking & structured data | Asana, Trello, Airtable | projects and tasks, boards and cards, relational tables and records, memberships and permissions |
 | Messaging | Slack, Teams chat, Twilio (SMS/MMS, Verify, Lookup), WhatsApp Cloud API, Messenger | channels/threads/DMs, inbound simulation, delivery status callbacks, 24-hour windows, opt-outs, signed webhooks |
 | Payments | Stripe | customers, payment methods, PaymentIntents state machine with test cards, subscriptions, invoices, refunds, disputes, events + signed webhooks, test clocks |
 | CRM | Salesforce, HubSpot | SOQL/SOSL, composite, Bulk 2.0, describe, role-hierarchy sharing; HubSpot CRM v3 objects, associations, search, pipelines |
 | Accounting | QuickBooks Online, Xero | chart of accounts, customers/jobs, invoices, payments, bills, reports that tie out, CDC, webhooks |
 
-Sixteen emulators, all seeded from **one shared synthetic organisation** — *Halcyon Advisory Group*, a
+Nineteen emulators, all seeded from **one shared synthetic organisation** — *Halcyon Advisory Group*, a
 45-person accounting and advisory firm with 24 clients — so the same person, client, document
 and meeting line up across every system. All data is fictional (`*.example` emails, fictional
 phone ranges).
 
 ## Verified compatibility
 
-* **4,247 tests** (unit, provider wire tests, official-SDK contract tests, consumer-flow replays,
+* **Over 4,600 tests** (unit, provider wire tests, official-SDK contract tests, consumer-flow replays,
   cross-system consistency, fuzzing) — run on Python 3.12 and 3.13 in CI.
 * **Official SDKs drive the emulators unchanged:** `msal`, `google-api-python-client` (incl.
   batch requests), `google-auth`, `stripe` (incl. `Webhook.construct_event`), `twilio` (incl.
   `RequestValidator`), `dropbox`, `box-sdk-gen`, `simple-salesforce` (REST and SOAP login),
   `slack_sdk` (sync, async, `SignatureVerifier`), `python-quickbooks`, `intuit-oauth`.
+* **Additional official SDK contracts:** Asana's Python SDK and `airtable.js`, using their
+  configurable local API endpoints. These optional suites and their test-only installation
+  commands are documented in [Asana](docs/providers/asana.md) and [Airtable](docs/providers/airtable.md).
 * **Our products' real call sequences pass:** parlance's Teams/Zoom/Meet recording and transcript
   imports and storage connectors, lumen-copilot's Google Drive incremental sync,
   saas_backbone's Twilio SMS and Stripe webhook verification (`tests/e2e/`).
@@ -91,7 +95,7 @@ def test_stripe(emulator_intercept):
 * **Permissions enforced.** Delegated tokens only see what that user could see (drive ACLs, shared
   drives, private channels, CRM sharing rules, mailbox ownership); app tokens see what apps can.
 * **Webhooks with real signatures.** Stripe, Zoom, Slack, Twilio, Meta, Dropbox, Box, Graph,
-  Google push, QuickBooks, Xero, HubSpot, Webex — with handshake/validation flows, retries and a
+  Google push, QuickBooks, Xero, HubSpot, Webex, Asana, Trello, Airtable — with handshake/validation flows, retries and a
   delivery journal. Deliver over the network or straight into an ASGI app in-process.
 * **Control plane** on every provider: `/_emulator/{health,info,reset,state,requests,faults,tokens,webhooks,actions,docs}`.
   Inject 429s/500s/latency, inspect every request your code made, simulate inbound SMS, end a
@@ -115,7 +119,7 @@ date; pin it with `EMULATORS_ANCHOR=2026-10-16` for byte-stable fixtures.
 * [Architecture](docs/architecture.md) · [Use from Python tests](docs/howto/python-tests.md) ·
   [Docker with real hostnames](docs/howto/docker-compose.md)
 * Provider references: [docs/providers/](docs/providers/README.md) — hosts, auth, endpoints, seeded
-  data, webhooks, actions and known gaps for each of the 16 emulators.
+  data, webhooks, actions and known gaps for each of the 19 emulators.
 * [Webhooks, simulations, faults and time](docs/howto/webhooks-faults-time.md)
 * Decisions: [0001 hostname routing](docs/decisions/0001-hostname-routing.md) ·
   [0002 shared synthetic world](docs/decisions/0002-shared-synthetic-world.md)

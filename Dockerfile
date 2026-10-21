@@ -21,7 +21,7 @@ ENV PATH=/opt/venv/bin:$PATH \
 RUN useradd --uid 10001 --create-home emulators && mkdir -p /certs && chown emulators /certs
 COPY --from=build /opt/venv /opt/venv
 USER 10001
-EXPOSE 44080 44443 44101-44111
+EXPOSE 44080 44443 44101-44119
 HEALTHCHECK --interval=10s --timeout=3s --start-period=20s --retries=5 \
   CMD python -c "import os,urllib.request; urllib.request.urlopen(f'http://127.0.0.1:{os.environ.get(\"EMULATORS_PORT\",\"44080\")}/_emulator/health', timeout=3)" || exit 1
 ENTRYPOINT ["emulators"]

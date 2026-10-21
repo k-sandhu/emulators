@@ -10,7 +10,7 @@ docker compose -f docker-compose.yml up -d --build      # in this repo
 
 This starts `emulators` on the `emulators-vendors` network with aliases for every vendor host,
 listening on 443 (HTTPS) and 80 (HTTP) inside the network, and publishes the gateway on
-`localhost:44080` / `localhost:44443` plus one port per provider (44101–44111). The CA lives in the
+`localhost:44080` / `localhost:44443` plus one port per provider (44101–44119). The CA lives in the
 `emulators-certs` volume.
 
 In your project's compose file:

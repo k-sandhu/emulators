@@ -23,6 +23,9 @@ known gaps. Live credentials and seeded ids for the current seed are always avai
 | Meetings | Webex (`webex`, 44114) | [webex.md](webex.md) |
 | Knowledge | Notion (`notion`, 44115) | [notion.md](notion.md) |
 | Knowledge, work tracking | Confluence + Jira (`atlassian`, 44116) | [atlassian.md](atlassian.md) |
+| Work tracking | Asana (`asana`, 44117) | [asana.md](asana.md) |
+| Work tracking | Trello (`trello`, 44118) | [trello.md](trello.md) |
+| Structured data | Airtable (`airtable`, 44119) | [airtable.md](airtable.md) |
 
 All providers are seeded from the same synthetic organisation (see
 [architecture](../architecture.md#the-world-srcemulatorsworld)), share one clock, and expose the
