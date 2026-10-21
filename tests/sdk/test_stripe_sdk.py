@@ -88,6 +88,36 @@ def test_sdk_exception_mapping() -> None:
         stripe.Customer.list(api_key=SECRET_KEY.replace("test", "live"))
 
 
+def test_confirmation_authentication_failure_and_parameter_overrides() -> None:
+    with pytest.raises(stripe.CardError) as failed:
+        stripe.PaymentIntent.create(
+            amount=1000,
+            currency="usd",
+            payment_method="pm_card_threeDSecure2Required",
+            confirm=True,
+            error_on_requires_action=True,
+        )
+    assert failed.value.http_status == 402 and failed.value.code == "authentication_required"
+    intent = stripe.PaymentIntent.retrieve(failed.value.json_body["error"]["payment_intent"]["id"])
+    assert (
+        intent.status == "requires_payment_method"
+        and intent.last_payment_error.code == "authentication_required"
+    )
+    customer = stripe.Customer.create()
+    intent = stripe.PaymentIntent.create(amount=1000, currency="usd", customer=customer.id)
+    confirmed = stripe.PaymentIntent.confirm(
+        intent.id,
+        payment_method="pm_card_visa",
+        capture_method="manual",
+        setup_future_usage="off_session",
+        receipt_email="billing@halcyonadvisory.example",
+        expand=["latest_charge", "payment_method"],
+    )
+    assert confirmed.status == "requires_capture" and not confirmed.latest_charge.captured
+    assert confirmed.latest_charge.receipt_email == "billing@halcyonadvisory.example"
+    assert confirmed.payment_method.customer == customer.id
+
+
 def test_setup_and_payment_method_attach_detach() -> None:
     customer = stripe.Customer.create(email="sdk-setup@halcyonadvisory.example")
     token = stripe.Token.create(

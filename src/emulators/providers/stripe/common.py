@@ -444,6 +444,7 @@ def card_error(pi: Record, code: str, decline: str | None = None) -> EmulatorErr
         "type": "card_error",
         "code": code,
         "message": {
+            "authentication_required": "Your card was declined. This transaction requires authentication.",
             "expired_card": "Your card has expired.",
             "incorrect_cvc": "Your card's security code is incorrect.",
             "processing_error": "An error occurred while processing your card. Try again in a little bit.",

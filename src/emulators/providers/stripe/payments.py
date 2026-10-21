@@ -233,6 +233,21 @@ class PaymentsAPI(BaseAPI):
                 "This intent cannot be confirmed because it has already succeeded or been canceled.",
                 setup=setup,
             )
+        if self.publishable and intent.get("confirmation_method") == "manual":
+            fail("This PaymentIntent requires confirmation with a secret key.", status=403)
+        if not setup:
+            if (
+                self.publishable
+                and intent.get("setup_future_usage")
+                and "setup_future_usage" in p
+                and p["setup_future_usage"] != intent["setup_future_usage"]
+                and (intent["setup_future_usage"], p["setup_future_usage"]) != ("on_session", "off_session")
+            ):
+                fail(
+                    "You can only update setup_future_usage from on_session to off_session with a publishable key.",
+                    "setup_future_usage",
+                )
+            self.update(intent, p, {"capture_method", "receipt_email", "setup_future_usage", "shipping"})
         pm = self.payment_method_for(p, intent["customer"])
         if pm:
             if pm["id"] != intent["payment_method"]:
@@ -247,9 +262,15 @@ class PaymentsAPI(BaseAPI):
             )
         scenario = pm["_scenario"]
         event_prefix = "setup_intent" if setup else "payment_intent"
-        if self.publishable and intent.get("confirmation_method") == "manual":
-            fail("This PaymentIntent requires confirmation with a secret key.", status=403)
-        if scenario in THREE_DS and not complete_3ds and not intent.get("_authenticated"):
+        requires_authentication = (
+            scenario in THREE_DS and not complete_3ds and not intent.get("_authenticated")
+        )
+        authentication_failed = (
+            requires_authentication
+            and not setup
+            and (boolean(p.get("error_on_requires_action", False)) or boolean(p.get("off_session", False)))
+        )
+        if requires_authentication and not authentication_failed:
             intent.update(
                 status="requires_action",
                 next_action={
@@ -270,10 +291,14 @@ class PaymentsAPI(BaseAPI):
                 }
             await self.emit(event_prefix + ".requires_action", intent)
             return intent
-        if scenario in DECLINES and (not setup or scenario != "4000000000000341"):
-            code, decline = DECLINES[scenario]
+        if authentication_failed or (scenario in DECLINES and (not setup or scenario != "4000000000000341")):
+            code, decline = (
+                ("authentication_required", "authentication_required")
+                if authentication_failed
+                else DECLINES[scenario]
+            )
             if not setup:
-                charge = self.make_charge(intent, pm, success=False)
+                charge = self.make_charge(intent, pm, success=False, failure_code=code, decline_code=decline)
                 intent["latest_charge"] = charge["id"]
                 await self.emit("charge.failed", charge)
             intent.update(status="requires_payment_method", next_action=None)
@@ -348,8 +373,19 @@ class PaymentsAPI(BaseAPI):
         txn.pop("livemode", None)
         return txn
 
-    def make_charge(self, pi: Record, pm: Record, *, success: bool = True) -> Record:
+    def make_charge(
+        self,
+        pi: Record,
+        pm: Record,
+        *,
+        success: bool = True,
+        failure_code: str | None = None,
+        decline_code: str | None = None,
+    ) -> Record:
         captured = success and pi["capture_method"] != "manual"
+        if not success:
+            failure_code = failure_code or DECLINES.get(pm["_scenario"], ("card_declined", None))[0]
+        failure_message = card_error(pi, failure_code).body["error"]["message"] if failure_code else None
         charge = self.new(
             "charges",
             amount=pi["amount"],
@@ -367,18 +403,16 @@ class PaymentsAPI(BaseAPI):
             description=pi.get("description"),
             disputed=False,
             failure_balance_transaction=None,
-            failure_code=None if success else DECLINES.get(pm["_scenario"], ("card_declined", None))[0],
-            failure_message=None if success else "Your card was declined.",
+            failure_code=failure_code,
+            failure_message=failure_message,
             fraud_details={},
             on_behalf_of=None,
             outcome={
                 "network_status": "approved_by_network" if success else "declined_by_network",
-                "reason": None if success else "generic_decline",
+                "reason": None if success else decline_code or failure_code,
                 "risk_level": "normal",
                 "risk_score": 5,
-                "seller_message": "Payment complete."
-                if success
-                else "The bank returned the decline code `generic_decline`.",
+                "seller_message": "Payment complete." if success else failure_message,
                 "type": "authorized" if success else "issuer_declined",
             },
             paid=success,
