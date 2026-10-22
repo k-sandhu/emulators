@@ -48,10 +48,11 @@ uv run emulators serve            # gateway http://localhost:44080 (+ HTTPS :444
 open http://localhost:44080/_emulator/ui
 ```
 
-or with Docker:
+or with Docker (vendor hostnames as network aliases, see [docs/howto/docker-compose.md](docs/howto/docker-compose.md)):
 
 ```bash
-docker compose up -d --build      # vendor hostnames as network aliases, see docs/howto/docker-compose.md
+docker compose -f docker-compose.yml up -d --wait   # published ghcr.io/k-sandhu/emulators image, pinned
+docker compose up -d --build --wait                 # or build this checkout from source
 ```
 
 ### From Python tests — keep the real URLs
@@ -131,7 +132,14 @@ date; pin it with `EMULATORS_ANCHOR=2026-10-16` for byte-stable fixtures.
 uv sync
 uv run pytest -q                       # unit, provider, SDK-contract and consumer-flow tests
 uv run ruff check . && uv run ruff format --check .
-uv run python scripts/gen_compose.py   # after adding hostnames
+uv run python scripts/gen_compose.py   # after adding hostnames or bumping the version
 ```
+
+Releasing: `uv version 0.2.0` (updates `pyproject.toml` and `uv.lock`), set `__version__` in
+`src/emulators/__init__.py`, run `scripts/gen_compose.py`, commit, then push the tag `v0.2.0`.
+[release.yml](.github/workflows/release.yml) refuses a tag that doesn't match the version, runs CI on
+the tagged commit, pushes the multi-arch image to `ghcr.io/k-sandhu/emulators` (`:v0.2.0`, plus
+`:latest` for final releases) and publishes a GitHub Release with the sdist, wheel, pinned
+`docker-compose.yml` and notes built from the commits since the previous tag.
 
 License: MIT.
